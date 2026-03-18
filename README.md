@@ -134,6 +134,15 @@ git push
 
 Then run notebook 00 and it pulls automatically.
 
+### If large/generated files were committed by mistake
+
+Run this once to untrack files now covered by `.gitignore` without deleting local copies:
+
+```bash
+git ls-files -ci --exclude-standard -z | xargs -0 git rm --cached --
+git commit -m "chore: untrack generated artifacts"
+```
+
 ## Evaluation Metrics Guide
 
 - `pitch_class_cosine`: key consistency between seed and continuation (higher is better).
