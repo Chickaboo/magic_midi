@@ -9,6 +9,54 @@ from typing import Any, Dict, Optional
 import torch
 
 
+def detect_environment() -> Dict[str, Any]:
+    """
+    Detect the current training environment.
+    Returns a dict with environment details.
+    """
+    import os
+
+    env: Dict[str, Any] = {
+        "is_colab": False,
+        "is_kaggle": False,
+        "is_local": False,
+        "gpu_available": False,
+        "environment_name": "local",
+    }
+
+    ipy = None
+    try:
+        from IPython.core.getipython import get_ipython
+
+        ipy = get_ipython()
+    except Exception:
+        ipy = None
+
+    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") is not None or os.path.exists(
+        "/kaggle/working"
+    ):
+        env["is_kaggle"] = True
+        env["environment_name"] = "kaggle"
+    elif ipy is not None and "google.colab" in str(type(ipy)):
+        env["is_colab"] = True
+        env["environment_name"] = "colab"
+    else:
+        env["is_local"] = True
+        env["environment_name"] = "local"
+
+    try:
+        env["gpu_available"] = torch.cuda.is_available()
+        if env["gpu_available"]:
+            env["gpu_name"] = torch.cuda.get_device_name(0)
+            env["gpu_memory_gb"] = (
+                torch.cuda.get_device_properties(0).total_memory / 1e9
+            )
+    except Exception:
+        pass
+
+    return env
+
+
 def get_gpu_info() -> Dict[str, Any]:
     if torch.cuda.is_available():
         device = torch.device("cuda")

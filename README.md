@@ -143,6 +143,30 @@ git ls-files -ci --exclude-standard -z | xargs -0 git rm --cached --
 git commit -m "chore: untrack generated artifacts"
 ```
 
+## Kaggle Training
+
+Kaggle offers 30 hours/week of free GPU (P100 or T4) with 12-hour sessions
+and no inactivity disconnect - better than Colab free tier for long runs.
+
+### Setup
+1. Add your GitHub repo as a Kaggle dataset (Code -> New Dataset -> GitHub)
+2. Add MAESTRO as a Kaggle dataset
+3. Open `notebooks/00_kaggle_training.ipynb`
+4. Enable GPU: Settings -> Accelerator -> GPU
+5. Enable Internet: Settings -> Internet -> On (needed for pip installs)
+
+### Persistence
+Kaggle does not have Google Drive. Checkpoints are saved to `/kaggle/working/`.
+To persist across sessions:
+- Save a notebook version (Run All -> Save Version) after training
+- Download `checkpoints/best.safetensors` from the output panel
+- Re-upload as a dataset for the next session OR just re-run (preprocessing
+  is cached in working dir within a session but resets between sessions)
+
+### Continuing from a previous checkpoint
+Upload your `best.safetensors` as a Kaggle dataset, then in `kaggle_session.py`
+add a `resume_from` parameter pointing to that dataset path.
+
 ## Evaluation Metrics Guide
 
 - `pitch_class_cosine`: key consistency between seed and continuation (higher is better).
