@@ -10,81 +10,79 @@ import os
 from pathlib import Path
 
 
-def find_kaggle_dataset_path(possible_names: list[str]) -> Path:
+def find_project_root() -> Path:
     """
-    Find a Kaggle input dataset by trying multiple possible mount names.
-    Kaggle slugifies dataset names, so the actual path may vary.
+    Find the magic-midi project root by searching /kaggle/input recursively.
+    Looks for a file that definitively identifies the project root.
     """
-    input_root = Path("/kaggle/input")
-    for name in possible_names:
-        candidate = input_root / name
-        if candidate.exists():
-            return candidate
+    marker_files = [
+        "piano_kaggle_session.py",
+        "kaggle_config.py",
+        "scale_config.py",
+        "session.py",
+    ]
 
-    if input_root.exists():
-        available = sorted([p.name for p in input_root.iterdir()])
-        raise FileNotFoundError(
-            f"None of {possible_names} found in /kaggle/input/.\n"
-            f"Available datasets: {available}\n"
-            f"Check your dataset slug names in Kaggle settings."
-        )
+    for root, _dirs, files in os.walk("/kaggle/input"):
+        for marker in marker_files:
+            if marker in files:
+                found = Path(root)
+                print(f"Project root found at: {found}")
+                return found
 
-    raise FileNotFoundError("/kaggle/input/ does not exist - not running on Kaggle?")
+    print("ERROR: Could not find project root. Contents of /kaggle/input:")
+    for root, _dirs, files in os.walk("/kaggle/input"):
+        depth = root.replace("/kaggle/input", "").count(os.sep)
+        if depth <= 2:
+            indent = "  " * depth
+            print(f"{indent}{os.path.basename(root)}/")
+            if depth <= 1:
+                for file_name in files[:5]:
+                    print(f"{indent}  {file_name}")
+
+    raise FileNotFoundError(
+        "Project files not found under /kaggle/input. "
+        "Make sure you added the magic-midi GitHub repo as a dataset."
+    )
 
 
-def _safe_iterdir(path: Path) -> list[Path]:
-    try:
-        return list(path.iterdir())
-    except Exception:
-        return []
+def find_maestro_root() -> Path:
+    """
+    Find the MAESTRO dataset root by searching /kaggle/input.
+    Identifies MAESTRO by the presence of its CSV metadata file.
+    """
+    for root, _dirs, files in os.walk("/kaggle/input"):
+        for file_name in files:
+            if file_name == "maestro-v3.0.0.csv" or file_name == "maestro-v2.0.0.csv":
+                found = Path(root)
+                print(f"MAESTRO found at: {found}")
+                return found
+
+    print("ERROR: MAESTRO dataset not found. Contents of /kaggle/input:")
+    for root, _dirs, _files in os.walk("/kaggle/input"):
+        depth = root.replace("/kaggle/input", "").count(os.sep)
+        if depth <= 2:
+            indent = "  " * depth
+            print(f"{indent}{os.path.basename(root)}/")
+
+    raise FileNotFoundError(
+        "MAESTRO CSV not found under /kaggle/input. "
+        "Make sure you added the MAESTRO dataset to this notebook."
+    )
 
 
 def get_kaggle_paths() -> dict:
     """
     Returns all relevant paths for Kaggle environment.
     Searches for the MAESTRO dataset and project code under
-    the standard Kaggle input mount points.
+    Kaggle input mount points.
     """
-    maestro_path = find_kaggle_dataset_path(
-        [
-            "maestro-v3",
-            "maestro-v300",
-            "maestro",
-            "maestro-v3-0-0",
-            "maestrov3",
-            "piano-maestro",
-        ]
-    )
-
-    maestro_root = maestro_path
-    candidates = [maestro_path, *_safe_iterdir(maestro_path)]
-    for candidate in candidates:
-        if not candidate.is_dir():
-            continue
-        try:
-            has_year_dirs = any(
-                c.is_dir() and c.name.isdigit() for c in candidate.iterdir()
-            )
-        except Exception:
-            has_year_dirs = False
-        if has_year_dirs:
-            maestro_root = candidate
-            break
-
-    project_path = find_kaggle_dataset_path(
-        [
-            "piano-midi-model",
-            "pianomidimodel",
-            "piano-midi-model-1",
-            "piano-model",
-        ]
-    )
-
+    project_root = find_project_root()
+    maestro_root = find_maestro_root()
     working_dir = Path("/kaggle/working")
 
     return {
         "maestro_root": str(maestro_root),
-        "project_root": str(project_path),
+        "project_root": str(project_root),
         "working_dir": str(working_dir),
         "checkpoint_dir": str(working_dir / "checkpoints"),
         "processed_dir": str(working_dir / "processed"),
@@ -111,10 +109,10 @@ def setup_kaggle_environment() -> dict:
         Path(paths[dir_key]).mkdir(parents=True, exist_ok=True)
     Path(paths["tokenizer_path"]).parent.mkdir(parents=True, exist_ok=True)
 
-    print("Kaggle environment configured:")
-    print(f"  MAESTRO root:    {paths['maestro_root']}")
-    print(f"  Project root:    {paths['project_root']}")
-    print(f"  Working dir:     {paths['working_dir']}")
-    print(f"  Checkpoint dir:  {paths['checkpoint_dir']}")
+    print("Kaggle environment:")
+    print(f"  Project root:   {paths['project_root']}")
+    print(f"  MAESTRO root:   {paths['maestro_root']}")
+    print(f"  Working dir:    {paths['working_dir']}")
+    print(f"  Checkpoints:    {paths['checkpoint_dir']}")
 
     return paths

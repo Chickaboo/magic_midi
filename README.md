@@ -164,7 +164,7 @@ To persist across sessions:
   is cached in working dir within a session but resets between sessions)
 
 ### Continuing from a previous checkpoint
-Upload your `best.safetensors` as a Kaggle dataset, then in `kaggle_session.py`
+Upload your `best.safetensors` as a Kaggle dataset, then in `piano_kaggle_session.py`
 add a `resume_from` parameter pointing to that dataset path.
 
 ## Evaluation Metrics Guide
