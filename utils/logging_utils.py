@@ -67,8 +67,14 @@ def log_model_summary(model: Any, config: Any) -> None:
 
     use_cfc = getattr(config, "use_cfc", getattr(model, "use_cfc", "unknown"))
     use_mamba = getattr(config, "use_mamba", getattr(model, "use_mamba", "unknown"))
+    attention_bias = getattr(config, "attention_bias_type", "unknown")
+    tied_emb = getattr(config, "tie_embeddings", "unknown")
+    logit_scale = getattr(config, "output_logit_scale", "auto")
 
     print(f"Mamba backend: {mamba_info}")
     print(f"Fallback active: {fallback_info}")
     print(f"CfC enabled: {use_cfc}")
     print(f"Mamba enabled: {use_mamba}")
+    print(f"Attention bias: {attention_bias}")
+    print(f"Tied embeddings: {tied_emb}")
+    print(f"Output logit scale: {logit_scale}")

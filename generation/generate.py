@@ -15,6 +15,9 @@ class GenerationConfig:
     temperature: float = 0.9
     top_p: float = 0.95
     top_k: int = 50
+    repetition_penalty: float = 1.1
+    repetition_window: int = 64
+    min_tokens_to_keep: int = 3
     num_samples: int = 1
 
 
@@ -32,12 +35,12 @@ def generate_continuation(
 
     tokens = tokenizer.encode(seed_midi_path)
     if len(tokens) < config.seed_length:
-        raise ValueError(
-            f"Seed file {seed_midi_path} has only {len(tokens)} tokens, "
-            f"requires at least {config.seed_length}."
+        print(
+            f"Seed file {seed_midi_path} has only {len(tokens)} tokens; "
+            f"using the available seed length instead of configured {config.seed_length}."
         )
 
-    seed_tokens = tokens[: config.seed_length]
+    seed_tokens = tokens[: min(len(tokens), config.seed_length)]
     out_paths: List[Path] = []
 
     for i in range(generation_config.num_samples):
@@ -47,6 +50,9 @@ def generate_continuation(
             temperature=generation_config.temperature,
             top_p=generation_config.top_p,
             top_k=generation_config.top_k,
+            repetition_penalty=generation_config.repetition_penalty,
+            repetition_window=generation_config.repetition_window,
+            min_tokens_to_keep=generation_config.min_tokens_to_keep,
         )
 
         out_file = output_path

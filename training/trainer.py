@@ -85,6 +85,10 @@ class Trainer:
             "val_loss": [],
             "perplexity": [],
             "lr": [],
+            "gen_health_max_final_top1": [],
+            "gen_health_max_raw_top1": [],
+            "gen_health_min_candidates": [],
+            "gen_health_passed": [],
         }
         self.best_val_loss = float("inf")
         self.global_step = 0
@@ -149,8 +153,12 @@ class Trainer:
                     else nullcontext()
                 )
                 with autocast_ctx:
-                    logits, _ = self.model(input_ids)
-                    loss = next_token_loss(logits, targets)
+                    logits, _ = self._forward_model(input_ids)
+                    loss = next_token_loss(
+                        logits,
+                        targets,
+                        label_smoothing=self.config.label_smoothing,
+                    )
 
                 loss_value = float(loss.item())
                 epoch_loss_sum += loss_value
@@ -283,8 +291,12 @@ class Trainer:
                         else nullcontext()
                     )
                     with autocast_ctx:
-                        logits, _ = self.model(input_ids)
-                        loss = next_token_loss(logits, targets)
+                        logits, _ = self._forward_model(input_ids)
+                        loss = next_token_loss(
+                            logits,
+                            targets,
+                            label_smoothing=self.config.label_smoothing,
+                        )
 
                     loss_value = float(loss.item())
                     epoch_loss_sum += loss_value
@@ -429,8 +441,12 @@ class Trainer:
                 else nullcontext()
             )
             with autocast_ctx:
-                logits, _ = self.model(input_ids)
-                loss = next_token_loss(logits, targets)
+                logits, _ = self._forward_model(input_ids)
+                loss = next_token_loss(
+                    logits,
+                    targets,
+                    label_smoothing=self.config.label_smoothing,
+                )
 
             val_loss_sum += float(loss.item())
             val_count += 1
@@ -445,6 +461,7 @@ class Trainer:
             perplexity = float("inf")
 
         self._generate_validation_sample(epoch=epoch)
+        self._run_generation_health_check(epoch=epoch)
         return val_loss, perplexity
 
     def save_checkpoint(
@@ -566,9 +583,11 @@ class Trainer:
             generated = generate_fn(
                 seed_tokens=seed,
                 max_new_tokens=self.data_config.continuation_length,
-                temperature=0.9,
-                top_p=0.95,
-                top_k=50,
+                temperature=self.config.generation_health_temperature,
+                top_p=self.config.generation_health_top_p,
+                top_k=self.config.generation_health_top_k,
+                repetition_penalty=self.config.generation_health_repetition_penalty,
+                min_tokens_to_keep=self.config.generation_health_min_tokens_to_keep,
             )
             if not isinstance(generated, (list, tuple)):
                 raise RuntimeError(
@@ -596,6 +615,82 @@ class Trainer:
             np.save(
                 sample_dir / f"epoch_{epoch:03d}.npy",
                 np.asarray(generated_tokens, dtype=np.int64),
+            )
+
+    def _run_generation_health_check(self, epoch: int) -> None:
+        if self.fixed_seed_tokens is None:
+            return
+        if self.data_config is None:
+            return
+
+        seed = self.fixed_seed_tokens[: self.data_config.seed_length]
+        if len(seed) < self.data_config.seed_length:
+            return
+
+        core_model = self._unwrap_model()
+        health_fn = getattr(core_model, "generation_health_check", None)
+        if not callable(health_fn):
+            warnings.warn(
+                "Model does not expose generation_health_check(...); skipping health check."
+            )
+            return
+
+        try:
+            health = health_fn(
+                seed_tokens=seed,
+                steps=self.config.generation_health_steps,
+                temperature=self.config.generation_health_temperature,
+                top_p=self.config.generation_health_top_p,
+                top_k=self.config.generation_health_top_k,
+                repetition_penalty=self.config.generation_health_repetition_penalty,
+                min_tokens_to_keep=self.config.generation_health_min_tokens_to_keep,
+                top1_threshold=self.config.generation_health_top1_threshold,
+                raise_on_failure=False,
+            )
+        except Exception as exc:
+            warnings.warn(f"Generation health check failed to run: {exc}")
+            return
+
+        if not isinstance(health, dict):
+            warnings.warn(
+                "Generation health check returned non-dict payload; skipping metrics."
+            )
+            return
+
+        passed = bool(health.get("passed", False))
+        max_final_top1 = float(health.get("max_final_top1_prob", 0.0))
+        max_raw_top1 = float(health.get("max_raw_top1_prob", 0.0))
+        min_candidates = int(float(health.get("min_candidate_count", 0.0)))
+
+        print(
+            "Generation health "
+            f"epoch={epoch:03d} "
+            f"passed={passed} "
+            f"max_final_top1={max_final_top1:.4f} "
+            f"max_raw_top1={max_raw_top1:.4f} "
+            f"min_candidates={min_candidates}"
+        )
+
+        self.history.setdefault("gen_health_max_final_top1", []).append(max_final_top1)
+        self.history.setdefault("gen_health_max_raw_top1", []).append(max_raw_top1)
+        self.history.setdefault("gen_health_min_candidates", []).append(min_candidates)
+        self.history.setdefault("gen_health_passed", []).append(1.0 if passed else 0.0)
+
+        self._wandb_log(
+            {
+                "epoch": epoch,
+                "gen_health_passed": float(1.0 if passed else 0.0),
+                "gen_health_max_final_top1": max_final_top1,
+                "gen_health_max_raw_top1": max_raw_top1,
+                "gen_health_min_candidates": float(min_candidates),
+            }
+        )
+
+        if not passed:
+            raise AssertionError(
+                "Generation health check threshold exceeded: "
+                f"max_final_top1={max_final_top1:.4f} > "
+                f"{self.config.generation_health_top1_threshold:.4f}"
             )
 
     def _resolve_device(self, requested: str) -> torch.device:
@@ -644,6 +739,14 @@ class Trainer:
                 "Estimated memory usage exceeds 12GB. Consider lower batch size or shorter context."
             )
 
+    def _forward_model(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, Any]:
+        # Unified forward signature used by train/validate/generation.
+        return self.model(
+            input_ids,
+            hidden_states=None,
+            position_offset=0,
+        )
+
     def _infer_sequence_length(self) -> int:
         if self.data_config is not None:
             return self.data_config.seed_length + self.data_config.continuation_length
@@ -662,9 +765,7 @@ class Trainer:
             import wandb  # type: ignore[import-not-found]
 
             self._wandb = wandb
-            self._wandb.init(
-                project="piano-hybrid-cfc-mamba", config=asdict(self.config)
-            )
+            self._wandb.init(project="itty-bitty-piano", config=asdict(self.config))
         except Exception as exc:
             warnings.warn(f"wandb init failed; continuing without wandb ({exc})")
             self._wandb = None

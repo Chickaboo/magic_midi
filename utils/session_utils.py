@@ -185,12 +185,18 @@ class SessionWatchdog:
 
 def print_session_banner(scale_preset: str, epoch: int, drive_sync) -> None:
     try:
-        from scale_config import TARGET_PARAM_COUNTS
+        from scale_config import SCALE_PRESETS, TARGET_PARAM_COUNTS
 
         target = TARGET_PARAM_COUNTS.get(scale_preset)
         params_str = f"~{target / 1_000_000:.0f}M" if target else "n/a"
+        tokenization = "n/a"
+        preset = SCALE_PRESETS.get(scale_preset)
+        if isinstance(preset, dict):
+            data_cfg = preset.get("data")
+            tokenization = str(getattr(data_cfg, "tokenization_strategy", "n/a"))
     except Exception:
         params_str = "n/a"
+        tokenization = "n/a"
 
     target_epochs = None
     try:
@@ -233,9 +239,10 @@ def print_session_banner(scale_preset: str, epoch: int, drive_sync) -> None:
     free_str = f"{free:.1f} GB free" if free >= 0 else "unknown"
 
     print("=" * 48)
-    print("  Piano MIDI Model - Training Session")
+    print("  Itty Bitty Piano - Training Session")
     print("=" * 48)
     print(f"  Scale:         {scale_preset} ({params_str})")
+    print(f"  Tokenization:  {tokenization}")
     if target_epochs is not None:
         print(f"  Resuming:      epoch {epoch} / {target_epochs}")
     else:

@@ -8,6 +8,7 @@ class DataConfig:
     tokenizer_path: str = "tokenizer.json"
     processed_path: str = "processed/"
     vocab_size: int = 2000
+    tokenization_strategy: str = "remi"
     seed_length: int = 256
     continuation_length: int = 768
     stride: int = 128
@@ -32,10 +33,16 @@ class ModelConfig:
     attention_every_n_layers: int = 2
     attention_dropout: float = 0.1
     use_relative_attention: bool = True
+    attention_bias_type: str = "alibi"
     max_relative_distance: int = 128
+    use_absolute_positions: bool = True
     dropout: float = 0.1
     use_cfc: bool = True
     use_mamba: bool = True
+    ffn_expansion: int = 4
+    tie_embeddings: bool = True
+    embedding_init_std: float = 0.02
+    output_logit_scale: Optional[float] = None
     max_sequence_length: int = 1024
     debug: bool = False
 
@@ -46,9 +53,17 @@ class TrainConfig:
     grad_accumulation_steps: int = 4
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
+    label_smoothing: float = 0.1
     max_epochs: int = 50
     warmup_steps: int = 500
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 1.5
+    generation_health_steps: int = 20
+    generation_health_top1_threshold: float = 0.95
+    generation_health_temperature: float = 0.9
+    generation_health_top_p: float = 0.95
+    generation_health_top_k: int = 50
+    generation_health_repetition_penalty: float = 1.1
+    generation_health_min_tokens_to_keep: int = 3
     save_every_n_epochs: int = 5
     keep_every_n_epochs: int = 10
     checkpoint_dir: str = "checkpoints/"

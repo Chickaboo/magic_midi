@@ -284,6 +284,9 @@ def _safe_generate_tokens(
             temperature=0.9,
             top_p=0.95,
             top_k=50,
+            repetition_penalty=1.1,
+            repetition_window=64,
+            min_tokens_to_keep=3,
         )
         if isinstance(result, list):
             return [int(x) for x in result]
@@ -326,7 +329,10 @@ def _queue_epoch_checkpoint_sync(
 
 
 def calibrate_preset(scale_name: str) -> int:
-    """Instantiate model and print real parameter count for this runtime."""
+    """Instantiate model and print measured runtime parameter count.
+
+    This count depends on active backend (real Mamba vs fallback).
+    """
     preset = get_preset(scale_name)
     model = PianoHybridModel(preset["model"])
     total = sum(p.numel() for p in model.parameters())
@@ -337,7 +343,7 @@ def calibrate_preset(scale_name: str) -> int:
 
 
 def run_session(
-    scale: str = "nano",
+    scale: str = "small",
     max_epochs_this_session: Optional[int] = None,
     calibration_mode: bool = False,
 ):

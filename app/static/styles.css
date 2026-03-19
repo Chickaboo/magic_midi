@@ -1,0 +1,158 @@
+:root {
+  --bg: #0f1117;
+  --bg-elev: #171a23;
+  --line: #2a2f3e;
+  --text: #f2f5ff;
+  --muted: #a4acc2;
+  --accent: #4fb0ff;
+  --accent-2: #2d7bd8;
+  --warn: #ffb347;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: radial-gradient(1200px 700px at 80% -20%, #1c2234 0%, var(--bg) 48%, #0b0d12 100%);
+  color: var(--text);
+  font-family: "JetBrains Mono", "Cascadia Code", monospace;
+}
+
+.shell {
+  width: min(980px, 94vw);
+  margin: 26px auto;
+  display: grid;
+  gap: 16px;
+}
+
+.header h1 {
+  margin: 0;
+  font-size: 28px;
+  letter-spacing: 0.5px;
+}
+
+.header p {
+  margin: 6px 0 0;
+  color: var(--muted);
+}
+
+.panel {
+  background: linear-gradient(180deg, #1a1f2d 0%, var(--bg-elev) 100%);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 14px;
+}
+
+.field {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.field > span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+select,
+input[type="range"] {
+  width: 100%;
+}
+
+select {
+  background: #111521;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+}
+
+.upload {
+  border: 1px dashed #3a4560;
+  border-radius: 10px;
+  background: #111521;
+  min-height: 82px;
+  align-content: center;
+  padding: 12px;
+  cursor: pointer;
+}
+
+.upload.drag {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.upload input {
+  display: none;
+}
+
+.upload span {
+  color: var(--muted);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.field em {
+  font-style: normal;
+  color: var(--accent);
+  font-size: 13px;
+}
+
+.actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+button,
+.button {
+  background: linear-gradient(180deg, var(--accent), var(--accent-2));
+  border: none;
+  color: #081120;
+  font-weight: 700;
+  padding: 10px 14px;
+  border-radius: 8px;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.button.ghost {
+  background: #1d263a;
+  color: var(--text);
+  border: 1px solid var(--line);
+}
+
+.button.disabled {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+.status h2 {
+  margin: 0 0 10px;
+  font-size: 16px;
+}
+
+#statusBox {
+  margin: 0;
+  color: var(--muted);
+  white-space: pre-wrap;
+  font-size: 13px;
+}
+
+.warn {
+  color: var(--warn);
+}
+
+@media (max-width: 760px) {
+  .grid {
+    grid-template-columns: 1fr;
+  }
+}

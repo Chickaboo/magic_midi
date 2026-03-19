@@ -81,3 +81,22 @@ htmlcov/
 tmp/
 temp/
 *.tmp
+
+# App virtualenv/runtime artifacts
+app/.venv/
+
+# Keep app structure but ignore dropped runtime assets
+!app/models/
+app/models/*
+!app/models/.gitkeep
+
+!app/tokenizer/
+app/tokenizer/*
+!app/tokenizer/.gitkeep
+
+!app/runtime/
+app/runtime/*
+!app/runtime/.gitkeep
+!app/runtime/outputs/
+app/runtime/outputs/*
+!app/runtime/outputs/.gitkeep

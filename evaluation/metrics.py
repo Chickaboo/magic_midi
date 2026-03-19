@@ -140,6 +140,9 @@ def evaluate_dataset(
                     temperature=0.9,
                     top_p=0.95,
                     top_k=50,
+                    repetition_penalty=1.1,
+                    repetition_window=64,
+                    min_tokens_to_keep=3,
                 )
 
                 seed_path = tmp_dir_path / f"seed_{batch_idx}_{i}.mid"

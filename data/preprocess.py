@@ -128,8 +128,9 @@ def preprocess_maestro(config: DataConfig) -> Dict[str, float]:
         tokenizer = PianoTokenizer.load(str(tokenizer_path))
         print(f"Loaded tokenizer from {tokenizer_path.resolve()}")
     else:
-        print("Tokenizer not found. Training REMI+BPE tokenizer...")
-        tokenizer = PianoTokenizer()
+        strategy = str(getattr(config, "tokenization_strategy", "remi")).lower()
+        print(f"Tokenizer not found. Training {strategy.upper()}+BPE tokenizer...")
+        tokenizer = PianoTokenizer(strategy=strategy)
         tokenizer.train(midi_paths=midi_paths, vocab_size=config.vocab_size)
         tokenizer.save(str(tokenizer_path))
         print(f"Saved tokenizer to {tokenizer_path.resolve()}")

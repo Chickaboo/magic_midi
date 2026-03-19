@@ -5,7 +5,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _build_alibi_slopes(num_heads: int, device: torch.device) -> torch.Tensor:
+    head_ids = torch.arange(1, num_heads + 1, device=device, dtype=torch.float32)
+    return torch.pow(2.0, (-8.0 / float(num_heads)) * head_ids)
+
+
 class RelativePositionBias(nn.Module):
+    """Learned relative position bias with shape (heads, seq, seq)."""
+
     def __init__(self, max_distance: int, num_heads: int) -> None:
         super().__init__()
         if max_distance <= 0:
@@ -29,6 +36,25 @@ class RelativePositionBias(nn.Module):
         return bias.permute(2, 0, 1)
 
 
+class ALiBiPositionBias(nn.Module):
+    """Deterministic ALiBi attention bias (heads, seq, seq)."""
+
+    def __init__(self, num_heads: int) -> None:
+        super().__init__()
+        if num_heads <= 0:
+            raise ValueError("num_heads must be > 0")
+        self.num_heads = int(num_heads)
+
+    def forward(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        if seq_len <= 0:
+            raise ValueError("seq_len must be > 0")
+
+        pos = torch.arange(seq_len, device=device, dtype=torch.float32)
+        distance = torch.abs(pos.unsqueeze(0) - pos.unsqueeze(1))
+        slopes = _build_alibi_slopes(self.num_heads, device)
+        return -slopes.view(self.num_heads, 1, 1) * distance.unsqueeze(0)
+
+
 class MusicAttentionBlock(nn.Module):
     def __init__(
         self,
@@ -37,6 +63,8 @@ class MusicAttentionBlock(nn.Module):
         max_relative_distance: int = 128,
         dropout: float = 0.1,
         use_relative_bias: bool = True,
+        bias_type: str = "learned",
+        ffn_expansion: int = 2,
     ) -> None:
         super().__init__()
         if d_model <= 0:
@@ -47,12 +75,21 @@ class MusicAttentionBlock(nn.Module):
             raise ValueError(
                 f"d_model ({d_model}) must be divisible by num_heads ({num_heads})"
             )
+        if ffn_expansion <= 0:
+            raise ValueError("ffn_expansion must be > 0")
+
+        normalized_bias_type = str(bias_type).strip().lower()
+        if normalized_bias_type not in {"learned", "alibi"}:
+            raise ValueError(
+                f"bias_type must be either 'learned' or 'alibi', got '{bias_type}'"
+            )
 
         self.d_model = int(d_model)
         self.num_heads = int(num_heads)
         self.head_dim = self.d_model // self.num_heads
         self.dropout = float(dropout)
         self.use_relative_bias = bool(use_relative_bias)
+        self.bias_type = normalized_bias_type
 
         self.norm1 = nn.LayerNorm(self.d_model)
         self.norm2 = nn.LayerNorm(self.d_model)
@@ -62,19 +99,26 @@ class MusicAttentionBlock(nn.Module):
         self.out_dropout = nn.Dropout(self.dropout)
 
         if self.use_relative_bias:
-            self.rel_bias = RelativePositionBias(max_relative_distance, self.num_heads)
+            if self.bias_type == "alibi":
+                self.rel_bias: nn.Module | None = ALiBiPositionBias(self.num_heads)
+            else:
+                self.rel_bias = RelativePositionBias(
+                    max_relative_distance,
+                    self.num_heads,
+                )
         else:
             self.rel_bias = None
 
         self.ffn = nn.Sequential(
-            nn.Linear(self.d_model, self.d_model * 2),
+            nn.Linear(self.d_model, self.d_model * int(ffn_expansion)),
             nn.GELU(),
             nn.Dropout(self.dropout),
-            nn.Linear(self.d_model * 2, self.d_model),
+            nn.Linear(self.d_model * int(ffn_expansion), self.d_model),
             nn.Dropout(self.dropout),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Entry shape contract: x is (batch, seq_len, d_model).
         if x.ndim != 3:
             raise ValueError(
                 f"x must be (batch, seq_len, d_model), got {tuple(x.shape)}"
@@ -93,7 +137,9 @@ class MusicAttentionBlock(nn.Module):
         v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         causal = torch.zeros(
-            (1, 1, seq_len, seq_len), device=x.device, dtype=normed.dtype
+            (1, 1, seq_len, seq_len),
+            device=x.device,
+            dtype=normed.dtype,
         )
         causal_mask = torch.triu(
             torch.ones((seq_len, seq_len), device=x.device, dtype=torch.bool),
@@ -120,4 +166,5 @@ class MusicAttentionBlock(nn.Module):
 
         x = x + attn_out
         x = x + self.ffn(self.norm2(x))
+        # Exit shape contract: output is (batch, seq_len, d_model).
         return x

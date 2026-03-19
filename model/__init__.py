@@ -2,7 +2,13 @@ from .baseline import PianoBaselineModel
 from .hybrid import PianoHybridModel
 from .mamba_block import MAMBA_AVAILABLE, MambaBlock
 from .cfc_block import CfCBlock
-from .attention_block import MusicAttentionBlock, RelativePositionBias
+from .ffn_block import FeedForwardBlock
+from .attention_block import (
+    ALiBiPositionBias,
+    MusicAttentionBlock,
+    RelativePositionBias,
+)
+from .sampling import build_sampling_distribution, sample_next_token
 
 __all__ = [
     "PianoBaselineModel",
@@ -10,6 +16,10 @@ __all__ = [
     "MAMBA_AVAILABLE",
     "MambaBlock",
     "CfCBlock",
+    "FeedForwardBlock",
+    "ALiBiPositionBias",
     "MusicAttentionBlock",
     "RelativePositionBias",
+    "build_sampling_distribution",
+    "sample_next_token",
 ]

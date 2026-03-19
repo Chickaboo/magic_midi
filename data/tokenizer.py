@@ -6,14 +6,24 @@ from pathlib import Path
 from typing import Any, List, Sequence
 
 import numpy as np
-from miditok import REMI, TokenizerConfig
+from miditok import Octuple, REMI, TokenizerConfig
 
 
 ROUNDTRIP_TOLERANCE = 0.05
 
 
 class PianoTokenizer:
-    def __init__(self, tokenizer: REMI | None = None) -> None:
+    def __init__(
+        self,
+        tokenizer: REMI | Octuple | None = None,
+        strategy: str = "remi",
+    ) -> None:
+        self.strategy = str(strategy).strip().lower()
+        if self.strategy not in {"remi", "octuple"}:
+            raise ValueError(
+                f"Unsupported tokenization strategy '{strategy}'. Use 'remi' or 'octuple'."
+            )
+
         if tokenizer is not None:
             self.tokenizer = tokenizer
             return
@@ -24,8 +34,12 @@ class PianoTokenizer:
             use_time_signatures=True,
             use_chords=False,
             use_sustain_pedals=True,
+            use_programs=False,
         )
-        self.tokenizer = REMI(tokenizer_config=tokenizer_config)
+        if self.strategy == "octuple":
+            self.tokenizer = Octuple(tokenizer_config=tokenizer_config)
+        else:
+            self.tokenizer = REMI(tokenizer_config=tokenizer_config)
 
     def train(self, midi_paths: List[Path], vocab_size: int) -> None:
         paths = list(midi_paths)
@@ -130,9 +144,22 @@ class PianoTokenizer:
         if not load_path.exists():
             raise FileNotFoundError(f"Tokenizer file not found: {load_path}")
 
+        strategy = "remi"
         try:
-            tok = REMI(params=str(load_path))
-            return cls(tok)
+            import json
+
+            payload = json.loads(load_path.read_text(encoding="utf-8"))
+            tokenization = str(payload.get("tokenization", "REMI")).strip().lower()
+            if tokenization.startswith("octuple"):
+                strategy = "octuple"
+        except Exception:
+            strategy = "remi"
+
+        tokenizer_cls = Octuple if strategy == "octuple" else REMI
+
+        try:
+            tok = tokenizer_cls(params=str(load_path))
+            return cls(tok, strategy=strategy)
         except Exception:
             pass
 
@@ -142,12 +169,13 @@ class PianoTokenizer:
             use_time_signatures=True,
             use_chords=False,
             use_sustain_pedals=True,
+            use_programs=False,
         )
-        tok = REMI(tokenizer_config=tokenizer_config)
+        tok = tokenizer_cls(tokenizer_config=tokenizer_config)
         load_params = getattr(tok, "load_params", None)
         if callable(load_params):
             load_params(str(load_path))
-            return cls(tok)
+            return cls(tok, strategy=strategy)
 
         raise RuntimeError(f"Unable to load tokenizer from path: {load_path}")
 

@@ -28,7 +28,7 @@ from data.tokenizer import PianoTokenizer
 from generation.generate import GenerationConfig, generate_continuation
 from kaggle_config import setup_kaggle_environment
 from model.hybrid import PianoHybridModel
-from scale_config import SCALE_PRESETS, get_preset
+from scale_config import SCALE_PRESETS, get_preset, verify_preset_params
 from training.trainer import Trainer
 from utils.session_utils import SessionWatchdog, get_gpu_info
 
@@ -161,17 +161,15 @@ def _configure_kaggle_performance(train_cfg, scale: Optional[str] = None) -> Non
         base_accum = int(train_cfg.grad_accumulation_steps)
 
         default_target = {
-            "nano": 128,
-            "micro": 64,
             "small": 32,
             "medium": 16,
+            "large": 8,
         }.get(str(scale).lower() if scale is not None else "", 64)
 
         default_max = {
-            "nano": 256,
-            "micro": 128,
             "small": 96,
             "medium": 64,
+            "large": 32,
         }.get(str(scale).lower() if scale is not None else "", 128)
 
         # Aggressive but bounded scaling to keep both GPUs busy.
@@ -303,6 +301,9 @@ def _safe_generate_tokens(
         temperature=0.9,
         top_p=0.95,
         top_k=50,
+        repetition_penalty=1.1,
+        repetition_window=64,
+        min_tokens_to_keep=3,
     )
     if not isinstance(result, list):
         raise RuntimeError("Model generate(...) returned unsupported output type")
@@ -395,11 +396,13 @@ def _print_kaggle_banner(
     gpu_info: Dict[str, Any],
     paths: Dict[str, str],
     resumed: bool,
+    tokenization: str,
 ) -> None:
     print("=" * 56)
-    print("  Piano MIDI Model - Kaggle Session")
+    print("  Itty Bitty Piano - Kaggle Session")
     print("=" * 56)
     print(f"  Scale:             {scale}")
+    print(f"  Tokenization:      {tokenization}")
     print(f"  Resume status:     {'resumed' if resumed else 'fresh start'}")
     print(f"  Epoch progress:    {start_epoch} / {max_epochs}")
     print(
@@ -416,7 +419,7 @@ def _print_kaggle_banner(
     print("=" * 56)
 
 
-def run_kaggle_session(scale: str = "nano", max_epochs: int = 2000) -> Dict[str, Any]:
+def run_kaggle_session(scale: str = "small", max_epochs: int = 2000) -> Dict[str, Any]:
     paths = setup_kaggle_environment()
     _configure_mamba_backend()
     gpu = get_gpu_info()
@@ -487,6 +490,7 @@ def run_kaggle_session(scale: str = "nano", max_epochs: int = 2000) -> Dict[str,
         gpu_info=gpu,
         paths=paths,
         resumed=resumed,
+        tokenization=str(getattr(data_cfg, "tokenization_strategy", "n/a")),
     )
 
     if start_epoch >= int(max_epochs):
@@ -583,8 +587,8 @@ def run_kaggle_session(scale: str = "nano", max_epochs: int = 2000) -> Dict[str,
 
 def calibrate_on_kaggle() -> None:
     """
-    Print actual parameter counts for all presets on this Kaggle runtime.
-    Run this once to verify preset calibration before a long training run.
+    Print measured parameter counts for all presets on this runtime.
+    Use this to validate preset targets with active backend configuration.
     """
     _configure_mamba_backend()
 
@@ -599,21 +603,13 @@ def calibrate_on_kaggle() -> None:
         f"GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}"
     )
     print("-" * 50)
-
-    for name, preset in SCALE_PRESETS.items():
-        model = PianoHybridModel(preset["model"])
-        total = sum(p.numel() for p in model.parameters())
-        target_desc = preset["description"]
-        print(f"{name:8s}: {total:>12,} params  ({total / 1e6:.2f}M)  - {target_desc}")
-        del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
+    verify_preset_params()
     print("-" * 50)
-    print("Paste these numbers to your agent for preset calibration if needed.")
+    for name, preset in SCALE_PRESETS.items():
+        print(f"{name:8s}: {preset['description']}")
 
 
-def generate_from_best_checkpoint(scale: str = "nano") -> Path:
+def generate_from_best_checkpoint(scale: str = "small") -> Path:
     paths = setup_kaggle_environment()
     _configure_mamba_backend()
     preset = get_preset(scale)
@@ -674,6 +670,9 @@ def generate_from_best_checkpoint(scale: str = "nano") -> Path:
         temperature=0.9,
         top_p=0.95,
         top_k=50,
+        repetition_penalty=1.1,
+        repetition_window=64,
+        min_tokens_to_keep=3,
         num_samples=1,
     )
 
@@ -686,5 +685,96 @@ def generate_from_best_checkpoint(scale: str = "nano") -> Path:
         generation_config=gen_cfg,
     )
     print(f"Generated sample from checkpoint: {checkpoint_path}")
+    print(f"Saved to: {outputs[0]}")
+    return outputs[0]
+
+
+def generate_from_seed_file(
+    seed_path: str | Path,
+    checkpoint_path: Optional[str | Path] = None,
+    scale: str = "small",
+    max_new_tokens: Optional[int] = None,
+    output_path: Optional[str | Path] = None,
+) -> Path:
+    """Generate a long continuation from a seed MIDI file."""
+    paths = setup_kaggle_environment()
+    _configure_mamba_backend()
+    preset = get_preset(scale)
+
+    model_cfg = preset["model"]
+    data_cfg = preset["data"]
+    data_cfg.maestro_path = paths["maestro_root"]
+    data_cfg.processed_path = paths["processed_dir"]
+    data_cfg.tokenizer_path = paths["tokenizer_path"]
+
+    tokenizer_path = Path(data_cfg.tokenizer_path)
+    if not tokenizer_path.exists():
+        raise FileNotFoundError(
+            f"Tokenizer not found at {tokenizer_path}. Run run_kaggle_session first."
+        )
+    tokenizer = PianoTokenizer.load(str(tokenizer_path))
+    model_cfg.vocab_size = tokenizer.vocab_size
+    data_cfg.vocab_size = tokenizer.vocab_size
+
+    ckpt_dir = Path(paths["checkpoint_dir"])
+    if checkpoint_path is None:
+        candidates = [
+            ckpt_dir / "best.safetensors",
+            ckpt_dir / "best_model.safetensors",
+            ckpt_dir / "latest.safetensors",
+            ckpt_dir / "latest_model.safetensors",
+        ]
+        checkpoint_file = next((p for p in candidates if p.exists()), None)
+    else:
+        checkpoint_file = Path(checkpoint_path)
+
+    if checkpoint_file is None or not checkpoint_file.exists():
+        raise FileNotFoundError(
+            f"No checkpoint found. Looked in {ckpt_dir} and optional checkpoint_path."
+        )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = PianoHybridModel(model_cfg)
+    state = safetensors_load_file(str(checkpoint_file), device="cpu")
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        print(f"Missing keys while loading checkpoint: {len(missing)}")
+    if unexpected:
+        print(f"Unexpected keys while loading checkpoint: {len(unexpected)}")
+    model.to(device)
+    model.eval()
+
+    seed_path = Path(seed_path)
+    if not seed_path.exists():
+        raise FileNotFoundError(f"Seed MIDI file not found: {seed_path}")
+
+    output_dir = Path(paths["generated_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if output_path is None:
+        output_path = output_dir / f"{seed_path.stem}_continuation.mid"
+    else:
+        output_path = Path(output_path)
+
+    gen_tokens = max_new_tokens or max(4096, data_cfg.continuation_length * 16)
+    gen_cfg = GenerationConfig(
+        max_new_tokens=int(gen_tokens),
+        temperature=0.9,
+        top_p=0.95,
+        top_k=50,
+        repetition_penalty=1.1,
+        repetition_window=64,
+        min_tokens_to_keep=3,
+        num_samples=1,
+    )
+
+    outputs = generate_continuation(
+        model=model,
+        tokenizer=tokenizer,
+        seed_midi_path=seed_path,
+        output_path=output_path,
+        config=data_cfg,
+        generation_config=gen_cfg,
+    )
+    print(f"Generated continuation from seed: {seed_path}")
     print(f"Saved to: {outputs[0]}")
     return outputs[0]

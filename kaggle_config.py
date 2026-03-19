@@ -12,7 +12,7 @@ from pathlib import Path
 
 def find_project_root() -> Path:
     """
-    Find the magic-midi project root by searching /kaggle/input recursively.
+    Find the Itty Bitty Piano project root by searching /kaggle/input recursively.
     Looks for a file that definitively identifies the project root.
     """
     marker_files = [
@@ -41,7 +41,7 @@ def find_project_root() -> Path:
 
     raise FileNotFoundError(
         "Project files not found under /kaggle/input. "
-        "Make sure you added the magic-midi GitHub repo as a dataset."
+        "Make sure you added the Itty Bitty Piano GitHub repo as a dataset."
     )
 
 

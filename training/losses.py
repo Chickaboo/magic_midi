@@ -8,6 +8,7 @@ def next_token_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
     ignore_index: int = -100,
+    label_smoothing: float = 0.0,
 ) -> torch.Tensor:
     if logits.ndim != 3:
         raise ValueError(
@@ -24,6 +25,7 @@ def next_token_loss(
         logits.reshape(-1, logits.shape[-1]),
         targets.reshape(-1),
         ignore_index=ignore_index,
+        label_smoothing=float(label_smoothing),
     )
 
 

@@ -5,37 +5,38 @@ import warnings
 import torch
 import torch.nn as nn
 
-MAMBA_AVAILABLE = False
-
-try:
-    from mamba_ssm import Mamba as _Mamba
+try:  # pragma: no cover - optional dependency on CUDA runtimes
+    from mamba_ssm import Mamba as _Mamba  # pyright: ignore[reportMissingImports]
 
     MAMBA_AVAILABLE = True
 except Exception as exc:  # pragma: no cover
     _Mamba = None
+    MAMBA_AVAILABLE = False
     warnings.warn(
-        "mamba-ssm not available (requires CUDA). Using GRU fallback for local "
-        "development. Install mamba-ssm on Colab for full performance."
+        "mamba-ssm not available (requires CUDA). Using causal GRU fallback for local "
+        "development. Install mamba-ssm on Colab/Kaggle for full performance."
     )
     warnings.warn(f"mamba-ssm import details: {exc}")
 
 
 class MambaFallback(nn.Module):
-    """CPU-friendly approximation of Mamba using a bidirectional GRU."""
+    """CPU-friendly causal approximation of Mamba using a unidirectional GRU."""
 
     def __init__(self, d_model: int, expand: int = 2, dropout: float = 0.0) -> None:
         super().__init__()
-        hidden_size = max(d_model * expand // 2, 1)
+        self.expand = int(max(1, expand))
+        hidden_size = max(d_model * max(1, int(expand)), 1)
         self.gru = nn.GRU(
             input_size=d_model,
             hidden_size=hidden_size,
             num_layers=1,
             batch_first=True,
-            bidirectional=True,
+            bidirectional=False,
             dropout=0.0,
         )
-        self.out_proj = nn.Linear(2 * hidden_size, d_model)
+        self.out_proj = nn.Linear(hidden_size, d_model)
         self.dropout = nn.Dropout(dropout)
+        self.parameter_scale = 0.75
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y, _ = self.gru(x)
@@ -64,12 +65,16 @@ class MambaBlock(nn.Module):
 
         if use_real_mamba and _Mamba is not None:
             self.core = _Mamba(
-                d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand
+                d_model=d_model,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
             )
         else:
             self.core = MambaFallback(d_model=d_model, expand=expand, dropout=dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Entry shape contract: x is (batch, seq_len, d_model).
         if self.debug:
             assert x.ndim == 3, (
                 f"MambaBlock expects (batch, seq, feat), got {tuple(x.shape)}"
@@ -79,9 +84,9 @@ class MambaBlock(nn.Module):
             )
 
         residual = x
-        x = self.norm(x)
-        x = self.core(x)
-        out = residual + x
+        y = self.norm(x)
+        y = self.core(y)
+        out = residual + y
 
         if self.debug:
             assert out.shape == residual.shape, (
@@ -89,4 +94,5 @@ class MambaBlock(nn.Module):
                 f"got {tuple(out.shape)}"
             )
 
+        # Exit shape contract: output is (batch, seq_len, d_model).
         return out

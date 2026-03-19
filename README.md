@@ -1,203 +1,135 @@
-# Piano MIDI Hybrid CfC + Mamba Workspace
+# Itty Bitty Piano v2 (Mamba + FFN + Sparse Music Attention)
 
-This repository provides a full research workspace for piano MIDI continuation with a **hybrid CfC + Mamba** architecture.
+This repository trains and serves an autoregressive piano continuation model for MIDI token sequences under the Itty Bitty Piano project.
 
-Hypothesis: adding **CfC (Closed-form Continuous-time)** dynamics on top of sequence modeling layers improves temporal and timing consistency over a pure Mamba baseline for long-form piano generation.
+v2 upgrades the architecture and generation stack to eliminate the v1 collapse mode where one token dominated generation regardless of seed.
 
-The core task is: given a ~10-second seed clip, generate a musically coherent continuation.
+## What Changed in v2
+
+- Architecture: `Mamba -> FFN` blocks with sparse `MusicAttentionBlock`.
+- Attention bias: ALiBi-style relative bias support for extrapolation to longer contexts.
+- Generation: robust sampling pipeline with repetition penalty, minimum candidate guarantees, and confidence capping.
+- Training: label smoothing (`epsilon=0.1`) in next-token cross-entropy.
+- Validation: generation health check logs collapse risk every epoch.
+- Tokenization: configurable strategy (`remi` or `octuple`) for better token efficiency experiments.
+
+## Root Cause (v1 collapse)
+
+The collapse was not caused by top-k/top-p filtering. It was caused by extreme output confidence from tied embeddings and large unscaled logits under teacher forcing.
+
+Key findings:
+
+- Random-weight v1 also collapsed in generation (top-1 probability saturated near 1.0).
+- Collapse persisted even with CfC hidden-state threading fixes.
+- Logits remained numerically large (`std ~10+`) and peaked heavily.
+
+v2 addresses this by scaling output logits (`1/sqrt(d_model)` by default), adding label smoothing, adding repetition-aware sampling safeguards, and introducing a generation health check.
 
 ## Architecture
 
 ```text
-Input MIDI -> REMI+BPE tokens
-              |
-              v
-      Token Embedding
-             |
-             v
- Positional Encoding (learned)
-             |
-             v
-   +-------------------------+
-   | Mamba Block             |  <- sequence compression, O(n)
-   | CfC Block               |  <- temporal dynamics
-   +-------------------------+
-             |
-             v (every N layers)
-   +-------------------------+
-   | Music Attention Block   |  <- relative position bias
-   | + FFN                   |  <- in-context retrieval, motif reference
-   +-------------------------+
-             |
-             v (repeat)
-       Final LayerNorm
-             |
-             v
- Output Projection (weight-tied to embedding)
+Input tokens
+  -> token embedding (+ optional absolute position embedding)
+  -> [Mamba block -> FFN block] x N
+  -> sparse MusicAttentionBlock every K layers (causal, ALiBi/learned bias)
+  -> final LayerNorm
+  -> output projection (optionally weight-tied) + output logit scaling
 ```
 
-The hybrid stack alternates Mamba+CfC groups with sparse music attention blocks (`attention_every_n_layers`). Attention uses learned **relative position bias**, not absolute-position attention biasing, so rhythmic distance relationships can transfer across different piece lengths.
+CfC is still supported for compatibility (`use_cfc=True`) but v2 presets default to `use_cfc=False`.
 
-## Scale Presets
+## Scale Presets (v2 targets)
 
-- `nano`: ~3M parameters (pipeline validation and quick Colab checks)
-- `micro`: ~8M parameters (meaningful learning in short sessions)
-- `small`: ~22M parameters (full architecture, roughly one epoch per free-tier session)
-- `medium`: ~60M parameters (serious training; Colab Pro/Kaggle recommended)
+- `small`: ~15M (primary target)
+- `medium`: ~40M (stretch target)
+- `large`: ~100M (future target)
 
-Use `python scale_config.py` (or `verify_preset_params()`) to print measured parameter counts for each preset.
-
-## Attention Design Choice
-
-- Relative position bias is used for attention because musical structure depends more on **distance** (beat/bar offsets, phrase spacing) than absolute token index.
-- Sparse attention insertion (`every N layers`) keeps the model efficient while still improving in-context motif retrieval and continuation coherence.
-- This follows evidence from music generation and hybrid SSM+attention systems that a modest fraction of attention layers is often enough.
-
-References:
-- Cheng-Zhi Anna Huang et al., "Music Transformer: Generating Music with Long-Term Structure," ICLR 2019.
-- Joseph Lieber et al., "Jamba: A Hybrid Transformer-Mamba Language Model," 2024.
-
-## Project Layout
-
-The workspace is organized into focused modules for tokenization, preprocessing, model variants, training, generation, and evaluation. See the folder tree in this repository for full details.
-
-## Setup
-
-### Local CPU (debugging + preprocessing)
-
-1. Create an environment (Python 3.10+ recommended).
-2. Install dependencies:
+Run parameter checks:
 
 ```bash
-pip install -r requirements.txt
+python scale_config.py
 ```
 
-3. Place MAESTRO under `maestro-v3.0.0/` or update `DataConfig.maestro_path`.
+## Tokenization
 
-### Google Colab (training)
+`DataConfig.tokenization_strategy`:
 
-1. Open the notebooks from this repo.
-2. Use runtime with GPU (T4 recommended).
-3. Install Colab dependencies:
+- `"remi"` (default)
+- `"octuple"`
 
-```bash
-pip install -r requirements_colab.txt
-```
+Tokenizer is created accordingly in preprocessing.
 
-4. Mount Google Drive and set paths to `/content/drive/MyDrive/piano_model/`.
+## Training
 
-Notes:
-- `mamba-ssm` requires CUDA and may fail on CPU.
-- CPU mode automatically uses the GRU-based Mamba fallback.
-
-## Notebook Order
-
-1. `notebooks/01_data_pipeline.ipynb`
-2. `notebooks/02_baseline_training.ipynb`
-3. `notebooks/03_mamba_training.ipynb`
-4. `notebooks/04_hybrid_training.ipynb`
-5. `notebooks/05_generation_and_eval.ipynb`
-
-## Colab Sync via GitHub (recommended)
-
-Instead of uploading zip files, use GitHub for instant sync:
-
-### First time setup (local):
-
-```bash
-cd piano_midi_model
-git init
-git add .
-git commit -m "initial commit"
-git remote add origin https://github.com/YOURUSERNAME/piano_midi_model.git
-git push -u origin main
-```
-
-### Add to top of notebook 00 cell 1:
+Core loss:
 
 ```python
-import os
-if not os.path.exists('/content/piano_midi_model'):
-    !git clone https://github.com/YOURUSERNAME/piano_midi_model.git /content/piano_midi_model
-else:
-    !cd /content/piano_midi_model && git pull origin main
-    print("Repository updated to latest version")
+F.cross_entropy(logits, targets, ignore_index=-100, label_smoothing=0.1)
 ```
 
-### After agents make changes:
+Generation health check (run during validation):
+
+- generates 20 steps from a fixed validation seed,
+- asserts/logs max top-1 probability (`<= 0.95` after sampling constraints),
+- logs candidate set minimum and raw-vs-final confidence.
+
+## Generation Safeguards
+
+`PianoHybridModel.generate(...)` now includes:
+
+- repetition penalty over recent 64 tokens,
+- temperature floor at 0.1,
+- top-k/top-p filtering with minimum tokens kept (`>=3`),
+- confidence cap in final sampling distribution,
+- warning if >60% of generated tokens are identical.
+
+## Smoke Test
 
 ```bash
-git add .
-git commit -m "describe what changed"
-git push
+python smoke_test_architecture.py
 ```
 
-Then run notebook 00 and it pulls automatically.
+This covers:
 
-### If large/generated files were committed by mistake
+- ALiBi bias and attention block shape checks,
+- forward pass for CfC-off and CfC-on modes,
+- random-weight generation health check,
+- v1 checkpoint generation report with new sampler,
+- preset parameter verification on current runtime.
 
-Run this once to untrack files now covered by `.gitignore` without deleting local copies:
+## Web Inference App
+
+The repository now includes a rebuilt Flask web app at `app/`.
+
+Features:
+
+- drag/drop MIDI seed upload,
+- checkpoint selector from `app/models/`,
+- generation controls (temperature, length, top-p, top-k),
+- direct use of model `generate()` and shared sampling logic in `model/sampling.py`,
+- downloadable output MIDI,
+- CPU-compatible (GRU fallback, no mamba-ssm required).
+
+Setup / run:
 
 ```bash
-git ls-files -ci --exclude-standard -z | xargs -0 git rm --cached --
-git commit -m "chore: untrack generated artifacts"
+cd app
+./setup.sh   # or setup.bat on Windows
+./run.sh     # or run.bat on Windows
 ```
 
-## Kaggle Training
+Place files before launch:
 
-Kaggle offers 30 hours/week of free GPU (P100 or T4) with 12-hour sessions
-and no inactivity disconnect - better than Colab free tier for long runs.
+- tokenizer: `app/tokenizer/tokenizer.json`
+- checkpoints: `app/models/*.safetensors` or `app/models/*.pt`
 
-### Setup
-1. Add your GitHub repo as a Kaggle dataset (Code -> New Dataset -> GitHub)
-2. Add MAESTRO as a Kaggle dataset
-3. Open `notebooks/00_kaggle_training.ipynb`
-4. Enable GPU: Settings -> Accelerator -> GPU
-5. Enable Internet: Settings -> Internet -> On (needed for pip installs)
+## Kaggle / Session Helpers
 
-### Persistence
-Kaggle does not have Google Drive. Checkpoints are saved to `/kaggle/working/`.
-To persist across sessions:
-- Save a notebook version (Run All -> Save Version) after training
-- Download `checkpoints/best.safetensors` from the output panel
-- Re-upload as a dataset for the next session OR just re-run (preprocessing
-  is cached in working dir within a session but resets between sessions)
+- `session.py` for long-running session orchestration.
+- `piano_kaggle_session.py` for Kaggle runtime setup, resume, and generation.
+- checkpoints include full model/data/train configs for reproducible reconstruction.
 
-### Continuing from a previous checkpoint
-Upload your `best.safetensors` as a Kaggle dataset, then in `piano_kaggle_session.py`
-add a `resume_from` parameter pointing to that dataset path.
+## Notes
 
-## Evaluation Metrics Guide
-
-- `pitch_class_cosine`: key consistency between seed and continuation (higher is better).
-- `pitch_class_entropy`: tonal spread / chromaticity (too high can indicate unstable tonality).
-- `note_density`: notes per second (checks texture continuity).
-- `rhythmic_regularity` (IOI coefficient of variation): lower means more regular pulse.
-- `mean_velocity_ratio`: dynamic consistency between seed and continuation.
-
-The primary comparison is seed-vs-continuation consistency across the three model families:
-- Baseline GRU
-- Mamba-only (CfC ablated)
-- Hybrid Mamba+CfC
-
-## Known Limitations
-
-- Absolute learned token embeddings are still present in the base stack and may degrade quality far beyond configured context length.
-- MIDI-only objective does not directly optimize perceptual audio quality.
-- Token-level next-token loss can still miss long-horizon motif structure.
-- Mamba fallback is for compatibility/debugging, not architecture equivalence.
-
-## Next Steps
-
-- Add multi-objective losses for rhythm and motif consistency.
-- Extend evaluation with structural repetition and cadence metrics.
-- Add human listening tests and blind A/B ranking.
-
-## References
-
-- MAESTRO dataset:
-  - Curtis Hawthorne et al., "Enabling Factorized Piano Music Modeling and Generation with the MAESTRO Dataset," ICLR 2019.
-- Mamba:
-  - Albert Gu and Tri Dao, "Mamba: Linear-Time Sequence Modeling with Selective State Spaces," 2023.
-- CfC / liquid neural dynamics:
-  - Ramin Hasani et al., "Closed-form Continuous-time Neural Networks," Nature Machine Intelligence, 2022.
+- On CPU/local environments, `mamba-ssm` is typically unavailable; the model uses a causal GRU fallback implementation for compatibility.
+- On CUDA runtimes with `mamba-ssm` installed, real Mamba kernels are used.
