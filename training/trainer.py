@@ -38,6 +38,21 @@ class Trainer:
         self.data_config = data_config
 
         self.device = self._resolve_device(config.device)
+        requested_data_parallel = bool(
+            getattr(self.config, "_enable_data_parallel", True)
+        )
+        self.device_count = (
+            torch.cuda.device_count() if self.device.type == "cuda" else 1
+        )
+        self.use_data_parallel = (
+            self.device.type == "cuda"
+            and self.device_count > 1
+            and requested_data_parallel
+        )
+        if self.use_data_parallel:
+            device_ids = list(range(self.device_count))
+            print(f"Using DataParallel across GPUs: {device_ids}")
+            self.model = torch.nn.DataParallel(self.model, device_ids=device_ids)
         self.model.to(self.device)
 
         self.optimizer = AdamW(
@@ -86,6 +101,11 @@ class Trainer:
                     warnings.warn(f"Failed to load tokenizer at {tok_path}: {exc}")
 
         self._maybe_init_wandb()
+
+    def _unwrap_model(self) -> Any:
+        if isinstance(self.model, torch.nn.DataParallel):
+            return self.model.module
+        return self.model
 
     @staticmethod
     def format_perplexity(loss: float) -> str:
@@ -434,8 +454,9 @@ class Trainer:
         best: bool = False,
         tag: Optional[str] = None,
     ) -> None:
+        core_model = self._unwrap_model()
         model_state = {
-            k: v.detach().cpu().contiguous() for k, v in self.model.state_dict().items()
+            k: v.detach().cpu().contiguous() for k, v in core_model.state_dict().items()
         }
         model_state_to_save = _prepare_state_for_safetensors(model_state)
 
@@ -454,7 +475,7 @@ class Trainer:
             "data_config": asdict(self.data_config)
             if self.data_config is not None
             else None,
-            "model_config": _safe_asdict(getattr(self.model, "config", None)),
+            "model_config": _safe_asdict(getattr(core_model, "config", None)),
             "model_weights_path": str(latest_model_path.name),
             "history": self.history,
             "best_val_loss": self.best_val_loss,
@@ -494,10 +515,10 @@ class Trainer:
             if not model_path.exists():
                 model_path = ckpt_path.parent / "latest_model.safetensors"
             model_state = safetensors_load_file(str(model_path), device="cpu")
-            self.model.load_state_dict(model_state)
+            self._unwrap_model().load_state_dict(model_state)
         elif ckpt_path.suffix == ".safetensors":
             model_state = safetensors_load_file(str(ckpt_path), device="cpu")
-            self.model.load_state_dict(model_state)
+            self._unwrap_model().load_state_dict(model_state)
             state_guess = ckpt_path.with_name(
                 ckpt_path.name.replace("_model.safetensors", "_state.pt")
             )
@@ -538,7 +559,8 @@ class Trainer:
             return
 
         try:
-            generate_fn = getattr(self.model, "generate", None)
+            core_model = self._unwrap_model()
+            generate_fn = getattr(core_model, "generate", None)
             if not callable(generate_fn):
                 raise RuntimeError("Model does not expose generate(...)")
             generated = generate_fn(
@@ -591,14 +613,16 @@ class Trainer:
         total_vram = torch.cuda.get_device_properties(self.device).total_memory
         total_vram_gb = total_vram / (1024**3)
 
-        param_count = sum(p.numel() for p in self.model.parameters())
+        core_model = self._unwrap_model()
+
+        param_count = sum(p.numel() for p in core_model.parameters())
         params_bytes = param_count * 4
         grads_bytes = param_count * 4
         adam_bytes = param_count * 8
 
         seq_len = self._infer_sequence_length()
-        d_model = getattr(getattr(self.model, "config", None), "d_model", 256)
-        layers = getattr(getattr(self.model, "config", None), "n_layers", 4)
+        d_model = getattr(getattr(core_model, "config", None), "d_model", 256)
+        layers = getattr(getattr(core_model, "config", None), "n_layers", 4)
         activation_bytes = (
             self.config.batch_size * seq_len * d_model * max(layers, 1) * 4 * 4
         )
@@ -610,6 +634,11 @@ class Trainer:
             f"Estimated training memory: {estimate_gb:.2f} GB "
             f"(GPU available: {total_vram_gb:.2f} GB)"
         )
+        if self.use_data_parallel:
+            print(
+                "DataParallel active across "
+                f"{self.device_count} GPUs (global batch={self.config.batch_size})."
+            )
         if estimate_gb > 12.0:
             warnings.warn(
                 "Estimated memory usage exceeds 12GB. Consider lower batch size or shorter context."

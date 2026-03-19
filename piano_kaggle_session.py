@@ -17,7 +17,7 @@ import shutil
 import time
 import warnings
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 from safetensors.torch import load_file as safetensors_load_file
@@ -31,6 +31,172 @@ from model.hybrid import PianoHybridModel
 from scale_config import SCALE_PRESETS, get_preset
 from training.trainer import Trainer
 from utils.session_utils import SessionWatchdog, get_gpu_info
+
+
+def _as_bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _probe_mamba_kernel() -> Tuple[bool, str]:
+    if not torch.cuda.is_available():
+        return False, "CUDA is unavailable"
+
+    try:
+        import model.mamba_block as mamba_block
+    except Exception as exc:
+        return False, f"Could not import model.mamba_block ({exc})"
+
+    if (not bool(getattr(mamba_block, "MAMBA_AVAILABLE", False))) or getattr(
+        mamba_block, "_Mamba", None
+    ) is None:
+        return False, "mamba_ssm package is not available in this runtime"
+
+    try:
+        device = torch.device("cuda")
+        with torch.no_grad():
+            probe = mamba_block._Mamba(d_model=16, d_state=8, d_conv=4, expand=2).to(
+                device
+            )
+            x = torch.randn(1, 8, 16, device=device)
+            _ = probe(x)
+            torch.cuda.synchronize()
+        return True, "ok"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _configure_mamba_backend() -> None:
+    require_mamba = _as_bool_env("PIANO_REQUIRE_MAMBA", default=True)
+    allow_fallback = _as_bool_env("PIANO_ALLOW_GRU_FALLBACK", default=False)
+
+    ok, detail = _probe_mamba_kernel()
+    if ok:
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0)
+            cap = torch.cuda.get_device_capability(0)
+            print(
+                "Mamba kernel probe passed "
+                f"(GPU={name}, compute capability={cap[0]}.{cap[1]})."
+            )
+        else:
+            print("Mamba probe passed.")
+        return
+
+    reason = detail
+    if torch.cuda.is_available():
+        try:
+            name = torch.cuda.get_device_name(0)
+            cap = torch.cuda.get_device_capability(0)
+            reason = f"{detail} | GPU={name} (compute capability={cap[0]}.{cap[1]})"
+        except Exception:
+            reason = detail
+
+    if require_mamba and not allow_fallback:
+        raise RuntimeError(
+            "Mamba is required but kernel probe failed. "
+            f"Details: {reason}. "
+            "On Kaggle, switch Accelerator to T4 and rerun Cell 1, then Cell 3. "
+            "If you explicitly want fallback, set PIANO_ALLOW_GRU_FALLBACK=1."
+        )
+
+    try:
+        import model.mamba_block as mamba_block
+
+        mamba_block.MAMBA_AVAILABLE = False
+        mamba_block._Mamba = None
+        warnings.warn(f"Mamba probe failed; using GRU fallback. Details: {reason}")
+    except Exception as exc:
+        warnings.warn(
+            f"Mamba probe failed and fallback patch could not be applied ({exc})."
+        )
+
+
+def _configure_kaggle_performance(train_cfg, scale: Optional[str] = None) -> None:
+    if torch.cuda.is_available():
+        try:
+            torch.backends.cudnn.benchmark = True
+        except Exception:
+            pass
+
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+        except Exception:
+            pass
+
+        try:
+            torch.backends.cudnn.allow_tf32 = True
+        except Exception:
+            pass
+
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+    gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if torch.cuda.is_available():
+        gpu_names = [torch.cuda.get_device_name(i) for i in range(gpu_count)]
+        print(f"Detected CUDA GPUs ({gpu_count}): {gpu_names}")
+    train_cfg.device = "cuda" if torch.cuda.is_available() else "cpu"
+    setattr(train_cfg, "_enable_data_parallel", gpu_count > 1)
+
+    # Increase data throughput by default on Kaggle; can be overridden via env.
+    workers_env = os.environ.get("PIANO_NUM_WORKERS")
+    if workers_env is not None:
+        try:
+            num_workers = max(0, int(workers_env))
+        except Exception:
+            num_workers = 4
+    else:
+        cpu_count = os.cpu_count() or 4
+        num_workers = max(2, min(8, cpu_count))
+    setattr(train_cfg, "_force_num_workers", num_workers)
+
+    # Auto-scale global batch for multi-GPU to improve utilization.
+    if gpu_count > 1 and os.environ.get("PIANO_DISABLE_AUTO_BATCH", "0") != "1":
+        base_batch = int(train_cfg.batch_size)
+        base_accum = int(train_cfg.grad_accumulation_steps)
+
+        default_target = {
+            "nano": 128,
+            "micro": 64,
+            "small": 32,
+            "medium": 16,
+        }.get(str(scale).lower() if scale is not None else "", 64)
+
+        default_max = {
+            "nano": 256,
+            "micro": 128,
+            "small": 96,
+            "medium": 64,
+        }.get(str(scale).lower() if scale is not None else "", 128)
+
+        # Aggressive but bounded scaling to keep both GPUs busy.
+        scaled = max(base_batch * gpu_count * 4, int(default_target))
+        max_batch = int(os.environ.get("PIANO_MAX_BATCH_SIZE", str(default_max)))
+        train_cfg.batch_size = max(base_batch, min(max_batch, scaled))
+
+        # Prefer more frequent optimizer steps on multi-GPU unless overridden.
+        accum_env = os.environ.get("PIANO_GRAD_ACCUM_STEPS")
+        if accum_env is not None:
+            try:
+                train_cfg.grad_accumulation_steps = max(1, int(accum_env))
+            except Exception:
+                train_cfg.grad_accumulation_steps = 1
+        else:
+            train_cfg.grad_accumulation_steps = 1 if base_accum > 1 else base_accum
+
+    print(
+        "Performance config: "
+        f"device={train_cfg.device}, gpus={gpu_count}, "
+        f"batch_size={train_cfg.batch_size}, "
+        f"grad_accum={train_cfg.grad_accumulation_steps}, "
+        f"num_workers={getattr(train_cfg, '_force_num_workers', 'n/a')}, "
+        f"data_parallel={getattr(train_cfg, '_enable_data_parallel', False)}"
+    )
 
 
 def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
@@ -244,11 +410,15 @@ def _print_kaggle_banner(
     print(f"  Checkpoint dir:    {paths['checkpoint_dir']}")
     print(f"  Processed dir:     {paths['processed_dir']}")
     print(f"  Tokenizer path:    {paths['tokenizer_path']}")
+    print(
+        f"  CUDA devices:      {torch.cuda.device_count() if torch.cuda.is_available() else 0}"
+    )
     print("=" * 56)
 
 
 def run_kaggle_session(scale: str = "nano", max_epochs: int = 2000) -> Dict[str, Any]:
     paths = setup_kaggle_environment()
+    _configure_mamba_backend()
     gpu = get_gpu_info()
 
     preset = get_preset(scale)
@@ -258,6 +428,7 @@ def run_kaggle_session(scale: str = "nano", max_epochs: int = 2000) -> Dict[str,
 
     train_cfg.max_epochs = int(max_epochs)
     train_cfg.checkpoint_dir = paths["checkpoint_dir"]
+    _configure_kaggle_performance(train_cfg, scale=scale)
 
     data_cfg.maestro_path = paths["maestro_root"]
     data_cfg.processed_path = paths["processed_dir"]
@@ -415,6 +586,14 @@ def calibrate_on_kaggle() -> None:
     Print actual parameter counts for all presets on this Kaggle runtime.
     Run this once to verify preset calibration before a long training run.
     """
+    _configure_mamba_backend()
+
+    class _TmpTrainCfg:
+        device = "auto"
+        batch_size = 4
+        grad_accumulation_steps = 1
+
+    _configure_kaggle_performance(_TmpTrainCfg)
     print("Parameter calibration on this runtime:")
     print(
         f"GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}"
@@ -436,6 +615,7 @@ def calibrate_on_kaggle() -> None:
 
 def generate_from_best_checkpoint(scale: str = "nano") -> Path:
     paths = setup_kaggle_environment()
+    _configure_mamba_backend()
     preset = get_preset(scale)
 
     model_cfg = preset["model"]
