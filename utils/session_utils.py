@@ -174,7 +174,18 @@ class SessionWatchdog:
             tag = f"watchdog_{int(time.time())}"
             self.trainer.save_checkpoint(epoch=epoch, val_loss=latest_val, tag=tag)
 
-            local_path = str(self.trainer.checkpoint_dir / "latest_model.safetensors")
+            checkpoint_dir = self.trainer.checkpoint_dir
+            latest_candidates = [
+                checkpoint_dir / "latest.safetensors",
+                checkpoint_dir / "latest_model.safetensors",
+            ]
+            latest_path = next((p for p in latest_candidates if p.exists()), None)
+            if latest_path is None:
+                raise FileNotFoundError(
+                    f"No latest checkpoint found in {checkpoint_dir}"
+                )
+
+            local_path = str(latest_path)
             self.drive_sync.sync_checkpoint(local_path=local_path, tag="latest")
             self.drive_sync.sync_checkpoint(local_path=local_path, tag=tag)
             self.drive_sync.wait_for_sync()

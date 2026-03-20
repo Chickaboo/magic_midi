@@ -29,7 +29,11 @@ from generation.generate import GenerationConfig, generate_continuation
 from kaggle_config import setup_kaggle_environment
 from model.hybrid import PianoHybridModel
 from scale_config import SCALE_PRESETS, get_preset, verify_preset_params
-from training.trainer import Trainer
+from training.trainer import (
+    KAGGLE_KEEP_EVERY_N_EPOCHS,
+    Trainer,
+    rotate_kaggle_checkpoint_dir,
+)
 from utils.session_utils import SessionWatchdog, get_gpu_info
 
 
@@ -334,6 +338,11 @@ class _KaggleSyncShim:
             state_tmp = state_dst.with_name(state_dst.name + ".tmp")
             shutil.copy2(state_src, state_tmp)
             os.replace(state_tmp, state_dst)
+
+        rotate_kaggle_checkpoint_dir(
+            self.checkpoint_dir,
+            keep_every_n_epochs=KAGGLE_KEEP_EVERY_N_EPOCHS,
+        )
         return True
 
     def wait_for_sync(self) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import shutil
 import time
 import warnings
 from contextlib import nullcontext
@@ -19,6 +20,109 @@ from config import DataConfig, TrainConfig
 from data.tokenizer import PianoTokenizer
 from training.losses import create_targets, next_token_loss
 from training.scheduler import WarmupCosineScheduler
+
+
+KAGGLE_WORKING_ROOT = Path("/kaggle/working")
+KAGGLE_CHECKPOINT_ROOT = KAGGLE_WORKING_ROOT / "checkpoints"
+KAGGLE_WARN_FREE_GB = 3.0
+KAGGLE_EMERGENCY_FREE_GB = 2.0
+KAGGLE_KEEP_EVERY_N_EPOCHS = 10
+KAGGLE_ALWAYS_KEEP_FILES = {
+    "best.safetensors",
+    "latest.safetensors",
+    "best_state.pt",
+    "latest_state.pt",
+}
+
+
+def _is_kaggle_checkpoint_dir(path: Path) -> bool:
+    try:
+        resolved = path.resolve()
+    except Exception:
+        resolved = path
+    normalized = str(resolved).replace("\\", "/").rstrip("/")
+    target = str(KAGGLE_CHECKPOINT_ROOT).replace("\\", "/").rstrip("/")
+    return normalized.startswith(target)
+
+
+def _checkpoint_dir_size_bytes(checkpoint_dir: Path) -> int:
+    total = 0
+    for file_path in checkpoint_dir.rglob("*"):
+        if not file_path.is_file():
+            continue
+        try:
+            total += int(file_path.stat().st_size)
+        except Exception:
+            continue
+    return int(total)
+
+
+def _parse_epoch_from_rotation_name(filename: str) -> Optional[int]:
+    if filename.startswith("epoch_") and filename.endswith(".safetensors"):
+        token = filename[len("epoch_") : -len(".safetensors")]
+        if token.isdigit():
+            return int(token)
+
+    if filename.startswith("epoch_") and filename.endswith("_state.pt"):
+        token = filename[len("epoch_") : -len("_state.pt")]
+        if token.isdigit():
+            return int(token)
+
+    return None
+
+
+def rotate_kaggle_checkpoint_dir(
+    checkpoint_dir: Path,
+    keep_every_n_epochs: int = KAGGLE_KEEP_EVERY_N_EPOCHS,
+) -> Dict[str, float]:
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    keep_every = max(1, int(keep_every_n_epochs))
+
+    deleted_files = 0
+    kept_files = 0
+
+    for file_path in checkpoint_dir.iterdir():
+        if not file_path.is_file():
+            continue
+
+        name = file_path.name
+        keep = False
+
+        if name in KAGGLE_ALWAYS_KEEP_FILES:
+            keep = True
+        else:
+            epoch = _parse_epoch_from_rotation_name(name)
+            if epoch is not None and epoch % keep_every == 0:
+                keep = True
+
+        if keep:
+            kept_files += 1
+            continue
+
+        try:
+            file_path.unlink()
+            deleted_files += 1
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            warnings.warn(f"Failed to delete checkpoint artifact {file_path}: {exc}")
+
+    total_size_bytes = _checkpoint_dir_size_bytes(checkpoint_dir)
+    return {
+        "deleted_files": float(deleted_files),
+        "kept_files": float(kept_files),
+        "total_size_bytes": float(total_size_bytes),
+        "total_size_mb": float(total_size_bytes / (1024**2)),
+    }
+
+
+def kaggle_free_space_gb(path: Path = KAGGLE_WORKING_ROOT) -> float:
+    try:
+        _total, _used, free = shutil.disk_usage(str(path))
+    except Exception as exc:
+        warnings.warn(f"Failed to read disk usage for {path}: {exc}")
+        return -1.0
+    return float(free / (1024**3))
 
 
 class Trainer:
@@ -79,6 +183,12 @@ class Trainer:
         self.checkpoint_dir = Path(self.config.checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         (self.checkpoint_dir / "samples").mkdir(parents=True, exist_ok=True)
+        self._kaggle_rotation_enabled = _is_kaggle_checkpoint_dir(self.checkpoint_dir)
+        if self._kaggle_rotation_enabled:
+            print(
+                "Kaggle checkpoint rotation active: "
+                "keep latest/best + every 10th epoch only."
+            )
 
         self.history: Dict[str, list] = {
             "train_loss": [],
@@ -123,12 +233,57 @@ class Trainer:
             return f"{ppl / 1_000_000:.1f}M"
         return f"{ppl:.2f}"
 
+    def _run_kaggle_checkpoint_rotation(self, epoch: int, trigger: str) -> None:
+        if not self._kaggle_rotation_enabled:
+            return
+        stats = rotate_kaggle_checkpoint_dir(
+            self.checkpoint_dir,
+            keep_every_n_epochs=KAGGLE_KEEP_EVERY_N_EPOCHS,
+        )
+        print(
+            "[Kaggle checkpoint cleanup] "
+            f"epoch={int(epoch):03d} trigger={trigger} "
+            f"deleted={int(stats['deleted_files'])} "
+            f"kept={int(stats['kept_files'])} "
+            f"size={float(stats['total_size_mb']):.1f}MB"
+        )
+
+    def _kaggle_pre_epoch_disk_check(self, epoch: int) -> None:
+        if not self._kaggle_rotation_enabled:
+            return
+
+        free_gb = kaggle_free_space_gb(KAGGLE_WORKING_ROOT)
+        if free_gb < 0:
+            return
+
+        if free_gb < KAGGLE_WARN_FREE_GB:
+            print(
+                "[Kaggle disk warning] "
+                f"/kaggle/working free space is low: {free_gb:.2f} GB"
+            )
+
+        if free_gb < KAGGLE_EMERGENCY_FREE_GB:
+            print(
+                "[Kaggle disk emergency] "
+                f"epoch={int(epoch):03d} free={free_gb:.2f} GB < "
+                f"{KAGGLE_EMERGENCY_FREE_GB:.1f} GB. "
+                "Running synchronous checkpoint cleanup before save."
+            )
+            self._run_kaggle_checkpoint_rotation(epoch=epoch, trigger="pre_epoch")
+            free_after = kaggle_free_space_gb(KAGGLE_WORKING_ROOT)
+            if free_after >= 0:
+                print(
+                    "[Kaggle disk status] "
+                    f"free space after emergency cleanup: {free_after:.2f} GB"
+                )
+
     def train(self) -> Dict[str, list]:
         self._warn_if_high_memory_estimate()
         start_time = time.time()
 
         for epoch in range(1, self.config.max_epochs + 1):
             self.current_epoch = epoch
+            self._kaggle_pre_epoch_disk_check(epoch=epoch)
             epoch_start = time.time()
             self.model.train()
 
@@ -267,6 +422,7 @@ class Trainer:
             for local_epoch in range(1, n + 1):
                 epoch = int(start_epoch + local_epoch)
                 self.current_epoch = epoch
+                self._kaggle_pre_epoch_disk_check(epoch=epoch)
                 epoch_start = time.time()
                 self.model.train()
 
@@ -477,7 +633,12 @@ class Trainer:
         }
         model_state_to_save = _prepare_state_for_safetensors(model_state)
 
-        latest_model_path = self.checkpoint_dir / "latest_model.safetensors"
+        latest_model_name = (
+            "latest.safetensors"
+            if self._kaggle_rotation_enabled
+            else "latest_model.safetensors"
+        )
+        latest_model_path = self.checkpoint_dir / latest_model_name
         latest_state_path = self.checkpoint_dir / "latest_state.pt"
 
         safetensors_save_file(model_state_to_save, str(latest_model_path))
@@ -501,7 +662,12 @@ class Trainer:
         torch.save(state, latest_state_path)
 
         if best:
-            best_model_path = self.checkpoint_dir / "best_model.safetensors"
+            best_model_name = (
+                "best.safetensors"
+                if self._kaggle_rotation_enabled
+                else "best_model.safetensors"
+            )
+            best_model_path = self.checkpoint_dir / best_model_name
             best_state_path = self.checkpoint_dir / "best_state.pt"
             safetensors_save_file(model_state_to_save, str(best_model_path))
             state_best = dict(state)
@@ -509,12 +675,25 @@ class Trainer:
             torch.save(state_best, best_state_path)
 
         if tag is not None:
-            tagged_model = self.checkpoint_dir / f"{tag}_model.safetensors"
+            tagged_model_name = (
+                f"{tag}.safetensors"
+                if self._kaggle_rotation_enabled
+                else f"{tag}_model.safetensors"
+            )
+            tagged_model = self.checkpoint_dir / tagged_model_name
             tagged_state = self.checkpoint_dir / f"{tag}_state.pt"
             safetensors_save_file(model_state_to_save, str(tagged_model))
             state_tag = dict(state)
             state_tag["model_weights_path"] = str(tagged_model.name)
             torch.save(state_tag, tagged_state)
+
+        if self._kaggle_rotation_enabled:
+            trigger = "latest"
+            if best:
+                trigger = "best"
+            if tag is not None:
+                trigger = str(tag)
+            self._run_kaggle_checkpoint_rotation(epoch=epoch, trigger=trigger)
 
     def load_checkpoint(self, path: str) -> Dict[str, Any]:
         ckpt_path = Path(path)
@@ -525,26 +704,41 @@ class Trainer:
 
         if ckpt_path.suffix == ".pt":
             state = torch.load(ckpt_path, map_location=self.device)
-            model_weights_path = state.get(
-                "model_weights_path", "latest_model.safetensors"
+            model_weights_path = state.get("model_weights_path")
+            candidates = []
+            if isinstance(model_weights_path, str) and model_weights_path:
+                candidates.append(ckpt_path.parent / model_weights_path)
+            candidates.extend(
+                [
+                    ckpt_path.parent / "latest.safetensors",
+                    ckpt_path.parent / "latest_model.safetensors",
+                ]
             )
-            model_path = ckpt_path.parent / str(model_weights_path)
-            if not model_path.exists():
-                model_path = ckpt_path.parent / "latest_model.safetensors"
+
+            model_path = next((p for p in candidates if p.exists()), None)
+            if model_path is None:
+                raise FileNotFoundError(
+                    f"No model weights found next to checkpoint state {ckpt_path}"
+                )
             model_state = safetensors_load_file(str(model_path), device="cpu")
             self._unwrap_model().load_state_dict(model_state)
         elif ckpt_path.suffix == ".safetensors":
             model_state = safetensors_load_file(str(ckpt_path), device="cpu")
             self._unwrap_model().load_state_dict(model_state)
-            state_guess = ckpt_path.with_name(
-                ckpt_path.name.replace("_model.safetensors", "_state.pt")
-            )
-            if state_guess.exists():
-                state = torch.load(state_guess, map_location=self.device)
-            elif (ckpt_path.parent / "latest_state.pt").exists():
-                state = torch.load(
-                    ckpt_path.parent / "latest_state.pt", map_location=self.device
+            state_candidates = []
+            if ckpt_path.name.endswith("_model.safetensors"):
+                state_candidates.append(
+                    ckpt_path.with_name(
+                        ckpt_path.name.replace("_model.safetensors", "_state.pt")
+                    )
                 )
+            state_candidates.append(ckpt_path.with_name(f"{ckpt_path.stem}_state.pt"))
+            state_candidates.append(ckpt_path.parent / "latest_state.pt")
+
+            for state_guess in state_candidates:
+                if state_guess.exists():
+                    state = torch.load(state_guess, map_location=self.device)
+                    break
         else:
             raise ValueError("Checkpoint path must end with .pt or .safetensors")
 

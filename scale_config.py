@@ -50,7 +50,7 @@ SCALE_PRESETS: Dict[str, Dict[str, Any]] = {
             warmup_steps=200,
             max_grad_norm=1.5,
             label_smoothing=0.1,
-            save_every_n_epochs=1,
+            save_every_n_epochs=5,
             keep_every_n_epochs=10,
         ),
         "data": DataConfig(
@@ -96,7 +96,7 @@ SCALE_PRESETS: Dict[str, Dict[str, Any]] = {
             warmup_steps=2000,
             max_grad_norm=1.5,
             label_smoothing=0.1,
-            save_every_n_epochs=1,
+            save_every_n_epochs=5,
             keep_every_n_epochs=10,
         ),
         "data": DataConfig(
@@ -142,7 +142,7 @@ SCALE_PRESETS: Dict[str, Dict[str, Any]] = {
             warmup_steps=2000,
             max_grad_norm=1.5,
             label_smoothing=0.1,
-            save_every_n_epochs=1,
+            save_every_n_epochs=5,
             keep_every_n_epochs=10,
         ),
         "data": DataConfig(
