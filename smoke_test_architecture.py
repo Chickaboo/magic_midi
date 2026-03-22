@@ -383,6 +383,7 @@ def test_v2_model() -> None:
     seed = torch.randint(0, cfg.vocab_size, (128,))
     # V2 uses a stricter confidence ceiling because the larger dual-stream model with
     # label smoothing should maintain a more distributed next-token distribution.
+    # Set below legacy v1 (0.95) to keep headroom for calibration drift over training.
     report = model.generation_health_check(
         seed_tokens=seed,
         steps=20,
@@ -392,7 +393,7 @@ def test_v2_model() -> None:
         repetition_penalty=1.1,
         repetition_window=64,
         min_tokens_to_keep=3,
-        top1_threshold=0.85,
+        top1_threshold=0.80,
         raise_on_failure=True,
     )
     _print_ok(
