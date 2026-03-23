@@ -6,6 +6,8 @@ import torch.nn.functional as F
 
 
 def _build_alibi_slopes(num_heads: int, device: torch.device) -> torch.Tensor:
+    """Build ALiBi slope values for each attention head."""
+
     head_ids = torch.arange(1, num_heads + 1, device=device, dtype=torch.float32)
     return torch.pow(2.0, (-8.0 / float(num_heads)) * head_ids)
 
@@ -25,6 +27,8 @@ class RelativePositionBias(nn.Module):
         self.embeddings = nn.Embedding(2 * self.max_distance + 1, self.num_heads)
 
     def forward(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """Return learned relative position bias with shape `(heads, seq, seq)`."""
+
         if seq_len <= 0:
             raise ValueError("seq_len must be > 0")
 
@@ -46,6 +50,8 @@ class ALiBiPositionBias(nn.Module):
         self.num_heads = int(num_heads)
 
     def forward(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """Return deterministic ALiBi bias with shape `(heads, seq, seq)`."""
+
         if seq_len <= 0:
             raise ValueError("seq_len must be > 0")
 
@@ -56,6 +62,8 @@ class ALiBiPositionBias(nn.Module):
 
 
 class MusicAttentionBlock(nn.Module):
+    """Causal multi-head attention block with residual FFN sublayer."""
+
     def __init__(
         self,
         d_model: int,
@@ -65,6 +73,7 @@ class MusicAttentionBlock(nn.Module):
         use_relative_bias: bool = True,
         bias_type: str = "learned",
         ffn_expansion: int = 2,
+        residual_scale: float = 1.0,
     ) -> None:
         super().__init__()
         if d_model <= 0:
@@ -77,6 +86,8 @@ class MusicAttentionBlock(nn.Module):
             )
         if ffn_expansion <= 0:
             raise ValueError("ffn_expansion must be > 0")
+        if residual_scale <= 0.0:
+            raise ValueError("residual_scale must be > 0")
 
         normalized_bias_type = str(bias_type).strip().lower()
         if normalized_bias_type not in {"learned", "alibi"}:
@@ -88,6 +99,7 @@ class MusicAttentionBlock(nn.Module):
         self.num_heads = int(num_heads)
         self.head_dim = self.d_model // self.num_heads
         self.dropout = float(dropout)
+        self.residual_scale = float(residual_scale)
         self.use_relative_bias = bool(use_relative_bias)
         self.bias_type = normalized_bias_type
 
@@ -118,6 +130,8 @@ class MusicAttentionBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run causal attention + FFN residual updates on sequence features."""
+
         # Entry shape contract: x is (batch, seq_len, d_model).
         if x.ndim != 3:
             raise ValueError(
@@ -164,7 +178,7 @@ class MusicAttentionBlock(nn.Module):
         attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, seq_len, dim)
         attn_out = self.out_dropout(self.out_proj(attn_out))
 
-        x = x + attn_out
-        x = x + self.ffn(self.norm2(x))
+        x = x + (attn_out * float(self.residual_scale))
+        x = x + (self.ffn(self.norm2(x)) * float(self.residual_scale))
         # Exit shape contract: output is (batch, seq_len, d_model).
         return x

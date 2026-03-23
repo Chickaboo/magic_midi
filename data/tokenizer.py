@@ -3,7 +3,7 @@ from __future__ import annotations
 import tempfile
 import warnings
 from pathlib import Path
-from typing import Any, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 from miditok import Octuple, REMI, TokenizerConfig
@@ -22,9 +22,6 @@ TIME_EVENT_TYPES = {
     "velocity",
     "duration",
 }
-BPE_WORD_PREFIX = "\u2581"
-
-
 ROUNDTRIP_TOLERANCE = 0.05
 
 
@@ -44,6 +41,7 @@ class PianoTokenizer:
 
         if tokenizer is not None:
             self.tokenizer = tokenizer
+            self._token_event_cache: Dict[int, List[str]] = {}
             return
 
         tokenizer_config = TokenizerConfig(
@@ -58,6 +56,7 @@ class PianoTokenizer:
             self.tokenizer = Octuple(tokenizer_config=tokenizer_config)
         else:
             self.tokenizer = REMI(tokenizer_config=tokenizer_config)
+        self._token_event_cache: Dict[int, List[str]] = {}
 
     def train(self, midi_paths: List[Path], vocab_size: int) -> None:
         """Train BPE tokenizer using available MidiTok API variants."""
@@ -233,29 +232,58 @@ class PianoTokenizer:
         self,
         token_ids: Sequence[int],
     ) -> List[int] | None:
-        """Infer pre-BPE group lengths for each BPE id when available."""
+        """Infer pre-BPE group lengths by decoding one BPE id at a time."""
 
-        model = getattr(self.tokenizer, "_model", None)
-        id_to_token = getattr(model, "id_to_token", None)
-        if not callable(id_to_token):
+        if not token_ids:
             return None
 
-        group_lengths: List[int] = []
+        lengths: List[int] = []
         for token_id in token_ids:
-            try:
-                token_piece = str(id_to_token(int(token_id)) or "")
-            except Exception:
+            events = self.decode_token_id_events(int(token_id))
+            if not events:
                 return None
+            lengths.append(int(max(1, len(events))))
 
-            if token_piece.startswith(BPE_WORD_PREFIX):
-                token_piece = token_piece[len(BPE_WORD_PREFIX) :]
+        return lengths
 
-            length = len(token_piece)
-            if length <= 0:
-                length = 1
-            group_lengths.append(int(length))
+    def decode_token_id_events(self, token_id: int) -> List[str]:
+        """Decode one token ID into constituent base token events."""
 
-        return group_lengths
+        key = int(token_id)
+        cached = self._token_event_cache.get(key)
+        if cached is not None:
+            return list(cached)
+
+        decode_token_ids = getattr(self.tokenizer, "decode_token_ids", None)
+        complete_sequence = getattr(self.tokenizer, "complete_sequence", None)
+
+        if callable(decode_token_ids):
+            try:
+                from miditok.classes import TokSequence
+
+                seq = TokSequence(ids=[key])
+                seq.are_ids_encoded = True
+                decode_token_ids(seq)
+                if callable(complete_sequence):
+                    complete_sequence(seq)
+                tokens = [str(t) for t in list(getattr(seq, "tokens", []) or [])]
+                if tokens:
+                    self._token_event_cache[key] = list(tokens)
+                    return tokens
+            except Exception:
+                pass
+
+        id_to_token = getattr(self.tokenizer, "id_to_token", None)
+        if callable(id_to_token):
+            try:
+                token_name = str(id_to_token(key) or "")
+                if token_name:
+                    self._token_event_cache[key] = [token_name]
+                    return [token_name]
+            except Exception:
+                pass
+
+        return []
 
     @staticmethod
     def _compress_features_by_groups(

@@ -9,9 +9,16 @@ import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from utils.logging_utils import get_project_logger
+
+
+LOGGER = get_project_logger()
+
 
 class DriveSync:
-    def __init__(self, drive_root: str = "/content/drive/MyDrive/piano_model"):
+    """Synchronize checkpoints, tokenizer, processed data, and logs with Drive."""
+
+    def __init__(self, drive_root: str = "/content/drive/MyDrive/piano_model") -> None:
         self.in_colab = self._is_colab_runtime()
         self.requested_drive_root = drive_root
 
@@ -62,15 +69,17 @@ class DriveSync:
         self._ensure_log_file(Path(__file__).resolve().parent / "training_log.json")
 
     def mount(self) -> bool:
+        """Mount Google Drive on Colab when available."""
+
         if not self.in_colab:
-            print(
+            LOGGER.warning(
                 "Warning: not running in Colab. Google Drive mount unavailable; "
                 f"using local path: {self.drive_root}"
             )
             return False
 
         if Path("/content/drive/MyDrive").exists():
-            print("Drive already mounted.")
+            LOGGER.info("Drive already mounted.")
             for p in [
                 self.checkpoints_dir,
                 self.logs_dir,
@@ -99,26 +108,35 @@ class DriveSync:
         except Exception as exc:  # pragma: no cover
             msg = str(exc).lower()
             if "already" in msg or "mountpoint" in msg:
-                print("Drive already mounted.")
+                LOGGER.info("Drive already mounted.")
                 return True
-            print(f"Drive mount failed: {exc}. Using local cache paths instead.")
+            LOGGER.warning(
+                "Drive mount failed (%s). Using local cache paths instead.",
+                exc,
+            )
             return False
 
     def set_checkpoint_retention(self, keep_every_n_epochs: int) -> None:
+        """Set epoch cadence for long-term checkpoint retention."""
+
         value = int(keep_every_n_epochs)
         self.keep_every_n_epochs = 0 if value <= 0 else value
 
     def should_keep_checkpoint(self, epoch: int) -> bool:
+        """Return whether an epoch checkpoint should be retained."""
+
         return int(epoch) % max(1, self.keep_every_n_epochs) == 0
 
     def _rotation_enabled(self) -> bool:
         return int(self.keep_every_n_epochs) > 0
 
     def sync_checkpoint(self, local_path: str, tag: str = "latest") -> bool:
+        """Copy one local checkpoint artifact into synced storage."""
+
         try:
             src = Path(local_path)
             if not src.exists():
-                print(f"Checkpoint sync skipped: missing local file {src}")
+                LOGGER.warning("Checkpoint sync skipped: missing local file %s", src)
                 return False
 
             tmp_dst = self.checkpoints_dir / f"{tag}_tmp.safetensors"
@@ -136,14 +154,22 @@ class DriveSync:
 
             size_mb = final_dst.stat().st_size / (1024**2)
             ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{ts}] Synced checkpoint '{tag}' ({size_mb:.2f} MB) -> {final_dst}")
+            LOGGER.info(
+                "[%s] Synced checkpoint '%s' (%.2f MB) -> %s",
+                ts,
+                tag,
+                size_mb,
+                final_dst,
+            )
             self.cleanup_old_checkpoints()
             return True
         except Exception as exc:
-            print(f"Checkpoint sync failed for tag='{tag}': {exc}")
+            LOGGER.warning("Checkpoint sync failed for tag='%s': %s", tag, exc)
             return False
 
     def sync_checkpoint_background(self, local_path: str, tag: str) -> None:
+        """Schedule asynchronous checkpoint sync for a tag."""
+
         with self._sync_lock:
             if tag in self._pending_syncs:
                 return
@@ -165,6 +191,8 @@ class DriveSync:
                 self._pending_syncs.discard(tag)
 
     def cleanup_old_checkpoints(self) -> None:
+        """Remove non-milestone epoch checkpoints based on retention setting."""
+
         if not self._rotation_enabled():
             return
 
@@ -175,8 +203,8 @@ class DriveSync:
             if not self.should_keep_checkpoint(epoch_num):
                 try:
                     file_path.unlink()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    warnings.warn(f"Failed to delete old checkpoint {file_path}: {exc}")
 
         for file_path in self.checkpoints_dir.glob("epoch_*_state.pt"):
             epoch_num = self._parse_epoch_from_name(file_path.name)
@@ -185,10 +213,12 @@ class DriveSync:
             if not self.should_keep_checkpoint(epoch_num):
                 try:
                     file_path.unlink()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    warnings.warn(f"Failed to delete old state file {file_path}: {exc}")
 
     def wait_for_sync(self) -> None:
+        """Block until all background sync jobs are complete."""
+
         with self._sync_lock:
             threads = list(self._sync_threads)
             self._sync_threads.clear()
@@ -196,11 +226,17 @@ class DriveSync:
         for t in threads:
             t.join()
 
-        print("All checkpoints synced to Drive")
+        LOGGER.info("All checkpoints synced to Drive")
 
     def restore_checkpoint(self, tag: str = "latest") -> Optional[str]:
-        drive_ckpt = self.checkpoints_dir / f"{tag}.safetensors"
-        if not drive_ckpt.exists():
+        """Restore checkpoint from synced storage into local cache."""
+
+        candidates = [
+            self.checkpoints_dir / f"{tag}.safetensors",
+            self.checkpoints_dir / f"{tag}_model.safetensors",
+        ]
+        drive_ckpt = next((p for p in candidates if p.exists()), None)
+        if drive_ckpt is None:
             return None
 
         local_ckpt = self.local_checkpoints_dir / f"{tag}.safetensors"
@@ -218,10 +254,17 @@ class DriveSync:
                 self.last_restored_state_path = str(local_state)
                 break
 
-        print(f"Restored checkpoint '{tag}' from {drive_ckpt} -> {local_ckpt}")
+        LOGGER.info(
+            "Restored checkpoint '%s' from %s -> %s",
+            tag,
+            drive_ckpt,
+            local_ckpt,
+        )
         return str(local_ckpt)
 
     def sync_processed_data(self) -> str:
+        """Sync processed dataset cache between drive and local runtime."""
+
         drive_manifest = self.processed_dir / "manifest.json"
         local_manifest = self.local_processed_dir / "manifest.json"
 
@@ -230,36 +273,40 @@ class DriveSync:
 
         if drive_count > 0:
             self._copy_tree(self.processed_dir, self.local_processed_dir)
-            print("Processed data restored from Drive cache.")
+            LOGGER.info("Processed data restored from Drive cache.")
             return "restored"
 
         if local_count > 0:
             self._copy_tree(self.local_processed_dir, self.processed_dir)
-            print("Processed data uploaded to Drive cache.")
+            LOGGER.info("Processed data uploaded to Drive cache.")
             return "uploaded"
 
-        print("Processed data not found in Drive or local cache.")
+        LOGGER.info("Processed data not found in Drive or local cache.")
         return "missing"
 
     def sync_tokenizer(self) -> Optional[str]:
+        """Sync tokenizer JSON between drive and local runtime."""
+
         drive_tok = self.tokenizer_dir / "tokenizer.json"
         local_tok = self.local_tokenizer_path
 
         if drive_tok.exists():
             shutil.copy2(drive_tok, local_tok)
-            print(f"Tokenizer restored from Drive: {drive_tok}")
+            LOGGER.info("Tokenizer restored from Drive: %s", drive_tok)
             return str(local_tok)
 
         if local_tok.exists():
             drive_tok.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(local_tok, drive_tok)
-            print(f"Tokenizer uploaded to Drive: {drive_tok}")
+            LOGGER.info("Tokenizer uploaded to Drive: %s", drive_tok)
             return str(local_tok)
 
-        print("Tokenizer not found in Drive or local cache.")
+        LOGGER.info("Tokenizer not found in Drive or local cache.")
         return None
 
     def sync_log(self, log_data: Dict[str, Any]) -> None:
+        """Append one session record to synchronized training logs."""
+
         drive_log = self.logs_dir / "training_log.json"
         local_log = Path(__file__).resolve().parent / "training_log.json"
 
@@ -274,6 +321,8 @@ class DriveSync:
         self._atomic_write_json(local_log, history)
 
     def get_training_history(self) -> Dict[str, Any]:
+        """Load training history summary from synchronized logs."""
+
         history_path = self.logs_dir / "training_log.json"
         history = self._load_json(history_path, {"sessions": []})
         sessions = history.get("sessions", [])
@@ -296,7 +345,7 @@ class DriveSync:
                 current_epoch = max(current_epoch, end_epoch)
 
         best_str = f"{best_val:.4f}" if best_val is not None else "n/a"
-        print(
+        LOGGER.info(
             "Training history summary: "
             f"sessions={total_sessions}, epochs={total_epochs}, "
             f"time={total_seconds / 3600.0:.2f}h, best_val={best_str}, "
@@ -305,6 +354,8 @@ class DriveSync:
         return history
 
     def write_heartbeat(self, payload: Dict[str, Any]) -> None:
+        """Write latest heartbeat JSON for session monitoring."""
+
         heartbeat_path = self.logs_dir / "heartbeat_latest.json"
         self._atomic_write_json(heartbeat_path, payload)
 

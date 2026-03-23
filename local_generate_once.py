@@ -9,13 +9,12 @@ from safetensors.torch import load_file as safetensors_load_file
 from config import DataConfig, ModelConfig
 from data.tokenizer import PianoTokenizer
 from generation.generate import GenerationConfig, generate_continuation
-from model.hybrid import PianoHybridModel
+from model.factory import build_model
 from utils.config_compat import normalize_model_config_payload
 
 
 ROOT = Path(r"C:\Users\Lucas\Downloads\midi_AI\piano_midi_model")
 LOCAL_DRIVE = ROOT / "local_drive" / "piano_model"
-CHECKPOINT = LOCAL_DRIVE / "checkpoints" / "latest_model.safetensors"
 STATE_PATH = LOCAL_DRIVE / "checkpoints" / "latest_state.pt"
 SEED_PATH = LOCAL_DRIVE / "generated" / "distinct_seed_10s.mid"
 TOKENIZER_PATH = LOCAL_DRIVE / "tokenizer" / "tokenizer.json"
@@ -25,6 +24,8 @@ MAESTRO_ROOT = Path(r"C:\Users\Lucas\Downloads\maestro-v3.0.0-midi\maestro-v3.0.
 
 
 def build_tokenizer_if_needed() -> PianoTokenizer:
+    """Load existing tokenizer or train one on local MAESTRO copy."""
+
     TOKENIZER_PATH.parent.mkdir(parents=True, exist_ok=True)
     if TOKENIZER_PATH.exists():
         print(f"Loading tokenizer from {TOKENIZER_PATH}")
@@ -46,8 +47,17 @@ def build_tokenizer_if_needed() -> PianoTokenizer:
 
 
 def main() -> None:
-    if not CHECKPOINT.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {CHECKPOINT}")
+    """Run one local generation pass from latest local checkpoint."""
+
+    checkpoint_candidates = [
+        LOCAL_DRIVE / "checkpoints" / "latest.safetensors",
+        LOCAL_DRIVE / "checkpoints" / "latest_model.safetensors",
+    ]
+    checkpoint_path = next((p for p in checkpoint_candidates if p.exists()), None)
+    if checkpoint_path is None:
+        raise FileNotFoundError(
+            "Checkpoint not found. Expected latest.safetensors or latest_model.safetensors"
+        )
     if not STATE_PATH.exists():
         raise FileNotFoundError(f"State file not found: {STATE_PATH}")
     if not SEED_PATH.exists():
@@ -70,8 +80,8 @@ def main() -> None:
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    model = PianoHybridModel(model_cfg)
-    model_state = safetensors_load_file(str(CHECKPOINT), device="cpu")
+    model = build_model(model_cfg)
+    model_state = safetensors_load_file(str(checkpoint_path), device="cpu")
     missing, unexpected = model.load_state_dict(model_state, strict=False)
     print(f"Missing keys: {len(missing)} | Unexpected keys: {len(unexpected)}")
     model.to(device)

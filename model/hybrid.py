@@ -13,9 +13,15 @@ from model.cfc_block import CfCBlock
 from model.ffn_block import FeedForwardBlock
 from model.mamba_block import MAMBA_AVAILABLE, MambaBlock
 from model.sampling import sample_next_token
+from utils.logging_utils import get_project_logger
+
+
+LOGGER = get_project_logger()
 
 
 class PianoHybridModel(nn.Module):
+    """Hybrid autoregressive model combining Mamba, CfC/FFN, and sparse attention."""
+
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         self.config = config
@@ -118,6 +124,8 @@ class PianoHybridModel(nn.Module):
         self.last_generation_stats: Dict[str, Any] = {}
 
     def _reset_parameters(self) -> None:
+        """Initialize embeddings and untied output projection."""
+
         init_std = float(max(1e-6, self.config.embedding_init_std))
         nn.init.normal_(self.token_embedding.weight, mean=0.0, std=init_std)
         nn.init.normal_(self.position_embedding.weight, mean=0.0, std=init_std)
@@ -130,6 +138,17 @@ class PianoHybridModel(nn.Module):
         hidden_states: Optional[List[Any]] = None,
         position_offset: int = 0,
     ) -> Tuple[torch.Tensor, Optional[List[Any]]]:
+        """Run a forward pass.
+
+        Args:
+            input_ids: Token IDs with shape `(batch, seq_len)`.
+            hidden_states: Optional CfC hidden states, one entry per active CfC layer.
+            position_offset: Absolute offset for position embedding indexing.
+
+        Returns:
+            Tuple of `(logits, new_hidden_states)`.
+        """
+
         # Entry shape contract: input_ids is (batch, seq_len).
         if input_ids.ndim != 2:
             raise ValueError(
@@ -221,6 +240,8 @@ class PianoHybridModel(nn.Module):
         return logits, (new_hidden if len(new_hidden) > 0 else None)
 
     def get_num_params(self) -> int:
+        """Log and return total number of trainable parameters."""
+
         embedding_params = (
             self.token_embedding.weight.numel() + self.position_embedding.weight.numel()
         )
@@ -270,30 +291,32 @@ class PianoHybridModel(nn.Module):
                 using_fallback = bool(getattr(layer["mamba"], "using_fallback", False))
                 break
 
-        print("PianoHybridModel parameter breakdown")
-        print(f"  embedding params: {embedding_params:,}")
-        print(f"  attention params: {attention_params:,}")
-        print(f"  mamba params: {mamba_params:,}")
-        print(f"  cfc params: {cfc_params:,}")
-        print(f"  ffn params: {ffn_params:,}")
-        print(f"  final norm params: {final_norm_params:,}")
+        LOGGER.info("PianoHybridModel parameter breakdown")
+        LOGGER.info("  embedding params: %s", f"{embedding_params:,}")
+        LOGGER.info("  attention params: %s", f"{attention_params:,}")
+        LOGGER.info("  mamba params: %s", f"{mamba_params:,}")
+        LOGGER.info("  cfc params: %s", f"{cfc_params:,}")
+        LOGGER.info("  ffn params: %s", f"{ffn_params:,}")
+        LOGGER.info("  final norm params: %s", f"{final_norm_params:,}")
         if output_tied:
-            print(
-                "  output projection params: "
-                f"{output_projection_params:,} (weight-tied to token embedding)"
+            LOGGER.info(
+                "  output projection params: %s",
+                f"{output_projection_params:,} (weight-tied to token embedding)",
             )
         else:
-            print(f"  output projection params: {output_projection_params:,}")
-        print(f"  total params: {total_params:,}")
-        print(
+            LOGGER.info(
+                "  output projection params: %s", f"{output_projection_params:,}"
+            )
+        LOGGER.info("  total params: %s", f"{total_params:,}")
+        LOGGER.info(
             "  mamba backend: "
             f"{'mamba-ssm' if (MAMBA_AVAILABLE and not using_fallback) else 'GRU fallback'}"
         )
-        print(f"  CfC enabled: {self.use_cfc}")
-        print(f"  Mamba enabled: {self.use_mamba}")
-        print(f"  Relative attention: {self.config.use_relative_attention}")
-        print(f"  Attention bias: {self.config.attention_bias_type}")
-        print(f"  Output logit scale: {self.output_logit_scale:.6f}")
+        LOGGER.info("  CfC enabled: %s", self.use_cfc)
+        LOGGER.info("  Mamba enabled: %s", self.use_mamba)
+        LOGGER.info("  Relative attention: %s", self.config.use_relative_attention)
+        LOGGER.info("  Attention bias: %s", self.config.attention_bias_type)
+        LOGGER.info("  Output logit scale: %.6f", self.output_logit_scale)
         return total_params
 
     @staticmethod
@@ -302,6 +325,8 @@ class PianoHybridModel(nn.Module):
         *,
         device: torch.device,
     ) -> torch.Tensor:
+        """Convert input seed tokens to a `(1, seq_len)` long tensor."""
+
         if isinstance(seed_tokens, torch.Tensor):
             if seed_tokens.ndim == 1:
                 seed = seed_tokens.unsqueeze(0)
@@ -322,6 +347,8 @@ class PianoHybridModel(nn.Module):
 
     @staticmethod
     def _repetition_ratio(tokens: Sequence[int]) -> float:
+        """Compute max-token frequency ratio for repetition diagnostics."""
+
         if not tokens:
             return 0.0
         counts: Dict[int, int] = {}
@@ -343,6 +370,8 @@ class PianoHybridModel(nn.Module):
         repetition_window: int = 64,
         min_tokens_to_keep: int = 3,
     ) -> List[int]:
+        """Generate a continuation from a seed sequence."""
+
         self.eval()
         device = next(self.parameters()).device
 
@@ -357,36 +386,96 @@ class PianoHybridModel(nn.Module):
         raw_top1_probs: List[float] = []
         candidate_counts: List[int] = []
 
-        for _ in range(max_new_tokens):
+        if self.use_cfc:
             context = generated[:, -self.max_sequence_length :]
             pos_offset = max(0, generated.shape[1] - context.shape[1])
-
-            logits, _ = self.forward(
+            logits, hidden_states = self.forward(
                 context,
                 hidden_states=None,
                 position_offset=pos_offset,
             )
-            next_token, diagnostics = sample_next_token(
-                logits=logits[:, -1, :],
-                context_tokens=context,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                repetition_penalty=repetition_penalty,
-                recent_window=repetition_window,
-                min_tokens_to_keep=max(3, min_tokens_to_keep),
-                top1_cap=0.95,
-            )
-            final_top1_probs.extend(
-                [float(v) for v in diagnostics.final_top1_prob.detach().cpu().tolist()]
-            )
-            raw_top1_probs.extend(
-                [float(v) for v in diagnostics.raw_top1_prob.detach().cpu().tolist()]
-            )
-            candidate_counts.extend(
-                [int(v) for v in diagnostics.candidate_count.detach().cpu().tolist()]
-            )
-            generated = torch.cat([generated, next_token], dim=1)
+
+            for step in range(max_new_tokens):
+                sample_context = generated[:, -self.max_sequence_length :]
+                next_token, diagnostics = sample_next_token(
+                    logits=logits[:, -1, :],
+                    context_tokens=sample_context,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                    recent_window=repetition_window,
+                    min_tokens_to_keep=max(3, min_tokens_to_keep),
+                    top1_cap=0.95,
+                )
+                final_top1_probs.extend(
+                    [
+                        float(v)
+                        for v in diagnostics.final_top1_prob.detach().cpu().tolist()
+                    ]
+                )
+                raw_top1_probs.extend(
+                    [
+                        float(v)
+                        for v in diagnostics.raw_top1_prob.detach().cpu().tolist()
+                    ]
+                )
+                candidate_counts.extend(
+                    [
+                        int(v)
+                        for v in diagnostics.candidate_count.detach().cpu().tolist()
+                    ]
+                )
+                generated = torch.cat([generated, next_token], dim=1)
+
+                if step == max_new_tokens - 1:
+                    break
+
+                next_pos = generated.shape[1] - 1
+                logits, hidden_states = self.forward(
+                    next_token,
+                    hidden_states=hidden_states,
+                    position_offset=next_pos,
+                )
+        else:
+            for _ in range(max_new_tokens):
+                sample_context = generated[:, -self.max_sequence_length :]
+                pos_offset = max(0, generated.shape[1] - sample_context.shape[1])
+                logits, _ = self.forward(
+                    sample_context,
+                    hidden_states=None,
+                    position_offset=pos_offset,
+                )
+                next_token, diagnostics = sample_next_token(
+                    logits=logits[:, -1, :],
+                    context_tokens=sample_context,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                    recent_window=repetition_window,
+                    min_tokens_to_keep=max(3, min_tokens_to_keep),
+                    top1_cap=0.95,
+                )
+                final_top1_probs.extend(
+                    [
+                        float(v)
+                        for v in diagnostics.final_top1_prob.detach().cpu().tolist()
+                    ]
+                )
+                raw_top1_probs.extend(
+                    [
+                        float(v)
+                        for v in diagnostics.raw_top1_prob.detach().cpu().tolist()
+                    ]
+                )
+                candidate_counts.extend(
+                    [
+                        int(v)
+                        for v in diagnostics.candidate_count.detach().cpu().tolist()
+                    ]
+                )
+                generated = torch.cat([generated, next_token], dim=1)
 
         generated_list = generated.squeeze(0).tolist()
         new_tokens = generated_list[-max_new_tokens:]
@@ -430,6 +519,8 @@ class PianoHybridModel(nn.Module):
         top1_threshold: float = 0.95,
         raise_on_failure: bool = True,
     ) -> Dict[str, float | bool]:
+        """Run short generation diagnostics and report confidence statistics."""
+
         self.eval()
         device = next(self.parameters()).device
 
@@ -441,35 +532,96 @@ class PianoHybridModel(nn.Module):
         raw_top1_probs: List[float] = []
         candidate_counts: List[int] = []
 
-        for _ in range(int(steps)):
+        if self.use_cfc:
             context = generated[:, -self.max_sequence_length :]
             pos_offset = max(0, generated.shape[1] - context.shape[1])
-            logits, _ = self.forward(
+            logits, hidden_states = self.forward(
                 context,
                 hidden_states=None,
                 position_offset=pos_offset,
             )
-            next_token, diagnostics = sample_next_token(
-                logits=logits[:, -1, :],
-                context_tokens=context,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                repetition_penalty=repetition_penalty,
-                recent_window=repetition_window,
-                min_tokens_to_keep=max(3, min_tokens_to_keep),
-                top1_cap=top1_threshold,
-            )
-            final_top1_probs.extend(
-                [float(v) for v in diagnostics.final_top1_prob.detach().cpu().tolist()]
-            )
-            raw_top1_probs.extend(
-                [float(v) for v in diagnostics.raw_top1_prob.detach().cpu().tolist()]
-            )
-            candidate_counts.extend(
-                [int(v) for v in diagnostics.candidate_count.detach().cpu().tolist()]
-            )
-            generated = torch.cat([generated, next_token], dim=1)
+
+            for step in range(int(steps)):
+                sample_context = generated[:, -self.max_sequence_length :]
+                next_token, diagnostics = sample_next_token(
+                    logits=logits[:, -1, :],
+                    context_tokens=sample_context,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                    recent_window=repetition_window,
+                    min_tokens_to_keep=max(3, min_tokens_to_keep),
+                    top1_cap=top1_threshold,
+                )
+                final_top1_probs.extend(
+                    [
+                        float(v)
+                        for v in diagnostics.final_top1_prob.detach().cpu().tolist()
+                    ]
+                )
+                raw_top1_probs.extend(
+                    [
+                        float(v)
+                        for v in diagnostics.raw_top1_prob.detach().cpu().tolist()
+                    ]
+                )
+                candidate_counts.extend(
+                    [
+                        int(v)
+                        for v in diagnostics.candidate_count.detach().cpu().tolist()
+                    ]
+                )
+                generated = torch.cat([generated, next_token], dim=1)
+
+                if step == int(steps) - 1:
+                    break
+
+                next_pos = generated.shape[1] - 1
+                logits, hidden_states = self.forward(
+                    next_token,
+                    hidden_states=hidden_states,
+                    position_offset=next_pos,
+                )
+        else:
+            for _ in range(int(steps)):
+                sample_context = generated[:, -self.max_sequence_length :]
+                pos_offset = max(0, generated.shape[1] - sample_context.shape[1])
+                logits, _ = self.forward(
+                    sample_context,
+                    hidden_states=None,
+                    position_offset=pos_offset,
+                )
+                next_token, diagnostics = sample_next_token(
+                    logits=logits[:, -1, :],
+                    context_tokens=sample_context,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                    recent_window=repetition_window,
+                    min_tokens_to_keep=max(3, min_tokens_to_keep),
+                    top1_cap=top1_threshold,
+                )
+                final_top1_probs.extend(
+                    [
+                        float(v)
+                        for v in diagnostics.final_top1_prob.detach().cpu().tolist()
+                    ]
+                )
+                raw_top1_probs.extend(
+                    [
+                        float(v)
+                        for v in diagnostics.raw_top1_prob.detach().cpu().tolist()
+                    ]
+                )
+                candidate_counts.extend(
+                    [
+                        int(v)
+                        for v in diagnostics.candidate_count.detach().cpu().tolist()
+                    ]
+                )
+                generated = torch.cat([generated, next_token], dim=1)
 
         max_final_top1 = max(final_top1_probs) if final_top1_probs else 0.0
         max_raw_top1 = max(raw_top1_probs) if raw_top1_probs else 0.0

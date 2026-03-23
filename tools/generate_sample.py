@@ -25,7 +25,7 @@ if str(ROOT) not in sys.path:
 
 from data.tokenizer import PianoTokenizer
 from generation.generate import GenerationConfig, generate_continuation
-from model.hybrid import PianoHybridModel
+from model.factory import build_model
 from config import DataConfig, ModelConfig
 from scale_config import get_preset
 from utils.config_compat import normalize_model_config_payload
@@ -97,6 +97,8 @@ def _resolve_configs(
 
 
 def main() -> None:
+    """CLI entrypoint for one-off sample generation."""
+
     parser = argparse.ArgumentParser(
         description="Generate continuation from checkpoint"
     )
@@ -137,7 +139,7 @@ def main() -> None:
 
     print(f"Loading model from {checkpoint_path}...")
     # Prefer checkpoint config when available, but allow longer local generation.
-    model = PianoHybridModel(model_cfg)
+    model = build_model(model_cfg)
     state = safetensors_load_file(str(checkpoint_path), device="cpu")
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing:

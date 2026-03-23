@@ -12,6 +12,8 @@ def WarmupCosineScheduler(
     total_steps: int,
     min_lr_ratio: float = 0.1,
 ) -> LambdaLR:
+    """Create warmup + cosine decay learning-rate scheduler."""
+
     if total_steps <= 0:
         raise ValueError("total_steps must be > 0")
     if warmup_steps < 0:
@@ -20,6 +22,8 @@ def WarmupCosineScheduler(
         raise ValueError("min_lr_ratio must be in (0, 1]")
 
     def lr_lambda(current_step: int) -> float:
+        """Return multiplicative LR factor for the current optimization step."""
+
         if warmup_steps > 0 and current_step < warmup_steps:
             return float(current_step) / float(max(1, warmup_steps))
 

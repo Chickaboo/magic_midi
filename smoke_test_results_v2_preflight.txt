@@ -1,0 +1,209 @@
+C:\Users\Lucas\Downloads\midi_AI\piano_midi_model\model\mamba_block.py:17: UserWarning: mamba-ssm not available (requires CUDA). Using torch reference fallback for development. Install mamba-ssm on Colab/Kaggle for full performance.
+  warnings.warn(
+C:\Users\Lucas\Downloads\midi_AI\piano_midi_model\model\mamba_block.py:21: UserWarning: mamba-ssm import details: No module named 'mamba_ssm'
+  warnings.warn(f"mamba-ssm import details: {exc}")
+========================================================
+Model v3 smoke test
+========================================================
+Testing ALiBiPositionBias...
+  ALiBiPositionBias: OK - shape=(4, 128, 128)
+Testing MusicAttentionBlock (ALiBi)...
+  MusicAttentionBlock: OK - input/output=(2, 64, 128)
+Testing PianoHybridModel forward (CfC off)...
+  Forward CfC off: OK - logits=(2, 64, 2000)
+Testing PianoHybridModel forward (CfC on)...
+  Forward CfC on: OK - hidden_states=2
+Testing generation with CfC hidden-state threading...
+  CfC generation threading: OK - generated_tokens=80
+Testing generation distribution with random weights...
+  Generation health random: OK - max_final_top1=0.0209, max_raw_top1=0.0006
+Testing checkpoint rotation policy...
+  Checkpoint rotation: OK - remaining=3, deleted=29
+Testing low-disk emergency rotation trigger...
+[18:33:16] [WARNING] Low disk space before checkpoint save: 2.00 GB free (< 3.00 GB). Running emergency rotation.
+[18:33:16] [INFO] Free space after emergency rotation: 5.00 GB
+  Low-disk trigger: OK - emergency rotation invoked
+Testing v2 initialization health (uncapped)...
+=== Initialization Diagnostic ===
+  embedding           : std=0.020  max_abs=0.101
+  time_encoding       : std=0.008  max_abs=0.035
+  stream_split        : std=0.989  max_abs=3.662
+  stream_merge        : std=1.000  max_abs=4.565
+  phrase_summarizer   : std=0.172  max_abs=0.608
+  final_norm          : std=1.000  max_abs=4.566
+  logits              : std=0.661  max_abs=3.143
+
+Healthy range: std 1-5, max_abs < 20
+Collapsed if:  std > 10 or max_abs > 50
+Logit std: 0.661 (target: 0.5-8.0)
+Logit max_abs: 3.143 (target: <30.0)
+Uncapped max_top1: 0.0519 (target: <0.95)
+  Initialization health: OK - logit_std=0.661, max_abs=3.143, uncapped_top1=0.0519
+Testing v2 model architecture...
+  Parameters: 108,261,729 (108.3M)
+  V2 forward: OK - logits=(2, 256, 2000)
+  V2 dual stream: OK - harmonic_params=52,086,198, temporal_params=13,265,831
+  V2 cross-stream cadence: OK - layers=6, every=3
+  V2 phrase summarizer: OK - shape=(2, 8, 1152)
+  V2 memory accumulation: OK - memory_slots=16
+  V2 generation health: OK - max_final_top1=0.0574
+  V2 memory reset: OK - theme_memory.reset() -> None
+Testing v2 memory reset determinism...
+  V2 memory reset deterministic: OK - memory_shape=(1, 4, 1152)
+Testing model factory v1/v2 routing...
+  Model factory: OK - v1->PianoHybridModel, v2->IttyBittyPianoV2
+Testing tokenizer time feature invariants across datasets...
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\maestro\fast_ornaments.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\maestro\long_held_chords.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\maestro\silence_gaps.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+
+
+
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\maestro\fast_ornaments.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\maestro\fast_ornaments.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\maestro\long_held_chords.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\maestro\long_held_chords.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\maestro\silence_gaps.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\maestro\silence_gaps.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\giant_midi\fast_ornaments.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\giant_midi\long_held_chords.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\giant_midi\silence_gaps.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+
+
+
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\giant_midi\fast_ornaments.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\giant_midi\fast_ornaments.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\giant_midi\long_held_chords.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\giant_midi\long_held_chords.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\giant_midi\silence_gaps.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\giant_midi\silence_gaps.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\aria_midi\fast_ornaments.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\aria_midi\long_held_chords.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\aria_midi\silence_gaps.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+
+
+
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\aria_midi\fast_ornaments.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\aria_midi\fast_ornaments.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\aria_midi\long_held_chords.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\aria_midi\long_held_chords.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\aria_midi\silence_gaps.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\aria_midi\silence_gaps.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\adl_piano\fast_ornaments.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\adl_piano\long_held_chords.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\adl_piano\silence_gaps.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+
+
+
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\adl_piano\fast_ornaments.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\adl_piano\fast_ornaments.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\adl_piano\long_held_chords.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\adl_piano\long_held_chords.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\adl_piano\silence_gaps.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmps2_ug0tc\adl_piano\silence_gaps.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+  Tokenizer invariants: OK - datasets=4, edge_cases=3, checks=12
+Testing preprocessing time features and weighted sampling...
+[18:34:33] [INFO] Tokenizer not found. Training REMI+BPE tokenizer on 4 files.
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmpuydf7vl5\seed.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmpuydf7vl5\seed_2.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmpuydf7vl5\seed.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmpuydf7vl5\seed_2.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+
+
+
+[18:34:33] [INFO] Saved tokenizer to C:\Users\Lucas\AppData\Local\Temp\tmpuydf7vl5\tokenizer.json
+Tokenizing maestro:   0%|          | 0/2 [00:00<?, ?it/s][read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmpuydf7vl5\seed.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmpuydf7vl5\seed_2.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+Tokenizing maestro: 100%|##########| 2/2 [00:00<00:00, 114.48it/s]
+Tokenizing aria_midi:   0%|          | 0/2 [00:00<?, ?it/s][read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmpuydf7vl5\seed.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+[read_file(fs::path)] Input path: C:\Users\Lucas\AppData\Local\Temp\tmpuydf7vl5\seed_2.mid
+[read_file(fs::path)] _wfopen_s returned: 0
+Tokenizing aria_midi: 100%|##########| 2/2 [00:00<00:00, 129.98it/s]
+[18:34:33] [INFO] Multi-dataset preprocessing complete:
+[18:34:33] [INFO]   maestro:        2 pieces  |            16 tokens  |  ~    0.0 hours  |  weight=3.0
+[18:34:33] [INFO]   aria_midi:      2 pieces  |            16 tokens  |  ~    0.0 hours  |  weight=1.0
+[18:34:33] [INFO]   TOTAL:          4 pieces  |            32 tokens  |  ~    0.0 hours  |  weight=1.0
+[18:34:33] [INFO] Preprocessing summary
+[18:34:33] [INFO]   Total MIDI files scanned: 4
+[18:34:33] [INFO]   Total pieces kept: 4
+[18:34:33] [INFO]   Total tokens: 32
+[18:34:33] [INFO]   Piece length mean/min/max: 8.0/8/8
+[18:34:33] [INFO]   Vocabulary coverage: 0.49% (2/410)
+[18:34:33] [INFO]   Manifest saved: C:\Users\Lucas\AppData\Local\Temp\tmpuydf7vl5\processed\manifest.json
+[18:34:33] [INFO]   Sampling metadata saved: C:\Users\Lucas\AppData\Local\Temp\tmpuydf7vl5\processed\dataset_sampling.json
+  Time feature extraction: OK - tokens=8
+[18:34:33] [INFO] Multi-dataset training enabled.
+[18:34:33] [INFO]   source counts (train): {'aria_midi': 1, 'maestro': 1}
+[18:34:33] [INFO]   dataset weights: {'maestro': 3.0, 'aria_midi': 1.0}
+[18:34:33] [INFO] Dataset split by piece: train=2, val=1, test=1
+C:\Users\Lucas\Downloads\midi_AI\piano_midi_model\model\mamba_block.py:17: UserWarning: mamba-ssm not available (requires CUDA). Using torch reference fallback for development. Install mamba-ssm on Colab/Kaggle for full performance.
+  warnings.warn(
+C:\Users\Lucas\Downloads\midi_AI\piano_midi_model\model\mamba_block.py:21: UserWarning: mamba-ssm import details: No module named 'mamba_ssm'
+  warnings.warn(f"mamba-ssm import details: {exc}")
+  Weighted sampler + batch: OK - token/time fields present
+C:\Users\Lucas\Downloads\midi_AI\piano_midi_model\model\mamba_block.py:17: UserWarning: mamba-ssm not available (requires CUDA). Using torch reference fallback for development. Install mamba-ssm on Colab/Kaggle for full performance.
+  warnings.warn(
+C:\Users\Lucas\Downloads\midi_AI\piano_midi_model\model\mamba_block.py:21: UserWarning: mamba-ssm import details: No module named 'mamba_ssm'
+  warnings.warn(f"mamba-ssm import details: {exc}")
+Testing dataset weight distribution report...
+Effective data distribution:
+  aria_midi : ~ 75.0%
+  maestro   : ~  7.9%
+  giant_midi: ~ 12.0%
+  adl_piano : ~  5.1%
+  Dataset weights: OK - approx distribution aria~75%, maestro~8%, giant~12%, adl~5%
+Testing existing v1 checkpoint with new generate()...
+  v1 checkpoint: SKIPPED - no local checkpoint found
+Verifying parameter counts for all presets...
+Preset parameter verification
+----------------------------
+small    target=  25.6M | real_mamba_est=  25.26M (25,264,800) | runtime_measured=  21.50M (21,498,048) | backend=GRU fallback | real_mamba_est_delta=  1.3% | OK
+medium   target=  60.0M | real_mamba_est=  60.37M (60,365,248) | runtime_measured=  50.61M (50,608,832) | backend=GRU fallback | real_mamba_est_delta=  0.6% | OK
+large    target= 100.0M | real_mamba_est=  99.90M (99,901,200) | runtime_measured=  84.02M (84,016,800) | backend=GRU fallback | real_mamba_est_delta=  0.1% | OK
+large_v2 target= 100.0M | real_mamba_est= 250.70M (250,698,528) | runtime_measured= 108.26M (108,261,729) | backend=dual-stream runtime | runtime_measured_delta=  8.3% | OK
+========================================================
+All smoke tests completed.
+========================================================

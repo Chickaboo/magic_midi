@@ -8,6 +8,8 @@ import torch
 
 @dataclass
 class SamplingDiagnostics:
+    """Per-step diagnostics emitted by sampling distribution builders."""
+
     raw_top1_prob: torch.Tensor
     final_top1_prob: torch.Tensor
     candidate_count: torch.Tensor
@@ -161,6 +163,8 @@ def build_sampling_distribution(
     min_tokens_to_keep: int,
     top1_cap: Optional[float] = 0.95,
 ) -> tuple[torch.Tensor, SamplingDiagnostics]:
+    """Build filtered sampling distribution and diagnostics for next-token draw."""
+
     if logits.ndim != 2:
         raise ValueError(f"logits must be (batch, vocab), got {tuple(logits.shape)}")
 
@@ -213,6 +217,8 @@ def sample_next_token(
     min_tokens_to_keep: int,
     top1_cap: Optional[float] = 0.95,
 ) -> tuple[torch.Tensor, SamplingDiagnostics]:
+    """Sample one next token from filtered distribution and return diagnostics."""
+
     probs, diagnostics = build_sampling_distribution(
         logits=logits,
         context_tokens=context_tokens,

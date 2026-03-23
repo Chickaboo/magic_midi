@@ -1,19 +1,31 @@
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+except Exception as exc:  # pragma: no cover - optional dependency
+    plt = None  # type: ignore
+    warnings.warn(
+        f"matplotlib import failed. Visualization functions will be disabled. Details: {exc}"
+    )
+
 import numpy as np
 import pretty_midi
 
 
 def midi_duration(midi_path: str | Path) -> float:
+    """Return MIDI duration in seconds."""
+
     midi = pretty_midi.PrettyMIDI(str(midi_path))
     return float(midi.get_end_time())
 
 
 def _extract_note_events(midi_path: str | Path) -> List[Tuple[float, float, int, int]]:
+    """Extract note events `(start, end, pitch, velocity)` for piano range."""
+
     midi = pretty_midi.PrettyMIDI(str(midi_path))
     events: List[Tuple[float, float, int, int]] = []
     for inst in midi.instruments:
@@ -25,7 +37,19 @@ def _extract_note_events(midi_path: str | Path) -> List[Tuple[float, float, int,
     return events
 
 
-def visualize_pianoroll(midi_path, title: str = "", save_path=None) -> None:
+def visualize_pianoroll(
+    midi_path: str | Path,
+    title: str = "",
+    save_path: Optional[str | Path] = None,
+) -> None:
+    """Render a pianoroll plot for one MIDI file."""
+
+    if plt is None:  # pragma: no cover - optional dependency
+        warnings.warn(
+            "visualize_pianoroll called but matplotlib is not installed; skipping visualization"
+        )
+        return
+
     events = _extract_note_events(midi_path)
     cmap = plt.get_cmap("viridis")
 
@@ -49,7 +73,19 @@ def visualize_pianoroll(midi_path, title: str = "", save_path=None) -> None:
         plt.close(fig)
 
 
-def compare_pianorolls(seed_path, continuation_path, save_path=None) -> None:
+def compare_pianorolls(
+    seed_path: str | Path,
+    continuation_path: str | Path,
+    save_path: Optional[str | Path] = None,
+) -> None:
+    """Render side-by-side timeline comparison for seed and continuation."""
+
+    if plt is None:  # pragma: no cover - optional dependency
+        warnings.warn(
+            "compare_pianorolls called but matplotlib is not installed; skipping visualization"
+        )
+        return
+
     seed_events = _extract_note_events(seed_path)
     cont_events = _extract_note_events(continuation_path)
     seed_cmap = plt.get_cmap("Blues")

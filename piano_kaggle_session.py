@@ -1,16 +1,9 @@
-"""
-Kaggle training session runner.
-Equivalent to session.py but adapted for Kaggle's environment:
-- No Google Drive - checkpoints saved to /kaggle/working/
-- No inactivity disconnect - can run full 12-hour sessions
-- MAESTRO loaded from /kaggle/input/ (read-only)
-- Project code loaded from /kaggle/input/ (read-only)
-- Outputs saved to /kaggle/working/ (downloadable after session)
-"""
+"""Kaggle training session runner for v3 presets and multi-dataset support."""
 
 from __future__ import annotations
 
 import datetime as dt
+import argparse
 import json
 import os
 import shutil
@@ -23,21 +16,33 @@ import torch
 from safetensors.torch import load_file as safetensors_load_file
 
 from data.dataset import create_dataloaders
-from data.preprocess import preprocess_maestro
+from data.preprocess import MultiDatasetPreprocessor, preprocess_maestro
 from data.tokenizer import PianoTokenizer
 from generation.generate import GenerationConfig, generate_continuation
-from kaggle_config import setup_kaggle_environment
-from model.hybrid import PianoHybridModel
+from kaggle_config import (
+    find_adl_piano_root,
+    find_aria_midi_root,
+    find_giant_midi_root,
+    find_maestro_root,
+    setup_kaggle_environment,
+)
+from model.factory import build_model
 from scale_config import SCALE_PRESETS, get_preset, verify_preset_params
 from training.trainer import (
-    KAGGLE_KEEP_EVERY_N_EPOCHS,
+    CHECKPOINT_KEEP_POLICY,
     Trainer,
     rotate_kaggle_checkpoint_dir,
 )
+from utils.logging_utils import get_project_logger
 from utils.session_utils import SessionWatchdog, get_gpu_info
 
 
+LOGGER = get_project_logger()
+
+
 def _as_bool_env(name: str, default: bool) -> bool:
+    """Read boolean-like environment variable with a default value."""
+
     raw = os.environ.get(name)
     if raw is None:
         return default
@@ -45,6 +50,8 @@ def _as_bool_env(name: str, default: bool) -> bool:
 
 
 def _probe_mamba_kernel() -> Tuple[bool, str]:
+    """Run a tiny mamba-ssm forward pass to confirm kernel availability."""
+
     if not torch.cuda.is_available():
         return False, "CUDA is unavailable"
 
@@ -73,6 +80,8 @@ def _probe_mamba_kernel() -> Tuple[bool, str]:
 
 
 def _configure_mamba_backend() -> None:
+    """Configure mamba backend strictness based on environment flags."""
+
     require_mamba = _as_bool_env("PIANO_REQUIRE_MAMBA", default=True)
     allow_fallback = _as_bool_env("PIANO_ALLOW_GRU_FALLBACK", default=False)
 
@@ -81,12 +90,14 @@ def _configure_mamba_backend() -> None:
         if torch.cuda.is_available():
             name = torch.cuda.get_device_name(0)
             cap = torch.cuda.get_device_capability(0)
-            print(
-                "Mamba kernel probe passed "
-                f"(GPU={name}, compute capability={cap[0]}.{cap[1]})."
+            LOGGER.info(
+                "Mamba kernel probe passed (GPU=%s, compute capability=%d.%d).",
+                name,
+                cap[0],
+                cap[1],
             )
         else:
-            print("Mamba probe passed.")
+            LOGGER.info("Mamba probe passed.")
         return
 
     reason = detail
@@ -102,7 +113,7 @@ def _configure_mamba_backend() -> None:
         raise RuntimeError(
             "Mamba is required but kernel probe failed. "
             f"Details: {reason}. "
-            "On Kaggle, switch Accelerator to T4 and rerun Cell 1, then Cell 3. "
+            "On Kaggle, switch Accelerator to T4 and rerun setup. "
             "If you explicitly want fallback, set PIANO_ALLOW_GRU_FALLBACK=1."
         )
 
@@ -118,7 +129,9 @@ def _configure_mamba_backend() -> None:
         )
 
 
-def _configure_kaggle_performance(train_cfg, scale: Optional[str] = None) -> None:
+def _configure_kaggle_performance(train_cfg: Any, scale: Optional[str] = None) -> None:
+    """Tune device, worker, and batch defaults for Kaggle runtime."""
+
     if torch.cuda.is_available():
         try:
             torch.backends.cudnn.benchmark = True
@@ -143,11 +156,11 @@ def _configure_kaggle_performance(train_cfg, scale: Optional[str] = None) -> Non
     gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
     if torch.cuda.is_available():
         gpu_names = [torch.cuda.get_device_name(i) for i in range(gpu_count)]
-        print(f"Detected CUDA GPUs ({gpu_count}): {gpu_names}")
+        LOGGER.info("Detected CUDA GPUs (%d): %s", gpu_count, gpu_names)
+
     train_cfg.device = "cuda" if torch.cuda.is_available() else "cpu"
     setattr(train_cfg, "_enable_data_parallel", gpu_count > 1)
 
-    # Increase data throughput by default on Kaggle; can be overridden via env.
     workers_env = os.environ.get("PIANO_NUM_WORKERS")
     if workers_env is not None:
         try:
@@ -159,7 +172,6 @@ def _configure_kaggle_performance(train_cfg, scale: Optional[str] = None) -> Non
         num_workers = max(2, min(8, cpu_count))
     setattr(train_cfg, "_force_num_workers", num_workers)
 
-    # Auto-scale global batch for multi-GPU to improve utilization.
     if gpu_count > 1 and os.environ.get("PIANO_DISABLE_AUTO_BATCH", "0") != "1":
         base_batch = int(train_cfg.batch_size)
         base_accum = int(train_cfg.grad_accumulation_steps)
@@ -176,12 +188,10 @@ def _configure_kaggle_performance(train_cfg, scale: Optional[str] = None) -> Non
             "large": 32,
         }.get(str(scale).lower() if scale is not None else "", 128)
 
-        # Aggressive but bounded scaling to keep both GPUs busy.
         scaled = max(base_batch * gpu_count * 4, int(default_target))
         max_batch = int(os.environ.get("PIANO_MAX_BATCH_SIZE", str(default_max)))
         train_cfg.batch_size = max(base_batch, min(max_batch, scaled))
 
-        # Prefer more frequent optimizer steps on multi-GPU unless overridden.
         accum_env = os.environ.get("PIANO_GRAD_ACCUM_STEPS")
         if accum_env is not None:
             try:
@@ -191,17 +201,21 @@ def _configure_kaggle_performance(train_cfg, scale: Optional[str] = None) -> Non
         else:
             train_cfg.grad_accumulation_steps = 1 if base_accum > 1 else base_accum
 
-    print(
-        "Performance config: "
-        f"device={train_cfg.device}, gpus={gpu_count}, "
-        f"batch_size={train_cfg.batch_size}, "
-        f"grad_accum={train_cfg.grad_accumulation_steps}, "
-        f"num_workers={getattr(train_cfg, '_force_num_workers', 'n/a')}, "
-        f"data_parallel={getattr(train_cfg, '_enable_data_parallel', False)}"
+    LOGGER.info(
+        "Performance config: device=%s, gpus=%d, batch_size=%d, grad_accum=%d, "
+        "num_workers=%s, data_parallel=%s",
+        train_cfg.device,
+        gpu_count,
+        int(train_cfg.batch_size),
+        int(train_cfg.grad_accumulation_steps),
+        getattr(train_cfg, "_force_num_workers", "n/a"),
+        getattr(train_cfg, "_enable_data_parallel", False),
     )
 
 
 def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    """Atomically write JSON payload to disk."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -209,6 +223,8 @@ def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
 
 
 def _manifest_count(path: Path) -> int:
+    """Return number of manifest entries if JSON exists."""
+
     if not path.exists():
         return 0
     try:
@@ -220,10 +236,44 @@ def _manifest_count(path: Path) -> int:
     return 0
 
 
+def _build_kaggle_dataset_paths(paths: Dict[str, str]) -> Dict[str, str]:
+    """Build dataset-path mapping for optional multi-dataset preprocessing."""
+
+    dataset_paths: Dict[str, str] = {"maestro": paths["maestro_root"]}
+    giant_path = paths.get("giant_midi_root", "")
+    if giant_path:
+        dataset_paths["giant_midi"] = giant_path
+    aria_path = paths.get("aria_midi_root", "")
+    if aria_path:
+        dataset_paths["aria_midi"] = aria_path
+    adl_path = paths.get("adl_piano_root", "")
+    if adl_path:
+        dataset_paths["adl_piano"] = adl_path
+    piano_e_path = paths.get("piano_e_root", "")
+    if piano_e_path and "adl_piano" not in dataset_paths:
+        dataset_paths["adl_piano"] = piano_e_path
+    return dataset_paths
+
+
+def _run_preprocessing(data_cfg: Any, paths: Dict[str, str]) -> None:
+    """Run single- or multi-dataset preprocessing on Kaggle."""
+
+    dataset_paths = _build_kaggle_dataset_paths(paths)
+    if bool(getattr(data_cfg, "use_multi_dataset", False)) and len(dataset_paths) > 1:
+        data_cfg.dataset_paths = dataset_paths
+        processor = MultiDatasetPreprocessor(config=data_cfg)
+        processor.preprocess()
+        return
+
+    preprocess_maestro(data_cfg)
+
+
 def _find_resume_checkpoint(checkpoint_dir: Path) -> Optional[Path]:
+    """Find latest checkpoint file for automatic resume."""
+
     candidates = [
-        checkpoint_dir / "latest_model.safetensors",
         checkpoint_dir / "latest.safetensors",
+        checkpoint_dir / "latest_model.safetensors",
     ]
     for candidate in candidates:
         if candidate.exists():
@@ -232,6 +282,8 @@ def _find_resume_checkpoint(checkpoint_dir: Path) -> Optional[Path]:
 
 
 def _find_state_sidecar(model_path: Path) -> Optional[Path]:
+    """Resolve sidecar state path for a checkpoint model file."""
+
     if model_path.name.endswith("_model.safetensors"):
         candidate = model_path.with_name(
             model_path.name.replace("_model.safetensors", "_state.pt")
@@ -245,26 +297,9 @@ def _find_state_sidecar(model_path: Path) -> Optional[Path]:
     return None
 
 
-def _sync_checkpoint_aliases(checkpoint_dir: Path) -> None:
-    aliases = [
-        (
-            checkpoint_dir / "latest_model.safetensors",
-            checkpoint_dir / "latest.safetensors",
-        ),
-        (
-            checkpoint_dir / "best_model.safetensors",
-            checkpoint_dir / "best.safetensors",
-        ),
-    ]
-    for src, dst in aliases:
-        if not src.exists():
-            continue
-        tmp = dst.with_name(dst.name + ".tmp")
-        shutil.copy2(src, tmp)
-        os.replace(tmp, dst)
-
-
 def _append_training_log(log_path: Path, record: Dict[str, Any]) -> None:
+    """Append one session record to Kaggle training log file."""
+
     history = {"sessions": []}
     if log_path.exists():
         try:
@@ -282,10 +317,10 @@ def _append_training_log(log_path: Path, record: Dict[str, Any]) -> None:
     _atomic_write_json(log_path, history)
 
 
-def _find_first_seed_midi(maestro_root: Path) -> Optional[Path]:
-    midi_files = sorted(
-        list(maestro_root.rglob("*.mid")) + list(maestro_root.rglob("*.midi"))
-    )
+def _find_first_seed_midi(root: Path) -> Optional[Path]:
+    """Return deterministic first MIDI file under a root."""
+
+    midi_files = sorted(list(root.rglob("*.mid")) + list(root.rglob("*.midi")))
     if not midi_files:
         return None
     return midi_files[0]
@@ -296,6 +331,8 @@ def _safe_generate_tokens(
     seed_tokens: list[int],
     max_new_tokens: int,
 ) -> list[int]:
+    """Safely run generation and normalize output token type."""
+
     gen_fn = getattr(model, "generate", None)
     if not callable(gen_fn):
         raise RuntimeError("Model does not expose generate(...)")
@@ -315,14 +352,20 @@ def _safe_generate_tokens(
 
 
 class _KaggleSyncShim:
+    """Minimal sync shim used by session watchdog in Kaggle context."""
+
     def __init__(self, checkpoint_dir: Path, heartbeat_path: Path) -> None:
         self.checkpoint_dir = checkpoint_dir
         self.heartbeat_path = heartbeat_path
 
     def write_heartbeat(self, payload: Dict[str, Any]) -> None:
+        """Persist heartbeat payload for watchdog monitoring."""
+
         _atomic_write_json(self.heartbeat_path, payload)
 
     def sync_checkpoint(self, local_path: str, tag: str = "latest") -> bool:
+        """Copy checkpoint/state artifacts into Kaggle working directory."""
+
         src = Path(local_path)
         if not src.exists():
             return False
@@ -341,24 +384,31 @@ class _KaggleSyncShim:
 
         rotate_kaggle_checkpoint_dir(
             self.checkpoint_dir,
-            keep_every_n_epochs=KAGGLE_KEEP_EVERY_N_EPOCHS,
+            keep_every_n_epochs=int(CHECKPOINT_KEEP_POLICY["milestone_every_n"]),
+            max_total_checkpoints=int(CHECKPOINT_KEEP_POLICY["max_total_checkpoints"]),
         )
         return True
 
     def wait_for_sync(self) -> None:
+        """Compatibility no-op for synchronous Kaggle writes."""
+
         return
 
 
 class KaggleSessionWatchdog(SessionWatchdog):
+    """Kaggle watchdog with longer timeout expectations than Colab free tier."""
+
     def __init__(
         self,
-        drive_sync,
-        trainer,
+        drive_sync: Any,
+        trainer: Any,
         warning_minutes: int = 600,
         checkpoint_stall_minutes: int = 60,
     ) -> None:
         super().__init__(
-            drive_sync=drive_sync, trainer=trainer, warning_minutes=warning_minutes
+            drive_sync=drive_sync,
+            trainer=trainer,
+            warning_minutes=warning_minutes,
         )
         self.checkpoint_stall_minutes = checkpoint_stall_minutes
 
@@ -388,9 +438,10 @@ class KaggleSessionWatchdog(SessionWatchdog):
             if (not self._warning_fired) and minutes_elapsed >= float(
                 self.warning_minutes
             ):
-                print(
-                    f"[Watchdog] Session near timeout (~{self.warning_minutes} min). "
-                    "Triggering emergency checkpoint."
+                LOGGER.info(
+                    "[Watchdog] Session near timeout (~%d min). "
+                    "Triggering emergency checkpoint.",
+                    self.warning_minutes,
                 )
                 self._emergency_save(reason=f"{self.warning_minutes} minute warning")
                 self._warning_fired = True
@@ -407,6 +458,8 @@ def _print_kaggle_banner(
     resumed: bool,
     tokenization: str,
 ) -> None:
+    """Print user-facing Kaggle session banner."""
+
     print("=" * 56)
     print("  Itty Bitty Piano - Kaggle Session")
     print("=" * 56)
@@ -419,6 +472,12 @@ def _print_kaggle_banner(
         f"({gpu_info['total_vram_gb']:.1f} GB)"
     )
     print(f"  MAESTRO root:      {paths['maestro_root']}")
+    giant = paths.get("giant_midi_root", "")
+    aria = paths.get("aria_midi_root", "")
+    adl = paths.get("adl_piano_root", "") or paths.get("piano_e_root", "")
+    print(f"  GiantMIDI root:    {giant or 'not found (optional)'}")
+    print(f"  Aria-MIDI root:    {aria or 'not found (optional)'}")
+    print(f"  ADL Piano root:    {adl or 'not found (optional)'}")
     print(f"  Checkpoint dir:    {paths['checkpoint_dir']}")
     print(f"  Processed dir:     {paths['processed_dir']}")
     print(f"  Tokenizer path:    {paths['tokenizer_path']}")
@@ -429,6 +488,8 @@ def _print_kaggle_banner(
 
 
 def run_kaggle_session(scale: str = "small", max_epochs: int = 2000) -> Dict[str, Any]:
+    """Run full Kaggle training session with resume and artifact outputs."""
+
     paths = setup_kaggle_environment()
     _configure_mamba_backend()
     gpu = get_gpu_info()
@@ -445,6 +506,8 @@ def run_kaggle_session(scale: str = "small", max_epochs: int = 2000) -> Dict[str
     data_cfg.maestro_path = paths["maestro_root"]
     data_cfg.processed_path = paths["processed_dir"]
     data_cfg.tokenizer_path = paths["tokenizer_path"]
+    data_cfg.dataset_paths = _build_kaggle_dataset_paths(paths)
+    data_cfg.use_multi_dataset = len(data_cfg.dataset_paths) > 1
 
     checkpoint_dir = Path(paths["checkpoint_dir"])
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -456,12 +519,12 @@ def run_kaggle_session(scale: str = "small", max_epochs: int = 2000) -> Dict[str
         _manifest_count(manifest_path) == 0
     )
     if needs_preprocess:
-        print(
+        LOGGER.info(
             "Tokenizer/processed cache missing in /kaggle/working. Running preprocessing..."
         )
-        preprocess_maestro(data_cfg)
+        _run_preprocessing(data_cfg, paths)
     else:
-        print("Reusing tokenizer and processed cache from /kaggle/working.")
+        LOGGER.info("Reusing tokenizer and processed cache from /kaggle/working.")
 
     tokenizer = PianoTokenizer.load(data_cfg.tokenizer_path)
     model_cfg.vocab_size = tokenizer.vocab_size
@@ -469,7 +532,7 @@ def run_kaggle_session(scale: str = "small", max_epochs: int = 2000) -> Dict[str
 
     train_loader, val_loader, test_loader = create_dataloaders(data_cfg, train_cfg)
 
-    model = PianoHybridModel(model_cfg)
+    model = build_model(model_cfg)
     trainer = Trainer(
         model=model,
         train_loader=train_loader,
@@ -487,7 +550,9 @@ def run_kaggle_session(scale: str = "small", max_epochs: int = 2000) -> Dict[str
             state = trainer.load_checkpoint(str(resume_ckpt))
             start_epoch = int(state.get("epoch", 0))
             resumed = True
-            print(f"Resumed from checkpoint: {resume_ckpt} (epoch {start_epoch})")
+            LOGGER.info(
+                "Resumed from checkpoint: %s (epoch %d)", resume_ckpt, start_epoch
+            )
         except Exception as exc:
             warnings.warn(f"Checkpoint load failed; starting from scratch ({exc})")
             start_epoch = 0
@@ -503,7 +568,9 @@ def run_kaggle_session(scale: str = "small", max_epochs: int = 2000) -> Dict[str
     )
 
     if start_epoch >= int(max_epochs):
-        print(f"Target max_epochs={max_epochs} already reached. Nothing to train.")
+        LOGGER.info(
+            "Target max_epochs=%d already reached. Nothing to train.", max_epochs
+        )
         return {
             "scale": scale,
             "start_epoch": start_epoch,
@@ -514,7 +581,8 @@ def run_kaggle_session(scale: str = "small", max_epochs: int = 2000) -> Dict[str
 
     heartbeat_path = Path(paths["working_dir"]) / "heartbeat_latest.json"
     sync_shim = _KaggleSyncShim(
-        checkpoint_dir=checkpoint_dir, heartbeat_path=heartbeat_path
+        checkpoint_dir=checkpoint_dir,
+        heartbeat_path=heartbeat_path,
     )
     watchdog = KaggleSessionWatchdog(
         drive_sync=sync_shim,
@@ -531,17 +599,19 @@ def run_kaggle_session(scale: str = "small", max_epochs: int = 2000) -> Dict[str
     try:
         for epoch_base in range(start_epoch, int(max_epochs)):
             trainer.train_n_epochs(n=1, start_epoch=epoch_base)
-            _sync_checkpoint_aliases(checkpoint_dir)
             epochs_completed += 1
     finally:
         watchdog.stop()
 
-    _sync_checkpoint_aliases(checkpoint_dir)
     end_epoch = start_epoch + epochs_completed
     best_val_loss = float(trainer.best_val_loss)
 
     try:
-        seed_batch, _ = next(iter(test_loader))
+        sample_batch = next(iter(test_loader))
+        if isinstance(sample_batch, dict):
+            seed_batch = sample_batch["seed"]
+        else:
+            seed_batch = sample_batch[0]
         seed_tokens = seed_batch[0].tolist()
         generated_tokens = _safe_generate_tokens(
             model=trainer.model,
@@ -555,7 +625,7 @@ def run_kaggle_session(scale: str = "small", max_epochs: int = 2000) -> Dict[str
         gen_out = generated_dir / f"{session_id}_generated.mid"
         tokenizer.decode(seed_tokens, seed_out)
         tokenizer.decode(generated_tokens, gen_out)
-        print(f"Saved session sample: {gen_out}")
+        LOGGER.info("Saved session sample: %s", gen_out)
     except Exception as exc:
         warnings.warn(f"Session-end sample generation failed: {exc}")
 
@@ -573,14 +643,16 @@ def run_kaggle_session(scale: str = "small", max_epochs: int = 2000) -> Dict[str
     }
     _append_training_log(Path(paths["log_path"]), log_record)
 
-    print("-" * 56)
-    print(
-        f"Kaggle session complete: +{epochs_completed} epoch(s), "
-        f"epoch {start_epoch} -> {end_epoch}, best_val_loss={best_val_loss:.4f}, "
-        f"time={elapsed / 60.0:.1f} min"
+    LOGGER.info(
+        "Kaggle session complete: +%d epoch(s), epoch %d -> %d, "
+        "best_val_loss=%.4f, time=%.1f min",
+        epochs_completed,
+        start_epoch,
+        end_epoch,
+        best_val_loss,
+        elapsed / 60.0,
     )
-    print("Checkpoints saved to /kaggle/working/ - download via Kaggle output panel")
-    print("-" * 56)
+    LOGGER.info("Checkpoints saved to /kaggle/working/.")
 
     return {
         "session_id": session_id,
@@ -595,30 +667,33 @@ def run_kaggle_session(scale: str = "small", max_epochs: int = 2000) -> Dict[str
 
 
 def calibrate_on_kaggle() -> None:
-    """
-    Print measured parameter counts for all presets on this runtime.
-    Use this to validate preset targets with active backend configuration.
-    """
+    """Print measured parameter counts for all presets on this runtime."""
+
     _configure_mamba_backend()
 
     class _TmpTrainCfg:
+        """Minimal train config shim used for calibration runtime setup."""
+
         device = "auto"
         batch_size = 4
         grad_accumulation_steps = 1
 
     _configure_kaggle_performance(_TmpTrainCfg)
-    print("Parameter calibration on this runtime:")
-    print(
-        f"GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}"
+    LOGGER.info("Parameter calibration on this runtime:")
+    LOGGER.info(
+        "GPU: %s",
+        torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU",
     )
-    print("-" * 50)
+    LOGGER.info("%s", "-" * 50)
     verify_preset_params()
-    print("-" * 50)
+    LOGGER.info("%s", "-" * 50)
     for name, preset in SCALE_PRESETS.items():
-        print(f"{name:8s}: {preset['description']}")
+        LOGGER.info("%8s: %s", name, preset["description"])
 
 
 def generate_from_best_checkpoint(scale: str = "small") -> Path:
+    """Generate one sample MIDI from best (or latest) checkpoint."""
+
     paths = setup_kaggle_environment()
     _configure_mamba_backend()
     preset = get_preset(scale)
@@ -653,13 +728,13 @@ def generate_from_best_checkpoint(scale: str = "small") -> Path:
         )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = PianoHybridModel(model_cfg)
+    model = build_model(model_cfg)
     state = safetensors_load_file(str(checkpoint_path), device="cpu")
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing:
-        print(f"Missing keys while loading checkpoint: {len(missing)}")
+        LOGGER.info("Missing keys while loading checkpoint: %d", len(missing))
     if unexpected:
-        print(f"Unexpected keys while loading checkpoint: {len(unexpected)}")
+        LOGGER.info("Unexpected keys while loading checkpoint: %d", len(unexpected))
 
     model.to(device)
     model.eval()
@@ -693,8 +768,8 @@ def generate_from_best_checkpoint(scale: str = "small") -> Path:
         config=data_cfg,
         generation_config=gen_cfg,
     )
-    print(f"Generated sample from checkpoint: {checkpoint_path}")
-    print(f"Saved to: {outputs[0]}")
+    LOGGER.info("Generated sample from checkpoint: %s", checkpoint_path)
+    LOGGER.info("Saved to: %s", outputs[0])
     return outputs[0]
 
 
@@ -706,6 +781,7 @@ def generate_from_seed_file(
     output_path: Optional[str | Path] = None,
 ) -> Path:
     """Generate a long continuation from a seed MIDI file."""
+
     paths = setup_kaggle_environment()
     _configure_mamba_backend()
     preset = get_preset(scale)
@@ -743,13 +819,13 @@ def generate_from_seed_file(
         )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = PianoHybridModel(model_cfg)
+    model = build_model(model_cfg)
     state = safetensors_load_file(str(checkpoint_file), device="cpu")
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing:
-        print(f"Missing keys while loading checkpoint: {len(missing)}")
+        LOGGER.info("Missing keys while loading checkpoint: %d", len(missing))
     if unexpected:
-        print(f"Unexpected keys while loading checkpoint: {len(unexpected)}")
+        LOGGER.info("Unexpected keys while loading checkpoint: %d", len(unexpected))
     model.to(device)
     model.eval()
 
@@ -784,6 +860,88 @@ def generate_from_seed_file(
         config=data_cfg,
         generation_config=gen_cfg,
     )
-    print(f"Generated continuation from seed: {seed_path}")
-    print(f"Saved to: {outputs[0]}")
+    LOGGER.info("Generated continuation from seed: %s", seed_path)
+    LOGGER.info("Saved to: %s", outputs[0])
     return outputs[0]
+
+
+def print_dataset_availability() -> None:
+    """Print MAESTRO/GiantMIDI availability for notebook preflight checks."""
+
+    maestro = None
+    giant = None
+    aria = None
+    adl = None
+    try:
+        maestro = find_maestro_root()
+    except Exception:
+        maestro = None
+    try:
+        giant = find_giant_midi_root()
+    except Exception:
+        giant = None
+    try:
+        aria = find_aria_midi_root()
+    except Exception:
+        aria = None
+    try:
+        adl = find_adl_piano_root()
+    except Exception:
+        adl = None
+
+    print(f"MAESTRO:    {'✓ found' if maestro else '✗ not found'} {maestro or ''}")
+    print(
+        f"GiantMIDI:  {'✓ found' if giant else '✗ not found (optional)'} {giant or ''}"
+    )
+    print(f"Aria-MIDI:  {'✓ found' if aria else '✗ not found (optional)'} {aria or ''}")
+    print(f"ADL Piano:  {'✓ found' if adl else '✗ not found (optional)'} {adl or ''}")
+    print()
+    if not giant:
+        print(
+            "TIP: Add GiantMIDI as a Kaggle dataset for dramatically more training data."
+        )
+        print("     Training will proceed with MAESTRO only.")
+
+
+def _dry_run_session(scale: str = "large_v2") -> None:
+    """Print resolved config and model stats without starting training."""
+
+    preset = get_preset(scale)
+    model_cfg = preset["model"]
+    train_cfg = preset["train"]
+    data_cfg = preset["data"]
+    model = build_model(model_cfg)
+    params = sum(p.numel() for p in model.parameters())
+
+    print("=" * 56)
+    print("Itty Bitty Piano Kaggle Dry Run")
+    print("=" * 56)
+    print(f"Scale: {scale}")
+    print(
+        f"Architecture: {'v2' if bool(getattr(model_cfg, 'use_v2_architecture', False)) else 'v1'}"
+    )
+    print(f"Parameters: {params:,} ({params / 1e6:.2f}M)")
+    print(f"Batch size: {int(train_cfg.batch_size)}")
+    print(f"Grad accumulation: {int(train_cfg.grad_accumulation_steps)}")
+    print(f"Dataset weights: {dict(data_cfg.dataset_weights)}")
+    print("=" * 56)
+
+
+def _parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for Kaggle session script."""
+
+    parser = argparse.ArgumentParser(
+        description="Itty Bitty Piano Kaggle session helper"
+    )
+    parser.add_argument("--scale", type=str, default="small")
+    parser.add_argument("--max-epochs", type=int, default=2000)
+    parser.add_argument("--dry-run", action="store_true")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = _parse_args()
+    if bool(args.dry_run):
+        _dry_run_session(scale=str(args.scale))
+    else:
+        run_kaggle_session(scale=str(args.scale), max_epochs=int(args.max_epochs))

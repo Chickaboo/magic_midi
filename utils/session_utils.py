@@ -8,12 +8,15 @@ from typing import Any, Dict, Optional
 
 import torch
 
+from utils.logging_utils import get_project_logger
+
+
+LOGGER = get_project_logger()
+
 
 def detect_environment() -> Dict[str, Any]:
-    """
-    Detect the current training environment.
-    Returns a dict with environment details.
-    """
+    """Detect runtime environment and GPU availability."""
+
     import os
 
     env: Dict[str, Any] = {
@@ -52,17 +55,18 @@ def detect_environment() -> Dict[str, Any]:
                 torch.cuda.get_device_properties(0).total_memory / 1e9
             )
     except Exception:
-        pass
+        env["gpu_available"] = False
 
     return env
 
 
 def get_gpu_info() -> Dict[str, Any]:
+    """Return current GPU memory statistics, or CPU placeholders."""
+
     if torch.cuda.is_available():
-        device = torch.device("cuda")
-        props = torch.cuda.get_device_properties(device)
+        props = torch.cuda.get_device_properties(0)
         total = props.total_memory / (1024**3)
-        used = torch.cuda.memory_allocated(device) / (1024**3)
+        used = torch.cuda.memory_allocated(0) / (1024**3)
         free = max(0.0, total - used)
         return {
             "gpu_name": props.name,
@@ -79,7 +83,9 @@ def get_gpu_info() -> Dict[str, Any]:
     }
 
 
-def estimate_time_per_epoch(trainer) -> float:
+def estimate_time_per_epoch(trainer: Any) -> float:
+    """Measure one training epoch duration and return elapsed seconds."""
+
     start = time.time()
     before = getattr(trainer, "current_epoch", 0)
     trainer.train_n_epochs(1, start_epoch=int(before))
@@ -88,7 +94,14 @@ def estimate_time_per_epoch(trainer) -> float:
 
 
 class SessionWatchdog:
-    def __init__(self, drive_sync, trainer, warning_minutes: int = 5):
+    """Background watchdog that emits heartbeats and emergency checkpoints."""
+
+    def __init__(
+        self,
+        drive_sync: Any,
+        trainer: Any,
+        warning_minutes: int = 5,
+    ) -> None:
         self.drive_sync = drive_sync
         self.trainer = trainer
         self.warning_minutes = warning_minutes
@@ -102,12 +115,16 @@ class SessionWatchdog:
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
+        """Start watchdog background thread if not already running."""
+
         if self._thread is not None and self._thread.is_alive():
             return
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
+        """Stop watchdog thread."""
+
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=10)
@@ -127,21 +144,18 @@ class SessionWatchdog:
 
             minutes_elapsed = (now - self._start_time) / 60.0
 
-            # If no new checkpoint for 15 minutes, trigger emergency save.
             if (now - self._last_checkpoint_time) >= 900:
                 self._emergency_save(reason="no checkpoint for 15 minutes")
                 self._last_checkpoint_time = now
 
             if (not self._warning_fired) and minutes_elapsed >= 25.0:
-                print(
+                LOGGER.info(
                     "[Watchdog] Session near free-tier timeout (~25 min). "
-                    "Triggering emergency checkpoint + Drive sync."
+                    "Triggering emergency checkpoint + sync."
                 )
                 self._emergency_save(reason="25 minute warning")
                 self._warning_fired = True
 
-            # warning_minutes retained for compatibility; default loop interval 15s
-            _ = self.warning_minutes
             time.sleep(15)
 
     def _write_heartbeat(self, now: float) -> None:
@@ -156,9 +170,10 @@ class SessionWatchdog:
         }
         try:
             self.drive_sync.write_heartbeat(payload)
-            print(
-                "[Watchdog] Heartbeat: "
-                f"epoch={payload['current_epoch']} step={payload['global_step']}"
+            LOGGER.info(
+                "[Watchdog] Heartbeat: epoch=%d step=%d",
+                payload["current_epoch"],
+                payload["global_step"],
             )
         except Exception as exc:
             warnings.warn(f"Watchdog heartbeat failed: {exc}")
@@ -189,12 +204,14 @@ class SessionWatchdog:
             self.drive_sync.sync_checkpoint(local_path=local_path, tag="latest")
             self.drive_sync.sync_checkpoint(local_path=local_path, tag=tag)
             self.drive_sync.wait_for_sync()
-            print(f"[Watchdog] Emergency checkpoint saved ({reason}).")
+            LOGGER.info("[Watchdog] Emergency checkpoint saved (%s).", reason)
         except Exception as exc:
             warnings.warn(f"Watchdog emergency save failed ({reason}): {exc}")
 
 
-def print_session_banner(scale_preset: str, epoch: int, drive_sync) -> None:
+def print_session_banner(scale_preset: str, epoch: int, drive_sync: Any) -> None:
+    """Print concise session banner for local/Colab training runs."""
+
     try:
         from scale_config import SCALE_PRESETS, TARGET_PARAM_COUNTS
 
@@ -243,7 +260,7 @@ def print_session_banner(scale_preset: str, epoch: int, drive_sync) -> None:
                     ).total_seconds(),
                 )
         except Exception:
-            pass
+            continue
 
     best_str = f"{best_val:.3f}" if best_val is not None else "n/a"
     free = getattr(drive_sync, "free_space_gb", -1.0)

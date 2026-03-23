@@ -12,6 +12,8 @@ def _sample_next_token(
     top_p: float = 0.95,
     top_k: int = 50,
 ) -> torch.Tensor:
+    """Sample next token from logits using temperature/top-k/top-p filtering."""
+
     logits = logits / max(temperature, 1e-8)
 
     if top_k is not None and top_k > 0:
@@ -40,6 +42,8 @@ def _sample_next_token(
 
 
 class PianoBaselineModel(nn.Module):
+    """GRU baseline autoregressive model for MIDI token generation."""
+
     def __init__(
         self,
         vocab_size: int,
@@ -74,6 +78,8 @@ class PianoBaselineModel(nn.Module):
         hidden_states: torch.Tensor | None = None,
         position_offset: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run one forward pass and return logits plus recurrent hidden state."""
+
         if input_ids.ndim != 2:
             raise ValueError(
                 f"input_ids should be (batch, seq), got {tuple(input_ids.shape)}"
@@ -97,6 +103,8 @@ class PianoBaselineModel(nn.Module):
         return logits, h
 
     def get_num_params(self) -> int:
+        """Print and return total parameter count for baseline model."""
+
         embedding_params = (
             self.token_embedding.weight.numel() + self.position_embedding.weight.numel()
         )
@@ -120,6 +128,8 @@ class PianoBaselineModel(nn.Module):
         top_p: float = 0.95,
         top_k: int = 50,
     ) -> List[int]:
+        """Generate continuation tokens from seed tokens."""
+
         if max_new_tokens < 0:
             raise ValueError("max_new_tokens must be >= 0")
 

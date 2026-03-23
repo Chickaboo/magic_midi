@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import json
 import math
+import re
 import shutil
 import time
 import warnings
 from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -18,105 +20,33 @@ from torch.utils.data import DataLoader
 
 from config import DataConfig, TrainConfig
 from data.tokenizer import PianoTokenizer
-from training.losses import create_targets, next_token_loss
+from training.losses import build_piece_boundary_mask, create_targets, next_token_loss
 from training.scheduler import WarmupCosineScheduler
+from utils.logging_utils import get_project_logger
 
+
+LOGGER = get_project_logger()
 
 KAGGLE_WORKING_ROOT = Path("/kaggle/working")
-KAGGLE_CHECKPOINT_ROOT = KAGGLE_WORKING_ROOT / "checkpoints"
-KAGGLE_WARN_FREE_GB = 3.0
-KAGGLE_EMERGENCY_FREE_GB = 2.0
-KAGGLE_KEEP_EVERY_N_EPOCHS = 10
-KAGGLE_ALWAYS_KEEP_FILES = {
-    "best.safetensors",
-    "latest.safetensors",
-    "best_state.pt",
-    "latest_state.pt",
+CHECKPOINT_KEEP_POLICY: Dict[str, Any] = {
+    "always": [
+        "best.safetensors",
+        "best_state.pt",
+        "latest.safetensors",
+        "latest_state.pt",
+    ],
+    "milestone_every_n": 25,
+    "max_total_checkpoints": 8,
 }
+KAGGLE_KEEP_EVERY_N_EPOCHS = int(CHECKPOINT_KEEP_POLICY["milestone_every_n"])
+MIN_FREE_DISK_GB_BEFORE_SAVE = 3.0
 
-
-def _is_kaggle_checkpoint_dir(path: Path) -> bool:
-    try:
-        resolved = path.resolve()
-    except Exception:
-        resolved = path
-    normalized = str(resolved).replace("\\", "/").rstrip("/")
-    target = str(KAGGLE_CHECKPOINT_ROOT).replace("\\", "/").rstrip("/")
-    return normalized.startswith(target)
-
-
-def _checkpoint_dir_size_bytes(checkpoint_dir: Path) -> int:
-    total = 0
-    for file_path in checkpoint_dir.rglob("*"):
-        if not file_path.is_file():
-            continue
-        try:
-            total += int(file_path.stat().st_size)
-        except Exception:
-            continue
-    return int(total)
-
-
-def _parse_epoch_from_rotation_name(filename: str) -> Optional[int]:
-    if filename.startswith("epoch_") and filename.endswith(".safetensors"):
-        token = filename[len("epoch_") : -len(".safetensors")]
-        if token.isdigit():
-            return int(token)
-
-    if filename.startswith("epoch_") and filename.endswith("_state.pt"):
-        token = filename[len("epoch_") : -len("_state.pt")]
-        if token.isdigit():
-            return int(token)
-
-    return None
-
-
-def rotate_kaggle_checkpoint_dir(
-    checkpoint_dir: Path,
-    keep_every_n_epochs: int = KAGGLE_KEEP_EVERY_N_EPOCHS,
-) -> Dict[str, float]:
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    keep_every = max(1, int(keep_every_n_epochs))
-
-    deleted_files = 0
-    kept_files = 0
-
-    for file_path in checkpoint_dir.iterdir():
-        if not file_path.is_file():
-            continue
-
-        name = file_path.name
-        keep = False
-
-        if name in KAGGLE_ALWAYS_KEEP_FILES:
-            keep = True
-        else:
-            epoch = _parse_epoch_from_rotation_name(name)
-            if epoch is not None and epoch % keep_every == 0:
-                keep = True
-
-        if keep:
-            kept_files += 1
-            continue
-
-        try:
-            file_path.unlink()
-            deleted_files += 1
-        except FileNotFoundError:
-            continue
-        except Exception as exc:
-            warnings.warn(f"Failed to delete checkpoint artifact {file_path}: {exc}")
-
-    total_size_bytes = _checkpoint_dir_size_bytes(checkpoint_dir)
-    return {
-        "deleted_files": float(deleted_files),
-        "kept_files": float(kept_files),
-        "total_size_bytes": float(total_size_bytes),
-        "total_size_mb": float(total_size_bytes / (1024**2)),
-    }
+_EPOCH_MODEL_RE = re.compile(r"^epoch_(\d+)\.safetensors$")
 
 
 def kaggle_free_space_gb(path: Path = KAGGLE_WORKING_ROOT) -> float:
+    """Return free disk space in GiB for a given path."""
+
     try:
         _total, _used, free = shutil.disk_usage(str(path))
     except Exception as exc:
@@ -125,7 +55,114 @@ def kaggle_free_space_gb(path: Path = KAGGLE_WORKING_ROOT) -> float:
     return float(free / (1024**3))
 
 
+def _state_sidecar_for_model(model_file: Path) -> Path:
+    """Return the state sidecar path corresponding to one model file."""
+
+    return model_file.with_name(f"{model_file.stem}_state.pt")
+
+
+def _checkpoint_policy(
+    *,
+    keep_every_n_epochs: int,
+    max_total_checkpoints: int,
+) -> Dict[str, Any]:
+    """Build normalized checkpoint retention policy dict."""
+
+    keep_every = max(1, int(keep_every_n_epochs))
+    max_total = max(1, int(max_total_checkpoints))
+    always = list(CHECKPOINT_KEEP_POLICY["always"])
+    return {
+        "always": always,
+        "milestone_every_n": keep_every,
+        "max_total_checkpoints": max_total,
+    }
+
+
+def _rotate_checkpoints_impl(
+    checkpoint_dir: Path,
+    policy: Dict[str, Any],
+    reserve_slots: int = 0,
+) -> Dict[str, float]:
+    """Apply checkpoint retention policy and return rotation stats."""
+
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    protected = set(str(n) for n in policy["always"])
+    milestone_n = max(1, int(policy["milestone_every_n"]))
+    max_total = max(1, int(policy["max_total_checkpoints"]))
+    reserve = max(0, int(reserve_slots))
+    max_allowed_before_save = max(0, max_total - reserve)
+
+    all_models = list(checkpoint_dir.glob("*.safetensors"))
+    epoch_models = [f for f in all_models if _EPOCH_MODEL_RE.match(f.name)]
+
+    milestones: set[str] = set()
+    for model_file in epoch_models:
+        m = _EPOCH_MODEL_RE.match(model_file.name)
+        if m is None:
+            continue
+        epoch = int(m.group(1))
+        if epoch % milestone_n == 0:
+            milestones.add(model_file.name)
+            milestones.add(_state_sidecar_for_model(model_file).name)
+
+    deleted_files = 0
+    for model_file in epoch_models:
+        if model_file.name in protected or model_file.name in milestones:
+            continue
+        try:
+            model_file.unlink(missing_ok=True)
+            deleted_files += 1
+        except Exception as exc:
+            warnings.warn(f"Failed to delete checkpoint file {model_file}: {exc}")
+        sidecar = _state_sidecar_for_model(model_file)
+        try:
+            sidecar.unlink(missing_ok=True)
+        except Exception as exc:
+            warnings.warn(f"Failed to delete checkpoint state {sidecar}: {exc}")
+
+    remaining = list(checkpoint_dir.glob("*.safetensors"))
+    if len(remaining) > max_allowed_before_save:
+        non_protected = [f for f in remaining if f.name not in protected]
+        non_protected.sort(key=lambda f: f.stat().st_mtime)
+        over = len(remaining) - max_allowed_before_save
+        for model_file in non_protected[:over]:
+            try:
+                model_file.unlink(missing_ok=True)
+                deleted_files += 1
+            except Exception as exc:
+                warnings.warn(f"Failed to delete checkpoint file {model_file}: {exc}")
+            sidecar = _state_sidecar_for_model(model_file)
+            try:
+                sidecar.unlink(missing_ok=True)
+            except Exception as exc:
+                warnings.warn(f"Failed to delete checkpoint state {sidecar}: {exc}")
+
+    remaining_models = list(checkpoint_dir.glob("*.safetensors"))
+    return {
+        "deleted_files": float(deleted_files),
+        "remaining_models": float(len(remaining_models)),
+        "max_total_checkpoints": float(max_total),
+        "reserve_slots": float(reserve),
+    }
+
+
+def rotate_kaggle_checkpoint_dir(
+    checkpoint_dir: Path,
+    keep_every_n_epochs: int = KAGGLE_KEEP_EVERY_N_EPOCHS,
+    max_total_checkpoints: int = int(CHECKPOINT_KEEP_POLICY["max_total_checkpoints"]),
+) -> Dict[str, float]:
+    """Backward-compatible checkpoint rotation entrypoint used by Kaggle helpers."""
+
+    policy = _checkpoint_policy(
+        keep_every_n_epochs=keep_every_n_epochs,
+        max_total_checkpoints=max_total_checkpoints,
+    )
+    return _rotate_checkpoints_impl(checkpoint_dir, policy, reserve_slots=0)
+
+
 class Trainer:
+    """Training loop, validation, checkpointing, and resume utilities."""
+
     def __init__(
         self,
         model: torch.nn.Module,
@@ -155,9 +192,14 @@ class Trainer:
         )
         if self.use_data_parallel:
             device_ids = list(range(self.device_count))
-            print(f"Using DataParallel across GPUs: {device_ids}")
+            LOGGER.info("Using DataParallel across GPUs: %s", device_ids)
             self.model = torch.nn.DataParallel(self.model, device_ids=device_ids)
         self.model.to(self.device)
+
+        core_model = self._unwrap_model()
+        model_cfg = getattr(core_model, "config", None)
+        self.use_v2_model = bool(getattr(model_cfg, "use_v2_architecture", False))
+        self._memory_state: Optional[torch.Tensor] = None
 
         self.optimizer = AdamW(
             self.model.parameters(),
@@ -166,29 +208,30 @@ class Trainer:
         )
 
         steps_per_epoch = max(
-            1, math.ceil(len(self.train_loader) / self.config.grad_accumulation_steps)
+            1,
+            math.ceil(len(self.train_loader) / self.config.grad_accumulation_steps),
         )
         self.total_steps = steps_per_epoch * self.config.max_epochs
         self.scheduler = WarmupCosineScheduler(
             optimizer=self.optimizer,
             warmup_steps=self.config.warmup_steps,
             total_steps=self.total_steps,
-            min_lr_ratio=0.1,
+            min_lr_ratio=float(getattr(self.config, "min_lr_ratio", 0.1)),
         )
 
-        self.use_amp = self.device.type == "cuda"
-        amp_module = getattr(torch, "amp")
-        self.scaler = amp_module.GradScaler("cuda", enabled=self.use_amp)
+        self.use_amp = self.device.type == "cuda" and bool(
+            getattr(self.config, "use_amp", True)
+        )
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
         self.checkpoint_dir = Path(self.config.checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         (self.checkpoint_dir / "samples").mkdir(parents=True, exist_ok=True)
-        self._kaggle_rotation_enabled = _is_kaggle_checkpoint_dir(self.checkpoint_dir)
-        if self._kaggle_rotation_enabled:
-            print(
-                "Kaggle checkpoint rotation active: "
-                "keep latest/best + every 10th epoch only."
-            )
+
+        self._retention_policy = _checkpoint_policy(
+            keep_every_n_epochs=int(getattr(self.config, "keep_every_n_epochs", 25)),
+            max_total_checkpoints=int(getattr(self.config, "max_checkpoints", 8)),
+        )
 
         self.history: Dict[str, list] = {
             "train_loss": [],
@@ -214,15 +257,26 @@ class Trainer:
                 except Exception as exc:
                     warnings.warn(f"Failed to load tokenizer at {tok_path}: {exc}")
 
+        bind_tokenizer = getattr(self._unwrap_model(), "bind_tokenizer", None)
+        if callable(bind_tokenizer) and self.tokenizer is not None:
+            try:
+                bind_tokenizer(self.tokenizer)
+            except Exception as exc:
+                warnings.warn(f"Failed to bind tokenizer to model: {exc}")
+
         self._maybe_init_wandb()
 
     def _unwrap_model(self) -> Any:
+        """Return underlying module for DataParallel-wrapped models."""
+
         if isinstance(self.model, torch.nn.DataParallel):
             return self.model.module
         return self.model
 
     @staticmethod
     def format_perplexity(loss: float) -> str:
+        """Format perplexity for compact training logs."""
+
         if loss > 20.0:
             return "overflow"
         try:
@@ -233,184 +287,49 @@ class Trainer:
             return f"{ppl / 1_000_000:.1f}M"
         return f"{ppl:.2f}"
 
-    def _run_kaggle_checkpoint_rotation(self, epoch: int, trigger: str) -> None:
-        if not self._kaggle_rotation_enabled:
-            return
-        stats = rotate_kaggle_checkpoint_dir(
-            self.checkpoint_dir,
-            keep_every_n_epochs=KAGGLE_KEEP_EVERY_N_EPOCHS,
-        )
-        print(
-            "[Kaggle checkpoint cleanup] "
-            f"epoch={int(epoch):03d} trigger={trigger} "
-            f"deleted={int(stats['deleted_files'])} "
-            f"kept={int(stats['kept_files'])} "
-            f"size={float(stats['total_size_mb']):.1f}MB"
+    def _rotate_checkpoints(self, reserve_slots: int = 0) -> Dict[str, float]:
+        """Apply retention policy to checkpoint directory before saving."""
+
+        return _rotate_checkpoints_impl(
+            checkpoint_dir=self.checkpoint_dir,
+            policy=self._retention_policy,
+            reserve_slots=reserve_slots,
         )
 
-    def _kaggle_pre_epoch_disk_check(self, epoch: int) -> None:
-        if not self._kaggle_rotation_enabled:
-            return
+    def _pre_save_disk_check(self, reserve_slots: int = 0) -> None:
+        """Run disk-space check and emergency rotation when free space is low."""
 
-        free_gb = kaggle_free_space_gb(KAGGLE_WORKING_ROOT)
+        free_gb = kaggle_free_space_gb(self.checkpoint_dir)
         if free_gb < 0:
             return
 
-        if free_gb < KAGGLE_WARN_FREE_GB:
-            print(
-                "[Kaggle disk warning] "
-                f"/kaggle/working free space is low: {free_gb:.2f} GB"
+        if free_gb < MIN_FREE_DISK_GB_BEFORE_SAVE:
+            LOGGER.warning(
+                "Low disk space before checkpoint save: %.2f GB free (< %.2f GB). "
+                "Running emergency rotation.",
+                free_gb,
+                MIN_FREE_DISK_GB_BEFORE_SAVE,
             )
-
-        if free_gb < KAGGLE_EMERGENCY_FREE_GB:
-            print(
-                "[Kaggle disk emergency] "
-                f"epoch={int(epoch):03d} free={free_gb:.2f} GB < "
-                f"{KAGGLE_EMERGENCY_FREE_GB:.1f} GB. "
-                "Running synchronous checkpoint cleanup before save."
-            )
-            self._run_kaggle_checkpoint_rotation(epoch=epoch, trigger="pre_epoch")
-            free_after = kaggle_free_space_gb(KAGGLE_WORKING_ROOT)
+            self._rotate_checkpoints(reserve_slots=reserve_slots)
+            free_after = kaggle_free_space_gb(self.checkpoint_dir)
             if free_after >= 0:
-                print(
-                    "[Kaggle disk status] "
-                    f"free space after emergency cleanup: {free_after:.2f} GB"
-                )
+                LOGGER.info("Free space after emergency rotation: %.2f GB", free_after)
 
     def train(self) -> Dict[str, list]:
+        """Train for `config.max_epochs` epochs and return training history."""
+
         self._warn_if_high_memory_estimate()
         start_time = time.time()
 
         for epoch in range(1, self.config.max_epochs + 1):
-            self.current_epoch = epoch
-            self._kaggle_pre_epoch_disk_check(epoch=epoch)
-            epoch_start = time.time()
-            self.model.train()
-
-            self.optimizer.zero_grad(set_to_none=True)
-            running_loss = 0.0
-            running_count = 0
-            epoch_loss_sum = 0.0
-            epoch_loss_count = 0
-
-            for step_idx, batch in enumerate(self.train_loader, start=1):
-                seed, continuation = batch
-                seed = seed.to(self.device, non_blocking=True)
-                continuation = continuation.to(self.device, non_blocking=True)
-
-                input_ids = torch.cat([seed, continuation], dim=1)
-                targets = create_targets(seed, continuation)
-                targets = targets.to(self.device, non_blocking=True)
-
-                autocast_ctx = (
-                    getattr(torch, "amp").autocast("cuda")
-                    if self.use_amp
-                    else nullcontext()
-                )
-                with autocast_ctx:
-                    logits, _ = self._forward_model(input_ids)
-                    loss = next_token_loss(
-                        logits,
-                        targets,
-                        label_smoothing=self.config.label_smoothing,
-                    )
-
-                loss_value = float(loss.item())
-                epoch_loss_sum += loss_value
-                epoch_loss_count += 1
-
-                scaled_loss = loss / self.config.grad_accumulation_steps
-                if self.use_amp:
-                    self.scaler.scale(scaled_loss).backward()
-                else:
-                    scaled_loss.backward()
-
-                should_step = (
-                    step_idx % self.config.grad_accumulation_steps == 0
-                    or step_idx == len(self.train_loader)
-                )
-                if should_step:
-                    if self.use_amp:
-                        self.scaler.unscale_(self.optimizer)
-
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.config.max_grad_norm,
-                    )
-
-                    if self.use_amp:
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                    else:
-                        self.optimizer.step()
-
-                    self.optimizer.zero_grad(set_to_none=True)
-                    self.scheduler.step()
-                    self.global_step += 1
-
-                    lr = self.optimizer.param_groups[0]["lr"]
-                    self.history["lr"].append(float(lr))
-
-                running_loss += loss_value
-                running_count += 1
-
-                if (
-                    self.global_step > 0
-                    and self.global_step % 100 == 0
-                    and running_count > 0
-                ):
-                    avg = running_loss / running_count
-                    lr = self.optimizer.param_groups[0]["lr"]
-                    print(
-                        f"step={self.global_step:06d} train_loss={avg:.4f} lr={lr:.6e}"
-                    )
-                    running_loss = 0.0
-                    running_count = 0
-
-            train_loss = epoch_loss_sum / max(1, epoch_loss_count)
-            val_loss, perplexity = self.validate(epoch=epoch)
-
-            self.history["train_loss"].append(float(train_loss))
-            self.history["val_loss"].append(float(val_loss))
-            self.history["perplexity"].append(float(perplexity))
-
-            self.save_checkpoint(epoch=epoch, val_loss=val_loss)
-            if epoch % self.config.save_every_n_epochs == 0:
-                self.save_checkpoint(
-                    epoch=epoch, val_loss=val_loss, tag=f"epoch_{epoch:03d}"
-                )
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
-                self.save_checkpoint(epoch=epoch, val_loss=val_loss, best=True)
-
-            elapsed = time.time() - epoch_start
-            print(
-                f"Epoch {epoch:03d}/{self.config.max_epochs:03d} | "
-                f"train_loss={train_loss:.4f} | "
-                f"val_loss={val_loss:.4f} | "
-                f"ppl={self.format_perplexity(val_loss)} | "
-                f"time={elapsed:.1f}s"
-            )
-
-            self._wandb_log(
-                {
-                    "epoch": epoch,
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                    "perplexity": perplexity,
-                    "lr": self.optimizer.param_groups[0]["lr"],
-                }
-            )
+            self._run_one_epoch(epoch=epoch, max_epochs=self.config.max_epochs)
 
         total_elapsed = time.time() - start_time
-        print(f"Training complete in {total_elapsed / 60.0:.2f} minutes.")
+        LOGGER.info("Training complete in %.2f minutes.", total_elapsed / 60.0)
         return self.history
 
     def train_n_epochs(self, n: int, start_epoch: int = 0) -> Dict[str, list]:
-        """Train exactly n epochs starting from start_epoch.
-
-        Epoch numbering in logs/checkpoints will be absolute: start_epoch + i.
-        """
+        """Train exactly `n` epochs starting from `start_epoch` numbering."""
 
         if n <= 0:
             return self.history
@@ -421,133 +340,13 @@ class Trainer:
         try:
             for local_epoch in range(1, n + 1):
                 epoch = int(start_epoch + local_epoch)
-                self.current_epoch = epoch
-                self._kaggle_pre_epoch_disk_check(epoch=epoch)
-                epoch_start = time.time()
-                self.model.train()
-
-                self.optimizer.zero_grad(set_to_none=True)
-                running_loss = 0.0
-                running_count = 0
-                epoch_loss_sum = 0.0
-                epoch_loss_count = 0
-
-                for step_idx, batch in enumerate(self.train_loader, start=1):
-                    seed, continuation = batch
-                    seed = seed.to(self.device, non_blocking=True)
-                    continuation = continuation.to(self.device, non_blocking=True)
-
-                    input_ids = torch.cat([seed, continuation], dim=1)
-                    targets = create_targets(seed, continuation)
-                    targets = targets.to(self.device, non_blocking=True)
-
-                    autocast_ctx = (
-                        getattr(torch, "amp").autocast("cuda")
-                        if self.use_amp
-                        else nullcontext()
-                    )
-                    with autocast_ctx:
-                        logits, _ = self._forward_model(input_ids)
-                        loss = next_token_loss(
-                            logits,
-                            targets,
-                            label_smoothing=self.config.label_smoothing,
-                        )
-
-                    loss_value = float(loss.item())
-                    epoch_loss_sum += loss_value
-                    epoch_loss_count += 1
-
-                    scaled_loss = loss / self.config.grad_accumulation_steps
-                    if self.use_amp:
-                        self.scaler.scale(scaled_loss).backward()
-                    else:
-                        scaled_loss.backward()
-
-                    should_step = (
-                        step_idx % self.config.grad_accumulation_steps == 0
-                        or step_idx == len(self.train_loader)
-                    )
-                    if should_step:
-                        if self.use_amp:
-                            self.scaler.unscale_(self.optimizer)
-
-                        torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(),
-                            self.config.max_grad_norm,
-                        )
-
-                        if self.use_amp:
-                            self.scaler.step(self.optimizer)
-                            self.scaler.update()
-                        else:
-                            self.optimizer.step()
-
-                        self.optimizer.zero_grad(set_to_none=True)
-                        self.scheduler.step()
-                        self.global_step += 1
-
-                        lr = self.optimizer.param_groups[0]["lr"]
-                        self.history["lr"].append(float(lr))
-
-                    running_loss += loss_value
-                    running_count += 1
-
-                    if (
-                        self.global_step > 0
-                        and self.global_step % 100 == 0
-                        and running_count > 0
-                    ):
-                        avg = running_loss / running_count
-                        lr = self.optimizer.param_groups[0]["lr"]
-                        print(
-                            f"step={self.global_step:06d} "
-                            f"train_loss={avg:.4f} lr={lr:.6e}"
-                        )
-                        running_loss = 0.0
-                        running_count = 0
-
-                train_loss = epoch_loss_sum / max(1, epoch_loss_count)
-                val_loss, perplexity = self.validate(epoch=epoch)
-
-                self.history["train_loss"].append(float(train_loss))
-                self.history["val_loss"].append(float(val_loss))
-                self.history["perplexity"].append(float(perplexity))
-
-                self.save_checkpoint(epoch=epoch, val_loss=val_loss)
-                if epoch % self.config.save_every_n_epochs == 0:
-                    self.save_checkpoint(
-                        epoch=epoch,
-                        val_loss=val_loss,
-                        tag=f"epoch_{epoch:03d}",
-                    )
-                if val_loss < self.best_val_loss:
-                    self.best_val_loss = val_loss
-                    self.save_checkpoint(epoch=epoch, val_loss=val_loss, best=True)
-
-                elapsed = time.time() - epoch_start
-                print(
-                    f"Epoch {epoch:03d} | "
-                    f"train_loss={train_loss:.4f} | "
-                    f"val_loss={val_loss:.4f} | "
-                    f"ppl={self.format_perplexity(val_loss)} | "
-                    f"time={elapsed:.1f}s"
-                )
-
-                self._wandb_log(
-                    {
-                        "epoch": epoch,
-                        "train_loss": train_loss,
-                        "val_loss": val_loss,
-                        "perplexity": perplexity,
-                        "lr": self.optimizer.param_groups[0]["lr"],
-                    }
-                )
+                self._run_one_epoch(epoch=epoch, max_epochs=None)
 
             total_elapsed = time.time() - session_start
-            print(
-                f"Session training complete: {n} epoch(s) in "
-                f"{total_elapsed / 60.0:.2f} minutes."
+            LOGGER.info(
+                "Session training complete: %d epoch(s) in %.2f minutes.",
+                n,
+                total_elapsed / 60.0,
             )
             return self.history
 
@@ -571,37 +370,210 @@ class Trainer:
                 warnings.warn(f"Emergency checkpoint save failed: {save_exc}")
             raise
 
+    def _run_one_epoch(self, epoch: int, max_epochs: Optional[int]) -> None:
+        """Execute one full train/validate/checkpoint epoch."""
+
+        self.current_epoch = int(epoch)
+        epoch_start = time.time()
+        self.model.train()
+
+        self.optimizer.zero_grad(set_to_none=True)
+        running_loss = 0.0
+        running_count = 0
+        epoch_loss_sum = 0.0
+        epoch_loss_count = 0
+
+        for step_idx, batch in enumerate(self.train_loader, start=1):
+            parsed = self._parse_batch(batch)
+            seed = parsed["seed"]
+            continuation = parsed["continuation"]
+            input_ids = parsed["token_ids"]
+            onset_times = parsed["onset_times"]
+            durations = parsed["durations"]
+            reset_memory = bool(parsed["new_piece"].any().item())
+
+            seed = seed.to(self.device, non_blocking=True)
+            continuation = continuation.to(self.device, non_blocking=True)
+            input_ids = input_ids.to(self.device, non_blocking=True)
+            onset_times = onset_times.to(self.device, non_blocking=True)
+            durations = durations.to(self.device, non_blocking=True)
+            targets = create_targets(seed, continuation)
+            targets = targets.to(self.device, non_blocking=True)
+            boundary_mask = build_piece_boundary_mask(
+                seed=seed,
+                continuation=continuation,
+                new_piece=parsed["new_piece"],
+            ).to(self.device, non_blocking=True)
+
+            autocast_ctx = torch.amp.autocast("cuda") if self.use_amp else nullcontext()
+            with autocast_ctx:
+                logits, _ = self._forward_model(
+                    input_ids,
+                    onset_times=onset_times,
+                    durations=durations,
+                    reset_memory=reset_memory,
+                )
+                loss = next_token_loss(
+                    logits,
+                    targets,
+                    label_smoothing=self.config.label_smoothing,
+                    piece_boundary_mask=boundary_mask,
+                )
+
+            loss_value = float(loss.item())
+            epoch_loss_sum += loss_value
+            epoch_loss_count += 1
+
+            scaled_loss = loss / self.config.grad_accumulation_steps
+            if self.use_amp:
+                self.scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
+
+            should_step = (
+                step_idx % self.config.grad_accumulation_steps == 0
+                or step_idx == len(self.train_loader)
+            )
+            if should_step:
+                if self.use_amp:
+                    self.scaler.unscale_(self.optimizer)
+
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config.max_grad_norm,
+                )
+
+                if self.use_amp:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
+
+                self.optimizer.zero_grad(set_to_none=True)
+                self.scheduler.step()
+                self.global_step += 1
+
+                lr = self.optimizer.param_groups[0]["lr"]
+                self.history["lr"].append(float(lr))
+
+            running_loss += loss_value
+            running_count += 1
+
+            if (
+                self.global_step > 0
+                and self.global_step % 100 == 0
+                and running_count > 0
+            ):
+                avg = running_loss / running_count
+                lr = self.optimizer.param_groups[0]["lr"]
+                LOGGER.info(
+                    "step=%06d train_loss=%.4f lr=%.6e",
+                    self.global_step,
+                    avg,
+                    lr,
+                )
+                running_loss = 0.0
+                running_count = 0
+
+        train_loss = epoch_loss_sum / max(1, epoch_loss_count)
+        val_loss, perplexity = self.validate(epoch=epoch)
+
+        self.history["train_loss"].append(float(train_loss))
+        self.history["val_loss"].append(float(val_loss))
+        self.history["perplexity"].append(float(perplexity))
+
+        self.save_checkpoint(epoch=epoch, val_loss=val_loss)
+        if epoch % int(self.config.save_every_n_epochs) == 0:
+            self.save_checkpoint(
+                epoch=epoch,
+                val_loss=val_loss,
+                tag=f"epoch_{epoch:03d}",
+            )
+        if val_loss < self.best_val_loss:
+            self.best_val_loss = val_loss
+            self.save_checkpoint(epoch=epoch, val_loss=val_loss, best=True)
+
+        elapsed = time.time() - epoch_start
+        if max_epochs is None:
+            LOGGER.info(
+                "Epoch %03d | train_loss=%.4f | val_loss=%.4f | ppl=%s | time=%.1fs",
+                epoch,
+                train_loss,
+                val_loss,
+                self.format_perplexity(val_loss),
+                elapsed,
+            )
+        else:
+            LOGGER.info(
+                "Epoch %03d/%03d | train_loss=%.4f | val_loss=%.4f | ppl=%s | time=%.1fs",
+                epoch,
+                int(max_epochs),
+                train_loss,
+                val_loss,
+                self.format_perplexity(val_loss),
+                elapsed,
+            )
+
+        self._wandb_log(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "perplexity": perplexity,
+                "lr": self.optimizer.param_groups[0]["lr"],
+            }
+        )
+
     @torch.no_grad()
     def validate(self, epoch: int = 0) -> Tuple[float, float]:
+        """Evaluate on validation set and run generation health checks."""
+
         self.model.eval()
 
         val_loss_sum = 0.0
         val_count = 0
 
-        for batch_idx, batch in enumerate(self.val_loader):
-            seed, continuation = batch
+        for batch in self.val_loader:
+            parsed = self._parse_batch(batch)
+            seed = parsed["seed"]
+            continuation = parsed["continuation"]
+            input_ids = parsed["token_ids"]
+            onset_times = parsed["onset_times"]
+            durations = parsed["durations"]
+            reset_memory = bool(parsed["new_piece"].any().item())
+
             seed = seed.to(self.device, non_blocking=True)
             continuation = continuation.to(self.device, non_blocking=True)
+            input_ids = input_ids.to(self.device, non_blocking=True)
+            onset_times = onset_times.to(self.device, non_blocking=True)
+            durations = durations.to(self.device, non_blocking=True)
 
             if self.fixed_seed_tokens is None and seed.shape[0] > 0:
                 self.fixed_seed_tokens = seed[0].detach().cpu().tolist()
 
-            input_ids = torch.cat([seed, continuation], dim=1)
             targets = create_targets(seed, continuation).to(
-                self.device, non_blocking=True
+                self.device,
+                non_blocking=True,
             )
+            boundary_mask = build_piece_boundary_mask(
+                seed=seed,
+                continuation=continuation,
+                new_piece=parsed["new_piece"],
+            ).to(self.device, non_blocking=True)
 
-            autocast_ctx = (
-                getattr(torch, "amp").autocast("cuda")
-                if self.use_amp
-                else nullcontext()
-            )
+            autocast_ctx = torch.amp.autocast("cuda") if self.use_amp else nullcontext()
             with autocast_ctx:
-                logits, _ = self._forward_model(input_ids)
+                logits, _ = self._forward_model(
+                    input_ids,
+                    onset_times=onset_times,
+                    durations=durations,
+                    reset_memory=reset_memory,
+                )
                 loss = next_token_loss(
                     logits,
                     targets,
                     label_smoothing=self.config.label_smoothing,
+                    piece_boundary_mask=boundary_mask,
                 )
 
             val_loss_sum += float(loss.item())
@@ -617,8 +589,31 @@ class Trainer:
             perplexity = float("inf")
 
         self._generate_validation_sample(epoch=epoch)
-        self._run_generation_health_check(epoch=epoch)
+        if bool(getattr(self.config, "val_generation_check", True)):
+            self._run_generation_health_check(epoch=epoch)
         return val_loss, perplexity
+
+    def _checkpoint_target_paths(
+        self,
+        *,
+        best: bool,
+        tag: Optional[str],
+    ) -> Tuple[Path, Path]:
+        """Resolve checkpoint model/state output paths for a save call."""
+
+        if best:
+            model_path = self.checkpoint_dir / "best.safetensors"
+            state_path = self.checkpoint_dir / "best_state.pt"
+            return model_path, state_path
+
+        if tag is not None:
+            model_path = self.checkpoint_dir / f"{tag}.safetensors"
+            state_path = self.checkpoint_dir / f"{tag}_state.pt"
+            return model_path, state_path
+
+        model_path = self.checkpoint_dir / "latest.safetensors"
+        state_path = self.checkpoint_dir / "latest_state.pt"
+        return model_path, state_path
 
     def save_checkpoint(
         self,
@@ -627,85 +622,76 @@ class Trainer:
         best: bool = False,
         tag: Optional[str] = None,
     ) -> None:
+        """Save model and training state with aggressive pre-save rotation."""
+
+        target_model_path, target_state_path = self._checkpoint_target_paths(
+            best=best,
+            tag=tag,
+        )
+        reserve_slots = 0 if target_model_path.exists() else 1
+
+        self._rotate_checkpoints(reserve_slots=reserve_slots)
+        self._pre_save_disk_check(reserve_slots=reserve_slots)
+
         core_model = self._unwrap_model()
         model_state = {
-            k: v.detach().cpu().contiguous() for k, v in core_model.state_dict().items()
+            key: value.detach().cpu().contiguous()
+            for key, value in core_model.state_dict().items()
         }
         model_state_to_save = _prepare_state_for_safetensors(model_state)
-
-        latest_model_name = (
-            "latest.safetensors"
-            if self._kaggle_rotation_enabled
-            else "latest_model.safetensors"
+        model_config_payload = _safe_asdict(getattr(core_model, "config", None))
+        checkpoint_metadata = _checkpoint_safetensors_metadata(
+            epoch=epoch,
+            val_loss=val_loss,
+            train_config=asdict(self.config),
+            data_config=asdict(self.data_config)
+            if self.data_config is not None
+            else None,
+            model_config=model_config_payload,
         )
-        latest_model_path = self.checkpoint_dir / latest_model_name
-        latest_state_path = self.checkpoint_dir / "latest_state.pt"
 
-        safetensors_save_file(model_state_to_save, str(latest_model_path))
+        safetensors_save_file(
+            model_state_to_save,
+            str(target_model_path),
+            metadata=checkpoint_metadata,
+        )
 
         state = {
-            "epoch": epoch,
+            "epoch": int(epoch),
             "val_loss": float(val_loss),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),
             "scaler": self.scaler.state_dict() if self.use_amp else None,
+            "memory_state": self._memory_state.detach().cpu()
+            if isinstance(self._memory_state, torch.Tensor)
+            else None,
             "train_config": asdict(self.config),
             "data_config": asdict(self.data_config)
             if self.data_config is not None
             else None,
             "model_config": _safe_asdict(getattr(core_model, "config", None)),
-            "model_weights_path": str(latest_model_path.name),
+            "model_weights_path": str(target_model_path.name),
             "history": self.history,
             "best_val_loss": self.best_val_loss,
             "global_step": self.global_step,
         }
-        torch.save(state, latest_state_path)
-
-        if best:
-            best_model_name = (
-                "best.safetensors"
-                if self._kaggle_rotation_enabled
-                else "best_model.safetensors"
-            )
-            best_model_path = self.checkpoint_dir / best_model_name
-            best_state_path = self.checkpoint_dir / "best_state.pt"
-            safetensors_save_file(model_state_to_save, str(best_model_path))
-            state_best = dict(state)
-            state_best["model_weights_path"] = str(best_model_path.name)
-            torch.save(state_best, best_state_path)
-
-        if tag is not None:
-            tagged_model_name = (
-                f"{tag}.safetensors"
-                if self._kaggle_rotation_enabled
-                else f"{tag}_model.safetensors"
-            )
-            tagged_model = self.checkpoint_dir / tagged_model_name
-            tagged_state = self.checkpoint_dir / f"{tag}_state.pt"
-            safetensors_save_file(model_state_to_save, str(tagged_model))
-            state_tag = dict(state)
-            state_tag["model_weights_path"] = str(tagged_model.name)
-            torch.save(state_tag, tagged_state)
-
-        if self._kaggle_rotation_enabled:
-            trigger = "latest"
-            if best:
-                trigger = "best"
-            if tag is not None:
-                trigger = str(tag)
-            self._run_kaggle_checkpoint_rotation(epoch=epoch, trigger=trigger)
+        torch.save(state, target_state_path)
 
     def load_checkpoint(self, path: str) -> Dict[str, Any]:
+        """Load checkpoint weights and state from `.pt` or `.safetensors` file."""
+
         ckpt_path = Path(path)
         if not ckpt_path.exists():
-            raise FileNotFoundError(f"Checkpoint path not found: {ckpt_path}")
+            raise FileNotFoundError(
+                f"Checkpoint path not found: {ckpt_path}. Verify checkpoint location and filename."
+            )
 
         state: Dict[str, Any] = {}
 
         if ckpt_path.suffix == ".pt":
             state = torch.load(ckpt_path, map_location=self.device)
             model_weights_path = state.get("model_weights_path")
-            candidates = []
+            candidates: List[Path] = []
             if isinstance(model_weights_path, str) and model_weights_path:
                 candidates.append(ckpt_path.parent / model_weights_path)
             candidates.extend(
@@ -718,29 +704,35 @@ class Trainer:
             model_path = next((p for p in candidates if p.exists()), None)
             if model_path is None:
                 raise FileNotFoundError(
-                    f"No model weights found next to checkpoint state {ckpt_path}"
+                    f"No model weights found next to checkpoint state {ckpt_path}. "
+                    "Ensure .safetensors model file is present."
                 )
             model_state = safetensors_load_file(str(model_path), device="cpu")
             self._unwrap_model().load_state_dict(model_state)
         elif ckpt_path.suffix == ".safetensors":
             model_state = safetensors_load_file(str(ckpt_path), device="cpu")
             self._unwrap_model().load_state_dict(model_state)
-            state_candidates = []
+
+            state_candidates = [
+                ckpt_path.with_name(f"{ckpt_path.stem}_state.pt"),
+                ckpt_path.parent / "latest_state.pt",
+                ckpt_path.parent / "best_state.pt",
+            ]
             if ckpt_path.name.endswith("_model.safetensors"):
                 state_candidates.append(
                     ckpt_path.with_name(
                         ckpt_path.name.replace("_model.safetensors", "_state.pt")
                     )
                 )
-            state_candidates.append(ckpt_path.with_name(f"{ckpt_path.stem}_state.pt"))
-            state_candidates.append(ckpt_path.parent / "latest_state.pt")
 
             for state_guess in state_candidates:
                 if state_guess.exists():
                     state = torch.load(state_guess, map_location=self.device)
                     break
         else:
-            raise ValueError("Checkpoint path must end with .pt or .safetensors")
+            raise ValueError(
+                f"Unsupported checkpoint extension for {ckpt_path}. Use .pt or .safetensors."
+            )
 
         if state:
             if "optimizer" in state:
@@ -749,6 +741,12 @@ class Trainer:
                 self.scheduler.load_state_dict(state["scheduler"])
             if self.use_amp and "scaler" in state and state["scaler"] is not None:
                 self.scaler.load_state_dict(state["scaler"])
+            if "memory_state" in state:
+                memory_state = state.get("memory_state")
+                if isinstance(memory_state, torch.Tensor):
+                    self._memory_state = memory_state.to(self.device)
+                else:
+                    self._memory_state = memory_state
             self.global_step = int(state.get("global_step", 0))
             self.best_val_loss = float(state.get("best_val_loss", self.best_val_loss))
             history = state.get("history")
@@ -759,9 +757,10 @@ class Trainer:
         return state
 
     def _generate_validation_sample(self, epoch: int) -> None:
+        """Generate one validation sample for quick musical inspection."""
+
         if self.fixed_seed_tokens is None:
             return
-
         if self.data_config is None:
             return
 
@@ -773,7 +772,7 @@ class Trainer:
             core_model = self._unwrap_model()
             generate_fn = getattr(core_model, "generate", None)
             if not callable(generate_fn):
-                raise RuntimeError("Model does not expose generate(...)")
+                raise RuntimeError("Model does not expose generate(...) method.")
             generated = generate_fn(
                 seed_tokens=seed,
                 max_new_tokens=self.data_config.continuation_length,
@@ -785,7 +784,7 @@ class Trainer:
             )
             if not isinstance(generated, (list, tuple)):
                 raise RuntimeError(
-                    "Model generate(...) did not return a token sequence"
+                    "Model generate(...) did not return a token sequence."
                 )
             generated_tokens = [int(token) for token in generated]
         except Exception as exc:
@@ -812,6 +811,8 @@ class Trainer:
             )
 
     def _run_generation_health_check(self, epoch: int) -> None:
+        """Run generation confidence health checks during validation."""
+
         if self.fixed_seed_tokens is None:
             return
         if self.data_config is None:
@@ -830,9 +831,16 @@ class Trainer:
             return
 
         try:
+            health_steps = int(
+                getattr(
+                    self.config,
+                    "val_generation_steps",
+                    getattr(self.config, "generation_health_steps", 20),
+                )
+            )
             health = health_fn(
                 seed_tokens=seed,
-                steps=self.config.generation_health_steps,
+                steps=health_steps,
                 temperature=self.config.generation_health_temperature,
                 top_p=self.config.generation_health_top_p,
                 top_k=self.config.generation_health_top_k,
@@ -856,13 +864,14 @@ class Trainer:
         max_raw_top1 = float(health.get("max_raw_top1_prob", 0.0))
         min_candidates = int(float(health.get("min_candidate_count", 0.0)))
 
-        print(
-            "Generation health "
-            f"epoch={epoch:03d} "
-            f"passed={passed} "
-            f"max_final_top1={max_final_top1:.4f} "
-            f"max_raw_top1={max_raw_top1:.4f} "
-            f"min_candidates={min_candidates}"
+        LOGGER.info(
+            "Generation health epoch=%03d passed=%s max_final_top1=%.4f "
+            "max_raw_top1=%.4f min_candidates=%d",
+            epoch,
+            passed,
+            max_final_top1,
+            max_raw_top1,
+            min_candidates,
         )
 
         self.history.setdefault("gen_health_max_final_top1", []).append(max_final_top1)
@@ -884,10 +893,13 @@ class Trainer:
             raise AssertionError(
                 "Generation health check threshold exceeded: "
                 f"max_final_top1={max_final_top1:.4f} > "
-                f"{self.config.generation_health_top1_threshold:.4f}"
+                f"{self.config.generation_health_top1_threshold:.4f}. "
+                "Increase sampling diversity or review model calibration."
             )
 
     def _resolve_device(self, requested: str) -> torch.device:
+        """Resolve requested device string to a valid torch device."""
+
         if requested == "auto":
             return torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if requested == "cuda" and not torch.cuda.is_available():
@@ -896,6 +908,8 @@ class Trainer:
         return torch.device(requested)
 
     def _warn_if_high_memory_estimate(self) -> None:
+        """Log rough memory estimate on CUDA to avoid OOM surprises."""
+
         if self.device.type != "cuda":
             return
 
@@ -903,7 +917,6 @@ class Trainer:
         total_vram_gb = total_vram / (1024**3)
 
         core_model = self._unwrap_model()
-
         param_count = sum(p.numel() for p in core_model.parameters())
         params_bytes = param_count * 4
         grads_bytes = param_count * 4
@@ -919,22 +932,158 @@ class Trainer:
         estimate = params_bytes + grads_bytes + adam_bytes + activation_bytes
         estimate_gb = estimate / (1024**3)
 
-        print(
-            f"Estimated training memory: {estimate_gb:.2f} GB "
-            f"(GPU available: {total_vram_gb:.2f} GB)"
+        LOGGER.info(
+            "Estimated training memory: %.2f GB (GPU available: %.2f GB)",
+            estimate_gb,
+            total_vram_gb,
         )
         if self.use_data_parallel:
-            print(
-                "DataParallel active across "
-                f"{self.device_count} GPUs (global batch={self.config.batch_size})."
+            LOGGER.info(
+                "DataParallel active across %d GPUs (global batch=%d).",
+                self.device_count,
+                int(self.config.batch_size),
             )
         if estimate_gb > 12.0:
             warnings.warn(
                 "Estimated memory usage exceeds 12GB. Consider lower batch size or shorter context."
             )
 
-    def _forward_model(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, Any]:
-        # Unified forward signature used by train/validate/generation.
+    def _parse_batch(self, batch: Any) -> Dict[str, torch.Tensor]:
+        """Normalize dataloader batch formats to one dictionary structure."""
+
+        if isinstance(batch, dict):
+            seed = batch.get("seed")
+            continuation = batch.get("continuation")
+            token_ids = batch.get("token_ids")
+            onset_times = batch.get("onset_times")
+            durations = batch.get("durations")
+            new_piece = batch.get("new_piece")
+        else:
+            seed = None
+            continuation = None
+            token_ids = None
+            onset_times = None
+            durations = None
+            new_piece = None
+            if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                seed = batch[0]
+                continuation = batch[1]
+
+        if not isinstance(seed, torch.Tensor) or not isinstance(
+            continuation, torch.Tensor
+        ):
+            raise ValueError("Batch must provide tensor `seed` and `continuation`.")
+
+        if not isinstance(token_ids, torch.Tensor):
+            token_ids = torch.cat([seed, continuation], dim=1)
+
+        if not isinstance(onset_times, torch.Tensor):
+            onset_times = self._fallback_onset_times(token_ids)
+        if not isinstance(durations, torch.Tensor):
+            durations = self._fallback_durations(token_ids)
+
+        if not isinstance(new_piece, torch.Tensor):
+            new_piece = torch.ones((token_ids.shape[0],), dtype=torch.bool)
+        else:
+            new_piece = new_piece.to(dtype=torch.bool)
+
+        return {
+            "seed": seed,
+            "continuation": continuation,
+            "token_ids": token_ids,
+            "onset_times": onset_times,
+            "durations": durations,
+            "new_piece": new_piece,
+        }
+
+    def _fallback_onset_times(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Create fallback onset times when dataset lacks explicit timing arrays."""
+
+        if token_ids.ndim != 2:
+            raise ValueError(
+                f"token_ids must be rank-2, got shape {tuple(token_ids.shape)}"
+            )
+        step = 0.5
+        if self.data_config is not None:
+            step = float(
+                max(
+                    1e-4,
+                    getattr(
+                        self.data_config, "time_feature_fallback_step_seconds", 0.5
+                    ),
+                )
+            )
+        seq_len = int(token_ids.shape[1])
+        base = (
+            torch.arange(seq_len, device=token_ids.device, dtype=torch.float32) * step
+        )
+        return base.unsqueeze(0).expand(token_ids.shape[0], -1).contiguous()
+
+    def _fallback_durations(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Create fallback duration features when dataset lacks duration arrays."""
+
+        step = 0.5
+        if self.data_config is not None:
+            step = float(
+                max(
+                    1e-4,
+                    getattr(
+                        self.data_config, "time_feature_fallback_step_seconds", 0.5
+                    ),
+                )
+            )
+        return torch.full(
+            size=tuple(token_ids.shape),
+            fill_value=step,
+            dtype=torch.float32,
+            device=token_ids.device,
+        )
+
+    def _reset_memory_state(self) -> None:
+        """Reset recurrent theme memory for v2 model."""
+
+        self._memory_state = None
+        core = self._unwrap_model()
+        theme_memory = getattr(core, "theme_memory", None)
+        reset_fn = getattr(theme_memory, "reset", None)
+        if callable(reset_fn):
+            reset_value = reset_fn()
+            if isinstance(reset_value, torch.Tensor):
+                self._memory_state = reset_value
+
+    def _forward_model(
+        self,
+        input_ids: torch.Tensor,
+        onset_times: Optional[torch.Tensor] = None,
+        durations: Optional[torch.Tensor] = None,
+        reset_memory: bool = False,
+    ) -> Tuple[torch.Tensor, Any]:
+        """Run model forward with unified signature used by train/validate."""
+
+        if self.use_v2_model:
+            if reset_memory and bool(
+                getattr(self.config, "theme_memory_reset_on_piece", True)
+            ):
+                self._reset_memory_state()
+
+            if onset_times is None:
+                onset_times = self._fallback_onset_times(input_ids)
+            if durations is None:
+                durations = self._fallback_durations(input_ids)
+
+            logits, new_memory = self.model(
+                token_ids=input_ids,
+                onset_times=onset_times,
+                durations=durations,
+                memory=self._memory_state,
+                return_memory=True,
+            )
+            if isinstance(new_memory, torch.Tensor):
+                self._memory_state = new_memory.detach()
+            else:
+                self._memory_state = new_memory
+            return logits, new_memory
+
         return self.model(
             input_ids,
             hidden_states=None,
@@ -942,16 +1091,33 @@ class Trainer:
         )
 
     def _infer_sequence_length(self) -> int:
+        """Infer total train sequence length from config or one batch."""
+
         if self.data_config is not None:
             return self.data_config.seed_length + self.data_config.continuation_length
 
         try:
-            seed, cont = next(iter(self.train_loader))
-            return int(seed.shape[1] + cont.shape[1])
+            sample_batch = next(iter(self.train_loader))
+            if isinstance(sample_batch, dict):
+                token_ids = sample_batch.get("token_ids")
+                if isinstance(token_ids, torch.Tensor):
+                    return int(token_ids.shape[1])
+                seed = sample_batch.get("seed")
+                cont = sample_batch.get("continuation")
+                if isinstance(seed, torch.Tensor) and isinstance(cont, torch.Tensor):
+                    return int(seed.shape[1] + cont.shape[1])
+            elif isinstance(sample_batch, (list, tuple)) and len(sample_batch) >= 2:
+                seed, cont = sample_batch[0], sample_batch[1]
+                if isinstance(seed, torch.Tensor) and isinstance(cont, torch.Tensor):
+                    return int(seed.shape[1] + cont.shape[1])
         except Exception:
             return 1024
 
+        return 1024
+
     def _maybe_init_wandb(self) -> None:
+        """Initialize Weights & Biases if enabled."""
+
         self._wandb = None
         if not self.config.use_wandb:
             return
@@ -965,12 +1131,14 @@ class Trainer:
             self._wandb = None
 
     def _wandb_log(self, payload: Dict[str, Any]) -> None:
+        """Log one payload to wandb when enabled."""
+
         if self._wandb is None:
             return
         try:
             self._wandb.log(payload)
-        except Exception:
-            pass
+        except Exception as exc:
+            warnings.warn(f"wandb log failed ({exc})")
 
 
 def _prepare_state_for_safetensors(
@@ -991,9 +1159,38 @@ def _prepare_state_for_safetensors(
 
 
 def _safe_asdict(value: Any) -> Optional[Dict[str, Any]]:
+    """Safely convert dataclass value to dict or return None."""
+
     if value is None:
         return None
     try:
         return asdict(value)
     except TypeError:
         return None
+
+
+def _checkpoint_safetensors_metadata(
+    *,
+    epoch: int,
+    val_loss: float,
+    train_config: Dict[str, Any],
+    data_config: Optional[Dict[str, Any]],
+    model_config: Optional[Dict[str, Any]],
+) -> Dict[str, str]:
+    """Encode metadata payload for safetensors checkpoints."""
+
+    metadata: Dict[str, str] = {
+        "checkpoint_format": "1",
+        "epoch": str(int(epoch)),
+        "val_loss": str(float(val_loss)),
+    }
+
+    def _encode(name: str, payload: Optional[Dict[str, Any]]) -> None:
+        if payload is None:
+            return
+        metadata[name] = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    _encode("train_config", train_config)
+    _encode("data_config", data_config)
+    _encode("model_config", model_config)
+    return metadata

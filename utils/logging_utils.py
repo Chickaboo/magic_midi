@@ -5,7 +5,20 @@ from pathlib import Path
 from typing import Any
 
 
+PROJECT_LOGGER_NAME = "itty_bitty_piano"
+
+
 def setup_logger(name: str, log_file: str | None = None) -> logging.Logger:
+    """Create and configure a logger once.
+
+    Args:
+        name: Logger name.
+        log_file: Optional file path for mirrored logs.
+
+    Returns:
+        Configured logger instance.
+    """
+
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
 
@@ -31,14 +44,23 @@ def setup_logger(name: str, log_file: str | None = None) -> logging.Logger:
     return logger
 
 
+def get_project_logger(log_file: str | None = None) -> logging.Logger:
+    """Return the shared project logger."""
+
+    return setup_logger(PROJECT_LOGGER_NAME, log_file=log_file)
+
+
 def log_model_summary(model: Any, config: Any) -> None:
+    """Log core model configuration and parameter counts."""
+
+    logger = get_project_logger()
     model_type = model.__class__.__name__
-    print(f"Model type: {model_type}")
+    logger.info("Model type: %s", model_type)
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total params: {total_params:,}")
-    print(f"Trainable params: {trainable_params:,}")
+    logger.info("Total params: %s", f"{total_params:,}")
+    logger.info("Trainable params: %s", f"{trainable_params:,}")
 
     if hasattr(model, "get_num_params"):
         model.get_num_params()
@@ -71,10 +93,10 @@ def log_model_summary(model: Any, config: Any) -> None:
     tied_emb = getattr(config, "tie_embeddings", "unknown")
     logit_scale = getattr(config, "output_logit_scale", "auto")
 
-    print(f"Mamba backend: {mamba_info}")
-    print(f"Fallback active: {fallback_info}")
-    print(f"CfC enabled: {use_cfc}")
-    print(f"Mamba enabled: {use_mamba}")
-    print(f"Attention bias: {attention_bias}")
-    print(f"Tied embeddings: {tied_emb}")
-    print(f"Output logit scale: {logit_scale}")
+    logger.info("Mamba backend: %s", mamba_info)
+    logger.info("Fallback active: %s", fallback_info)
+    logger.info("CfC enabled: %s", use_cfc)
+    logger.info("Mamba enabled: %s", use_mamba)
+    logger.info("Attention bias: %s", attention_bias)
+    logger.info("Tied embeddings: %s", tied_emb)
+    logger.info("Output logit scale: %s", logit_scale)

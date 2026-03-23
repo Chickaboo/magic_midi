@@ -40,6 +40,101 @@ def _print_ok(label: str, payload: str) -> None:
     print(f"  {label}: OK - {payload}")
 
 
+def diagnose_initialization(
+    model: IttyBittyPianoV2,
+) -> tuple[Dict[str, Dict[str, float]], torch.Tensor]:
+    """Run pre-training activation/logit diagnostics for v2 initialization."""
+
+    model.eval()
+
+    batch_size, seq_len = 2, 128
+    token_ids = torch.randint(0, 2000, (batch_size, seq_len))
+    onset_times = torch.linspace(0.0, 30.0, seq_len).unsqueeze(0).repeat(batch_size, 1)
+
+    activations: Dict[str, Dict[str, float]] = {}
+
+    def make_hook(name: str):
+        def hook(
+            _module: torch.nn.Module, _inputs: tuple[torch.Tensor, ...], output: Any
+        ) -> None:
+            out = output[0] if isinstance(output, tuple) else output
+            if isinstance(out, torch.Tensor):
+                activations[name] = {
+                    "mean": float(out.mean().item()),
+                    "std": float(out.std().item()),
+                    "max_abs": float(out.abs().max().item()),
+                }
+
+        return hook
+
+    hooks = [
+        model.token_embedding.register_forward_hook(make_hook("embedding")),
+        model.time_encoding.register_forward_hook(make_hook("time_encoding")),
+        model.stream_split.register_forward_hook(make_hook("stream_split")),
+        model.stream_merge.register_forward_hook(make_hook("stream_merge")),
+        model.phrase_summarizer.register_forward_hook(make_hook("phrase_summarizer")),
+        model.final_norm.register_forward_hook(make_hook("final_norm")),
+    ]
+
+    with torch.no_grad():
+        logits, _ = model(token_ids, onset_times, return_memory=True)
+
+    for h in hooks:
+        h.remove()
+
+    print("=== Initialization Diagnostic ===")
+    for name, stats in activations.items():
+        print(f"  {name:20s}: std={stats['std']:.3f}  max_abs={stats['max_abs']:.3f}")
+    print(
+        f"  {'logits':20s}: std={float(logits.std().item()):.3f}  "
+        f"max_abs={float(logits.abs().max().item()):.3f}"
+    )
+    print("\nHealthy range: std 1-5, max_abs < 20")
+    print("Collapsed if:  std > 10 or max_abs > 50")
+
+    return activations, logits
+
+
+def test_initialization_health() -> None:
+    """Verify v2 random init stays stable and non-collapsed without top1 cap."""
+
+    print("Testing v2 initialization health (uncapped)...")
+    cfg = SCALE_PRESETS["large_v2"]["model"]
+    model = IttyBittyPianoV2(cfg).eval()
+
+    _activations, logits = diagnose_initialization(model)
+
+    logit_std = float(logits.std().item())
+    logit_max = float(logits.abs().max().item())
+    print(f"Logit std: {logit_std:.3f} (target: 0.5-8.0)")
+    print(f"Logit max_abs: {logit_max:.3f} (target: <30.0)")
+    assert 0.5 < logit_std < 8.0, f"Logit std out of healthy range: {logit_std:.3f}"
+    assert logit_max < 30.0, f"Logit max_abs too large: {logit_max:.3f}"
+
+    seed = torch.randint(0, cfg.vocab_size, (128,))
+    report = model.generation_health_check(
+        seed_tokens=seed,
+        steps=20,
+        temperature=1.0,
+        top_p=0.95,
+        top_k=50,
+        repetition_penalty=1.1,
+        repetition_window=64,
+        min_tokens_to_keep=3,
+        top1_threshold=1.1,
+        raise_on_failure=False,
+    )
+    max_top1 = float(report["max_final_top1_prob"])
+    print(f"Uncapped max_top1: {max_top1:.4f} (target: <0.95)")
+    assert max_top1 < 0.95, (
+        f"Architecture collapses at initialization: max_top1={max_top1:.4f}"
+    )
+    _print_ok(
+        "Initialization health",
+        f"logit_std={logit_std:.3f}, max_abs={logit_max:.3f}, uncapped_top1={max_top1:.4f}",
+    )
+
+
 def test_alibi_bias() -> None:
     """Validate ALiBi bias shape and diagonal values."""
 
@@ -406,6 +501,36 @@ def test_v2_model() -> None:
     _print_ok("V2 memory reset", "theme_memory.reset() -> None")
 
 
+def test_memory_reset_determinism() -> None:
+    """Verify memory reset restores deterministic logits for same input."""
+
+    print("Testing v2 memory reset determinism...")
+    cfg = SCALE_PRESETS["large_v2"]["model"]
+    model = IttyBittyPianoV2(cfg).eval()
+    token_ids = torch.randint(0, cfg.vocab_size, (1, 128))
+    onset_times = torch.linspace(0.0, 30.0, 128).unsqueeze(0)
+
+    with torch.no_grad():
+        logits_1, mem_1 = model(token_ids, onset_times, return_memory=True)
+        _logits_with_mem, _ = model(
+            token_ids,
+            onset_times,
+            memory=mem_1,
+            return_memory=True,
+        )
+
+    model.theme_memory.reset()
+    with torch.no_grad():
+        logits_2, mem_2 = model(token_ids, onset_times, return_memory=True)
+
+    assert mem_1 is not None and mem_2 is not None
+    assert torch.allclose(logits_1, logits_2, atol=1e-5), "Memory reset failed"
+    _print_ok(
+        "V2 memory reset deterministic",
+        f"memory_shape={tuple(mem_2.shape)}",
+    )
+
+
 def test_model_factory_switch() -> None:
     """Verify model factory returns correct class for v1/v2 presets."""
 
@@ -416,6 +541,7 @@ def test_model_factory_switch() -> None:
     m2 = build_model(large_v2_cfg)
     assert isinstance(m1, PianoHybridModel)
     assert isinstance(m2, IttyBittyPianoV2)
+    assert int(getattr(m2, "harmonic_dim", 0)) > int(getattr(m2, "temporal_dim", 0))
     _print_ok("Model factory", "v1->PianoHybridModel, v2->IttyBittyPianoV2")
 
 
@@ -515,6 +641,40 @@ def test_time_features_and_weighted_sampling() -> None:
         assert "durations" in sample
         assert "new_piece" in sample
         _print_ok("Weighted sampler + batch", "token/time fields present")
+
+
+def test_dataset_weight_distribution_report() -> None:
+    """Check dry-run dataset weight distribution printout and values."""
+
+    print("Testing dataset weight distribution report...")
+    from config import DataConfig
+
+    cfg = DataConfig(
+        use_multi_dataset=True,
+        dataset_paths={
+            "aria_midi": "dummy",
+            "maestro": "dummy",
+            "giant_midi": "dummy",
+            "adl_piano": "dummy",
+        },
+        dataset_weights={
+            "aria_midi": 1.0,
+            "maestro": 1.5,
+            "giant_midi": 1.2,
+            "adl_piano": 1.3,
+        },
+    )
+    proc = MultiDatasetPreprocessor(config=cfg, dry_run=True)
+    probs = proc.print_weight_distribution()
+
+    assert "aria_midi" in probs and 0.70 <= probs["aria_midi"] <= 0.80
+    assert "maestro" in probs and 0.06 <= probs["maestro"] <= 0.10
+    assert "giant_midi" in probs and 0.10 <= probs["giant_midi"] <= 0.16
+    assert "adl_piano" in probs and 0.04 <= probs["adl_piano"] <= 0.07
+    _print_ok(
+        "Dataset weights",
+        "approx distribution aria~75%, maestro~8%, giant~12%, adl~5%",
+    )
 
 
 def _write_fast_ornaments_midi(path: Path) -> None:
@@ -732,10 +892,13 @@ if __name__ == "__main__":
     test_generation_health_random_weights()
     test_checkpoint_rotation_policy()
     test_low_disk_emergency_rotation_trigger()
+    test_initialization_health()
     test_v2_model()
+    test_memory_reset_determinism()
     test_model_factory_switch()
     test_tokenizer_time_feature_invariants()
     test_time_features_and_weighted_sampling()
+    test_dataset_weight_distribution_report()
     test_v1_checkpoint_generation_report()
     test_parameter_counts()
     print("=" * 56)

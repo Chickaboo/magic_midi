@@ -17,7 +17,7 @@ if str(ROOT) not in sys.path:
 
 from config import DataConfig, ModelConfig
 from data.tokenizer import PianoTokenizer
-from model.hybrid import PianoHybridModel
+from model.factory import build_model
 from scale_config import SCALE_PRESETS
 from utils.config_compat import normalize_model_config_payload
 
@@ -82,7 +82,7 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 
 def _make_preview_tokens(
-    model: PianoHybridModel,
+    model: Any,
     tokenizer: Optional[PianoTokenizer],
     seed_length: int,
     max_new_tokens: int,
@@ -115,6 +115,8 @@ def _make_preview_tokens(
 
 
 def build_model_card(checkpoint_path: Path, output_path: Path) -> Path:
+    """Build markdown model card from checkpoint and sidecar metadata."""
+
     state_path = _find_state_sidecar(checkpoint_path)
     state = _load_state_dict(state_path) if state_path is not None else {}
 
@@ -126,7 +128,7 @@ def build_model_card(checkpoint_path: Path, output_path: Path) -> Path:
     else:
         model_cfg = SCALE_PRESETS["small"]["model"]
 
-    model = PianoHybridModel(model_cfg)
+    model = build_model(model_cfg)
     missing: List[str] = []
     unexpected: List[str] = []
     if checkpoint_path.suffix == ".safetensors" and checkpoint_path.exists():
@@ -238,6 +240,8 @@ def build_model_card(checkpoint_path: Path, output_path: Path) -> Path:
 
 
 def main() -> None:
+    """CLI entrypoint for model card generation."""
+
     parser = argparse.ArgumentParser(description="Generate a markdown model card")
     parser.add_argument("--checkpoint", required=True, type=str)
     parser.add_argument("--output", default="MODEL_CARD.md", type=str)

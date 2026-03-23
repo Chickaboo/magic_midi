@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import tempfile
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import numpy as np
 import pretty_midi
@@ -12,7 +12,11 @@ import torch
 from config import DataConfig
 
 
-def _load_notes(midi_path: str | Path):
+def _load_notes(
+    midi_path: str | Path,
+) -> tuple[pretty_midi.PrettyMIDI, list[pretty_midi.Note]]:
+    """Load non-drum note list from a MIDI file."""
+
     midi = pretty_midi.PrettyMIDI(str(midi_path))
     notes = []
     for inst in midi.instruments:
@@ -23,6 +27,8 @@ def _load_notes(midi_path: str | Path):
 
 
 def pitch_class_histogram(midi_path: str | Path) -> np.ndarray:
+    """Compute normalized pitch-class histogram (12 bins)."""
+
     _, notes = _load_notes(midi_path)
     hist = np.zeros(12, dtype=np.float64)
     if not notes:
@@ -38,6 +44,8 @@ def pitch_class_histogram(midi_path: str | Path) -> np.ndarray:
 
 
 def pitch_class_entropy(histogram: np.ndarray) -> float:
+    """Compute entropy of a pitch-class histogram in bits."""
+
     p = np.asarray(histogram, dtype=np.float64)
     p = p[p > 0]
     if p.size == 0:
@@ -46,6 +54,8 @@ def pitch_class_entropy(histogram: np.ndarray) -> float:
 
 
 def note_density(midi_path: str | Path) -> float:
+    """Compute notes-per-second density for a MIDI file."""
+
     midi, notes = _load_notes(midi_path)
     duration = float(midi.get_end_time())
     if duration <= 0:
@@ -54,6 +64,8 @@ def note_density(midi_path: str | Path) -> float:
 
 
 def rhythmic_regularity(midi_path: str | Path) -> float:
+    """Compute IOI coefficient of variation as rhythmic regularity proxy."""
+
     _, notes = _load_notes(midi_path)
     if len(notes) < 3:
         return 0.0
@@ -72,6 +84,8 @@ def rhythmic_regularity(midi_path: str | Path) -> float:
 
 
 def _mean_velocity(midi_path: str | Path) -> float:
+    """Compute mean note velocity for a MIDI file."""
+
     _, notes = _load_notes(midi_path)
     if not notes:
         return 0.0
@@ -79,6 +93,8 @@ def _mean_velocity(midi_path: str | Path) -> float:
 
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray, eps: float = 1e-8) -> float:
+    """Compute cosine similarity with safe near-zero handling."""
+
     na = float(np.linalg.norm(a))
     nb = float(np.linalg.norm(b))
     if na < eps or nb < eps:
@@ -90,6 +106,8 @@ def compare_seed_vs_continuation(
     seed_path: str | Path,
     continuation_path: str | Path,
 ) -> Dict[str, float]:
+    """Compare core music statistics between seed and continuation MIDI."""
+
     seed_hist = pitch_class_histogram(seed_path)
     cont_hist = pitch_class_histogram(continuation_path)
 
@@ -116,11 +134,13 @@ def compare_seed_vs_continuation(
 
 @torch.no_grad()
 def evaluate_dataset(
-    model,
-    tokenizer,
-    test_loader,
+    model: Any,
+    tokenizer: Any,
+    test_loader: Any,
     config: DataConfig,
 ) -> Dict[str, Dict[str, float]]:
+    """Generate continuations on a loader and aggregate evaluation statistics."""
+
     model.eval()
     device = next(model.parameters()).device
 

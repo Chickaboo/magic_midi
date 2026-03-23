@@ -29,6 +29,9 @@ cd app
 ./run.sh
 ```
 
+The setup script installs `mamba-ssm` automatically when it detects Linux + CUDA.
+Otherwise the app stays on the built-in GRU fallback.
+
 ## Setup (Windows)
 
 ```bat
@@ -36,5 +39,8 @@ cd app
 setup.bat
 run.bat
 ```
+
+On Windows, the app will use the built-in GRU fallback unless you run it on a
+Linux + CUDA environment with `mamba-ssm` available.
 
 Open `http://127.0.0.1:5000`.

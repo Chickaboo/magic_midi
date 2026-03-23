@@ -1,87 +1,183 @@
-# Itty Bitty Piano v2 (Mamba + FFN + Sparse Music Attention)
+# Itty Bitty Piano (v1 + v2)
 
-This repository trains and serves an autoregressive piano continuation model for MIDI token sequences under the Itty Bitty Piano project.
+Itty Bitty Piano trains and serves autoregressive piano continuation models on tokenized MIDI data.
 
-v2 upgrades the architecture and generation stack to eliminate the v1 collapse mode where one token dominated generation regardless of seed.
+This repo now supports:
+- v1/v3 lineage (`PianoHybridModel`) for backward compatibility
+- official v2 research architecture (`IttyBittyPianoV2`) with continuous-time + dual-stream + phrase memory
 
-## What Changed in v2
+## v2 Architecture (Official)
 
-- Architecture: `Mamba -> FFN` blocks with sparse `MusicAttentionBlock`.
-- Attention bias: ALiBi-style relative bias support for extrapolation to longer contexts.
-- Generation: robust sampling pipeline with repetition penalty, minimum candidate guarantees, and confidence capping.
-- Training: label smoothing (`epsilon=0.1`) in next-token cross-entropy.
-- Validation: generation health check logs collapse risk every epoch.
-- Tokenization: configurable strategy (`remi` or `octuple`) for better token efficiency experiments.
+```text
+Token IDs + onset_times(seconds)
+  -> token embedding + ContinuousTimeEncoding
+  -> DualStreamSplit
+       -> harmonic stream (Mamba)
+       -> temporal stream (CfC)
+       -> CrossStreamAttention every 2 layers
+  -> stream merge
+  -> PhraseSummarizer
+  -> EpisodicThemeMemory
+  -> phrase-level sparse attention
+  -> phrase-to-token broadcast
+  -> final norm + tied output projection
+```
 
-## Root Cause (v1 collapse)
+Core v2 files:
+- `model/hybrid_v2.py`
+- `model/time_encoding.py`
+- `model/dual_stream.py`
+- `model/phrase_memory.py`
+- `model/factory.py`
 
-The collapse was not caused by top-k/top-p filtering. It was caused by extreme output confidence from tied embeddings and large unscaled logits under teacher forcing.
-
-Key findings:
-
-- Random-weight v1 also collapsed in generation (top-1 probability saturated near 1.0).
-- Collapse persisted even with CfC hidden-state threading fixes.
-- Logits remained numerically large (`std ~10+`) and peaked heavily.
-
-v2 addresses this by scaling output logits (`1/sqrt(d_model)` by default), adding label smoothing, adding repetition-aware sampling safeguards, and introducing a generation health check.
-
-## Architecture
+## v1/v3 Architecture
 
 ```text
 Input tokens
   -> token embedding (+ optional absolute position embedding)
-  -> [Mamba block -> FFN block] x N
-  -> sparse MusicAttentionBlock every K layers (causal, ALiBi/learned bias)
+  -> [Mamba block -> CfC block] x N
+  -> sparse MusicAttentionBlock every K layers
   -> final LayerNorm
   -> output projection (optionally weight-tied) + output logit scaling
 ```
 
-CfC is still supported for compatibility (`use_cfc=True`) but v2 presets default to `use_cfc=False`.
+Defaults in v3 presets:
 
-## Scale Presets (v2 targets)
+- `use_cfc=True`
+- `use_mamba=True`
+- sparse attention cadence via `attention_every_n_layers`
+- ALiBi relative bias for extrapolation
 
-- `small`: ~15M (primary target)
-- `medium`: ~40M (stretch target)
-- `large`: ~100M (future target)
+FFN remains available as fallback (`use_cfc=False`) but is no longer the default.
 
-Run parameter checks:
+## CfC Configuration
+
+CfC is implemented via `ncps.torch.CfC` with v3-compatible defaults:
+
+- `mode="pure"`
+- `batch_first=True`
+- `return_sequences=True` when supported by installed `ncps`
+- hidden size matches `d_model`
+- backbone defaults to 2 layers and hidden size `d_model // 2`
+
+Generation paths retain CfC hidden-state threading across autoregressive steps.
+
+## Scale Presets
+
+Presets live in `scale_config.py`:
+
+- `small` (v1/v3 family)
+- `medium` (v1/v3 family)
+- `large` (v1/v3 family)
+- `large_v2` (official v2 architecture target)
+
+Check current runtime counts:
 
 ```bash
 python scale_config.py
 ```
 
-## Tokenization
-
-`DataConfig.tokenization_strategy`:
-
-- `"remi"` (default)
-- `"octuple"`
-
-Tokenizer is created accordingly in preprocessing.
-
-## Training
-
-Core loss:
+On Kaggle with real `mamba-ssm`, run:
 
 ```python
-F.cross_entropy(logits, targets, ignore_index=-100, label_smoothing=0.1)
+from piano_kaggle_session import calibrate_on_kaggle
+calibrate_on_kaggle()
 ```
 
-Generation health check (run during validation):
+## Multi-Dataset Training
 
-- generates 20 steps from a fixed validation seed,
-- asserts/logs max top-1 probability (`<= 0.95` after sampling constraints),
-- logs candidate set minimum and raw-vs-final confidence.
+v3 supports combining MAESTRO with optional external datasets in one manifest.
 
-## Generation Safeguards
+Supported dataset sources:
 
-`PianoHybridModel.generate(...)` now includes:
+1. MAESTRO v3.0.0
+2. GiantMIDI-Piano
+3. Aria-MIDI (deduped subset)
+4. ADL Piano MIDI
 
-- repetition penalty over recent 64 tokens,
-- temperature floor at 0.1,
-- top-k/top-p filtering with minimum tokens kept (`>=3`),
-- confidence cap in final sampling distribution,
-- warning if >60% of generated tokens are identical.
+Core controls in `DataConfig`:
+
+- `use_multi_dataset`
+- `dataset_paths: Dict[str, str]`
+- `dataset_weights: Dict[str, float]`
+- `quality_filter_velocity`
+- `min_duration_seconds`
+- `dataset_profiles` (per-source filter overrides)
+- `min_note_count`, `min_distinct_pitches`, `piano_dominance_threshold`
+- `use_continuous_time`
+
+### Example multi-dataset config
+
+```python
+from config import DataConfig
+
+cfg = DataConfig(
+    use_multi_dataset=True,
+    dataset_paths={
+        "maestro": "/path/to/maestro",
+        "giant_midi": "/path/to/giant_midi",
+        "piano_e": "/path/to/piano_e",
+    },
+    dataset_weights={
+        "maestro": 2.0,
+        "giant_midi": 1.0,
+        "piano_e": 1.5,
+    },
+    quality_filter_velocity=True,
+    min_duration_seconds=30.0,
+)
+```
+
+Preprocessing entrypoints:
+
+- `data.preprocess.preprocess_maestro(cfg)` for MAESTRO-only compatibility
+- `data.preprocess.MultiDatasetPreprocessor(cfg).preprocess()` for combined datasets
+
+### Quality filters applied during preprocessing
+
+- minimum token length (`min_piece_length`, default 1200)
+- minimum duration (source profile)
+- velocity-variance filter (`std(velocity) >= 5`) when source profile enables it
+- minimum non-drum note count
+- minimum distinct pitch count
+- piano dominance threshold for mixed-instrument files
+
+Manifest entries include source + time features (`onset_times_path`, `durations_path`) for continuous-time training.
+
+### Adding a new dataset
+
+1. Add dataset root to `DataConfig.dataset_paths` with a unique source name.
+2. Set optional source weight in `DataConfig.dataset_weights`.
+3. Keep MIDI files under that root (`.mid` or `.midi`, recursive scan).
+4. Re-run preprocessing to rebuild `processed/manifest.json`.
+
+No code changes are required for generic MIDI datasets.
+
+## Checkpoint Rotation (v3)
+
+Trainer retention policy in `training/trainer.py`:
+
+```python
+CHECKPOINT_KEEP_POLICY = {
+    "always": ["best.safetensors", "best_state.pt", "latest.safetensors", "latest_state.pt"],
+    "milestone_every_n": 25,
+    "max_total_checkpoints": 8,
+}
+```
+
+Behavior:
+
+- save tagged checkpoints every 10 epochs (`save_every_n_epochs=10`)
+- keep milestone epochs every 25 epochs
+- hard-cap model checkpoint files to 8
+- rotate before writes
+- run emergency rotation when free space is below 3 GB
+
+## Training and Validation Safeguards
+
+- label smoothing in next-token cross-entropy (`label_smoothing=0.1`)
+- robust sampler with top-k/top-p, repetition penalty, and minimum-candidate guarantees
+- generation health check executed during validation
 
 ## Smoke Test
 
@@ -89,28 +185,39 @@ Generation health check (run during validation):
 python smoke_test_architecture.py
 ```
 
-This covers:
+Smoke tests include:
 
-- ALiBi bias and attention block shape checks,
-- forward pass for CfC-off and CfC-on modes,
-- random-weight generation health check,
-- v1 checkpoint generation report with new sampler,
-- preset parameter verification on current runtime.
+- attention bias/block shape checks
+- CfC on/off forward checks
+- CfC generation hidden-state threading check
+- checkpoint rotation simulation
+- low-disk emergency rotation trigger
+- v2 model checks (parameter range, forward/memory, generation health, reset)
+- generation health sanity checks
+- preset parameter verification
+
+Current local v2 `large_v2` measurement (fallback runtime): `102,884,834` params (~102.9M).
+
+## Kaggle Notebook
+
+Main notebook: `notebooks/00_kaggle_training.ipynb`
+
+- set `SCALE = "large"` for v3 target runs
+- use dataset availability check cell before training
+- run `run_kaggle_session(scale=SCALE, max_epochs=MAX_EPOCHS)`
 
 ## Web Inference App
 
-The repository now includes a rebuilt Flask web app at `app/`.
+Flask app lives in `app/`.
 
 Features:
 
-- drag/drop MIDI seed upload,
-- checkpoint selector from `app/models/`,
-- generation controls (temperature, length, top-p, top-k),
-- direct use of model `generate()` and shared sampling logic in `model/sampling.py`,
-- downloadable output MIDI,
-- CPU-compatible (GRU fallback, no mamba-ssm required).
+- seed MIDI upload
+- checkpoint selection from `app/models/`
+- sampling controls (temperature/top-p/top-k/length)
+- downloadable generated MIDI
 
-Setup / run:
+Run locally:
 
 ```bash
 cd app
@@ -118,18 +225,7 @@ cd app
 ./run.sh     # or run.bat on Windows
 ```
 
-Place files before launch:
-
-- tokenizer: `app/tokenizer/tokenizer.json`
-- checkpoints: `app/models/*.safetensors` or `app/models/*.pt`
-
-## Kaggle / Session Helpers
-
-- `session.py` for long-running session orchestration.
-- `piano_kaggle_session.py` for Kaggle runtime setup, resume, and generation.
-- checkpoints include full model/data/train configs for reproducible reconstruction.
-
 ## Notes
 
-- On CPU/local environments, `mamba-ssm` is typically unavailable; the model uses a causal GRU fallback implementation for compatibility.
-- On CUDA runtimes with `mamba-ssm` installed, real Mamba kernels are used.
+- CPU/local runtimes use the torch fallback implementation when `mamba-ssm` is unavailable.
+- Kaggle/Colab with compatible CUDA + `mamba-ssm` enables real Mamba kernels.

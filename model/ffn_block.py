@@ -5,6 +5,8 @@ import torch.nn as nn
 
 
 class FeedForwardBlock(nn.Module):
+    """Residual feed-forward block used when CfC is disabled."""
+
     def __init__(
         self,
         d_model: int,
@@ -30,6 +32,8 @@ class FeedForwardBlock(nn.Module):
         self.drop2 = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run one residual FFN update on sequence features."""
+
         # Entry shape contract: x is (batch, seq_len, d_model).
         if self.debug:
             assert x.ndim == 3, (

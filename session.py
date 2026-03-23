@@ -15,13 +15,13 @@ import torch
 
 from config import DataConfig
 from data.dataset import create_dataloaders
-from data.preprocess import preprocess_maestro
+from data.preprocess import MultiDatasetPreprocessor, preprocess_maestro
 from data.tokenizer import PianoTokenizer
 from drive_sync import DriveSync
-from model.hybrid import PianoHybridModel
+from model.factory import build_model
 from scale_config import get_preset
 from training.trainer import Trainer
-from utils.logging_utils import log_model_summary
+from utils.logging_utils import get_project_logger, log_model_summary
 from utils.session_utils import (
     SessionWatchdog,
     estimate_time_per_epoch,
@@ -30,14 +30,19 @@ from utils.session_utils import (
 )
 
 
+LOGGER = get_project_logger()
+
+
 def estimate_sessions_remaining(
     current_epoch: int,
     target_epochs: int,
     time_per_epoch_seconds: float,
 ) -> Dict[str, float]:
+    """Estimate remaining sessions and wall-clock hours to target epoch."""
+
     remaining_epochs = max(0, int(target_epochs) - int(current_epoch))
     if remaining_epochs <= 0:
-        print("Target epoch reached. No additional sessions estimated.")
+        LOGGER.info("Target epoch reached. No additional sessions estimated.")
         return {
             "remaining_epochs": 0,
             "sessions_remaining": 0.0,
@@ -48,7 +53,7 @@ def estimate_sessions_remaining(
     sessions_remaining = math.ceil(remaining_epochs / epochs_per_session)
     hours_remaining = (remaining_epochs * time_per_epoch_seconds) / 3600.0
 
-    print(
+    LOGGER.info(
         "At current pace, "
         f"~{sessions_remaining} more sessions (~{hours_remaining:.1f} hours) "
         f"to reach epoch {target_epochs}"
@@ -96,7 +101,11 @@ def _select_subset_manifest_if_needed(
     with output_path.open("w", encoding="utf-8") as f:
         json.dump(subset, f, indent=2)
 
-    print(f"Using stratified subset: {len(subset)} pieces (max_pieces={max_pieces}).")
+    LOGGER.info(
+        "Using stratified subset: %d pieces (max_pieces=%s).",
+        len(subset),
+        str(max_pieces),
+    )
     _print_composer_distribution(subset)
     return output_path
 
@@ -105,7 +114,7 @@ def _print_composer_distribution(
     entries: List[Dict[str, Any]], top_k: int = 10
 ) -> None:
     if not entries:
-        print("Composer distribution: empty subset")
+        LOGGER.info("Composer distribution: empty subset")
         return
 
     counts: Dict[str, int] = {}
@@ -115,10 +124,10 @@ def _print_composer_distribution(
 
     total = len(entries)
     top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
-    print("Composer distribution (top 10):")
+    LOGGER.info("Composer distribution (top 10):")
     for composer, n in top:
         pct = 100.0 * n / max(1, total)
-        print(f"  {composer[:24]:<24} {n:>4} pieces ({pct:>4.1f}%)")
+        LOGGER.info("  %-24s %4d pieces (%4.1f%%)", composer[:24], n, pct)
 
 
 def get_stratified_subset(
@@ -175,9 +184,9 @@ def get_stratified_subset(
 
 def _build_dataloaders_from_manifest(
     effective_data_cfg: DataConfig,
-    train_cfg,
+    train_cfg: Any,
     manifest_path: Path,
-):
+) -> Tuple[Any, Any, Any]:
     # create_dataloaders expects processed_path/manifest.json.
     temp_cfg = DataConfig(**effective_data_cfg.__dict__)
     if manifest_path.name == "manifest.json":
@@ -192,7 +201,7 @@ def _build_dataloaders_from_manifest(
     return create_dataloaders(temp_cfg, train_cfg)
 
 
-def _maybe_adjust_workers_for_environment(train_cfg) -> None:
+def _maybe_adjust_workers_for_environment(train_cfg: Any) -> None:
     """Avoid multiprocessing worker issues in non-Colab CPU sessions."""
 
     if train_cfg.device == "cpu":
@@ -204,7 +213,11 @@ def _maybe_adjust_workers_for_environment(train_cfg) -> None:
         return
 
 
-def _make_single_worker_dataloaders(train_loader, val_loader, test_loader):
+def _make_single_worker_dataloaders(
+    train_loader: Any,
+    val_loader: Any,
+    test_loader: Any,
+) -> Tuple[Any, Any, Any]:
     from torch.utils.data import DataLoader
 
     train_single = DataLoader(
@@ -295,7 +308,10 @@ def _safe_generate_tokens(
     raise RuntimeError("Model does not expose a callable generate(...) method.")
 
 
-def _optimizer_steps_per_epoch(train_loader, grad_accumulation_steps: int) -> int:
+def _optimizer_steps_per_epoch(
+    train_loader: Any,
+    grad_accumulation_steps: int,
+) -> int:
     batches = len(train_loader)
     accum = max(1, int(grad_accumulation_steps))
     return max(1, math.ceil(batches / accum))
@@ -334,19 +350,29 @@ def calibrate_preset(scale_name: str) -> int:
     This count depends on active backend (real Mamba vs fallback).
     """
     preset = get_preset(scale_name)
-    model = PianoHybridModel(preset["model"])
+    model = build_model(preset["model"])
     total = sum(p.numel() for p in model.parameters())
-    print(f"{scale_name}: {total:,} params ({total / 1e6:.2f}M)")
+    LOGGER.info("%s: %s params (%.2fM)", scale_name, f"{total:,}", total / 1e6)
     model.get_num_params()
     del model
     return int(total)
+
+
+def _run_preprocess(data_cfg: DataConfig) -> None:
+    """Run preprocessing according to current dataset configuration."""
+
+    if bool(data_cfg.use_multi_dataset):
+        processor = MultiDatasetPreprocessor(config=data_cfg)
+        processor.preprocess()
+        return
+    preprocess_maestro(data_cfg)
 
 
 def run_session(
     scale: str = "small",
     max_epochs_this_session: Optional[int] = None,
     calibration_mode: bool = False,
-):
+) -> Dict[str, Any]:
     """
     Complete training session handler.
     Call this once per Colab session. It will:
@@ -402,8 +428,8 @@ def run_session(
     processed_status = drive_sync.sync_processed_data()
 
     if processed_status == "missing":
-        print("No processed data cache found. Running preprocessing once...")
-        preprocess_maestro(data_cfg)
+        LOGGER.info("No processed data cache found. Running preprocessing once...")
+        _run_preprocess(data_cfg)
         drive_sync.sync_processed_data()
 
     if tokenizer_restore_status is None:
@@ -412,18 +438,20 @@ def run_session(
         if maybe_local.exists():
             drive_sync.sync_tokenizer()
         else:
-            print(
+            LOGGER.info(
                 "Tokenizer missing locally. Running preprocessing to build tokenizer..."
             )
-            preprocess_maestro(data_cfg)
+            _run_preprocess(data_cfg)
             drive_sync.sync_processed_data()
             drive_sync.sync_tokenizer()
 
     manifest_path = Path(data_cfg.processed_path) / "manifest.json"
     manifest_count = _count_manifest_entries(manifest_path)
     if manifest_count == 0:
-        print("Processed manifest missing or empty. Rebuilding preprocessing cache...")
-        preprocess_maestro(data_cfg)
+        LOGGER.info(
+            "Processed manifest missing or empty. Rebuilding preprocessing cache..."
+        )
+        _run_preprocess(data_cfg)
         drive_sync.sync_processed_data()
         drive_sync.sync_tokenizer()
         manifest_count = _count_manifest_entries(manifest_path)
@@ -465,7 +493,7 @@ def run_session(
         grad_accumulation_steps=train_cfg.grad_accumulation_steps,
     )
     effective_batch = int(train_cfg.batch_size) * int(train_cfg.grad_accumulation_steps)
-    print(
+    LOGGER.info(
         "Optimizer schedule: "
         f"train_pieces={train_pieces}, batches/epoch={train_batches}, "
         f"grad_accum={train_cfg.grad_accumulation_steps}, "
@@ -482,7 +510,7 @@ def run_session(
     data_cfg.vocab_size = tokenizer.vocab_size
 
     # ---------- Model initialization ----------
-    model = PianoHybridModel(model_cfg)
+    model = build_model(model_cfg)
     trainer = Trainer(
         model=model,
         train_loader=train_loader,
@@ -502,14 +530,14 @@ def run_session(
             else:
                 state = trainer.load_checkpoint(resume_ckpt)
             start_epoch = int(state.get("epoch", _load_resume_epoch(drive_sync)))
-            print(f"Resumed from checkpoint at epoch {start_epoch}.")
+            LOGGER.info("Resumed from checkpoint at epoch %d.", start_epoch)
         except Exception as exc:
             warnings.warn(
                 f"Checkpoint restore failed; starting from scratch. Details: {exc}"
             )
             start_epoch = 0
     else:
-        print("Starting from scratch")
+        LOGGER.info("Starting from scratch")
 
     log_model_summary(model, model_cfg)
     print_session_banner(scale_preset=scale, epoch=start_epoch, drive_sync=drive_sync)
@@ -521,7 +549,9 @@ def run_session(
     # ---------- Determine epoch budget ----------
     epochs_remaining = max(0, max_epochs_target - start_epoch)
     if epochs_remaining <= 0:
-        print(f"Target epoch {max_epochs_target} already reached. Nothing to train.")
+        LOGGER.info(
+            "Target epoch %d already reached. Nothing to train.", max_epochs_target
+        )
         watchdog.stop()
         drive_sync.wait_for_sync()
         return {
@@ -535,12 +565,12 @@ def run_session(
     already_trained = 0
     queued_sync_tags: Set[Tuple[int, str]] = set()
     if max_epochs_this_session is None:
-        print("Estimating epoch duration with one warmup epoch...")
+        LOGGER.info("Estimating epoch duration with one warmup epoch...")
         epoch_time_seconds = max(1e-6, estimate_time_per_epoch(trainer))
         already_trained = 1
 
-        local_ckpt = Path(train_cfg.checkpoint_dir) / "latest_model.safetensors"
-        best_ckpt = Path(train_cfg.checkpoint_dir) / "best_model.safetensors"
+        local_ckpt = Path(train_cfg.checkpoint_dir) / "latest.safetensors"
+        best_ckpt = Path(train_cfg.checkpoint_dir) / "best.safetensors"
         _queue_epoch_checkpoint_sync(
             drive_sync=drive_sync,
             local_ckpt=local_ckpt,
@@ -560,7 +590,7 @@ def run_session(
         )
         epochs_this_session = 1 + additional_epochs
 
-        print(
+        LOGGER.info(
             "Auto epoch budget: "
             f"time/epoch={epoch_time_seconds:.1f}s, "
             f"available={available_seconds}s, "
@@ -584,8 +614,8 @@ def run_session(
             completed_epoch = epoch_base + 1
             epochs_done += 1
 
-            local_ckpt = Path(train_cfg.checkpoint_dir) / "latest_model.safetensors"
-            best_ckpt = Path(train_cfg.checkpoint_dir) / "best_model.safetensors"
+            local_ckpt = Path(train_cfg.checkpoint_dir) / "latest.safetensors"
+            best_ckpt = Path(train_cfg.checkpoint_dir) / "best.safetensors"
             _queue_epoch_checkpoint_sync(
                 drive_sync=drive_sync,
                 local_ckpt=local_ckpt,
@@ -595,11 +625,11 @@ def run_session(
                 best_ckpt=best_ckpt,
             )
 
-            print(f"Session sync queued for epoch {completed_epoch:03d}")
+            LOGGER.info("Session sync queued for epoch %03d", completed_epoch)
 
     except Exception:
         warnings.warn("Training loop interrupted; attempting final sync.")
-        local_ckpt = Path(train_cfg.checkpoint_dir) / "latest_model.safetensors"
+        local_ckpt = Path(train_cfg.checkpoint_dir) / "latest.safetensors"
         if local_ckpt.exists():
             drive_sync.sync_checkpoint_background(str(local_ckpt), tag="latest")
         raise
@@ -622,7 +652,11 @@ def run_session(
 
     # Save one generated sample into Drive/generated.
     try:
-        seed_batch, _ = next(iter(test_loader))
+        sample_batch = next(iter(test_loader))
+        if isinstance(sample_batch, dict):
+            seed_batch = sample_batch["seed"]
+        else:
+            seed_batch = sample_batch[0]
         seed_tokens = seed_batch[0].tolist()
 
         seed_mid = drive_sync.generated_dir / f"{session_id}_seed.mid"
@@ -671,7 +705,7 @@ def run_session(
         elapsed = max(1e-6, (session_end_dt - session_start_dt).total_seconds())
         epoch_time_seconds = elapsed / max(1, epochs_done)
 
-    print(
+    LOGGER.info(
         f"Session complete: +{epochs_done} epoch(s), "
         f"epoch {start_epoch} -> {end_epoch}, "
         f"val_loss={final_val_loss if final_val_loss is not None else 'n/a'}"

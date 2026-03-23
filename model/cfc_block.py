@@ -6,6 +6,8 @@ from typing import Any, Optional, Tuple, cast
 import torch
 import torch.nn as nn
 
+from utils.logging_utils import get_project_logger
+
 try:
     from ncps.torch import CfC as _CfC
 
@@ -16,7 +18,12 @@ except Exception as exc:  # pragma: no cover
     warnings.warn(f"ncps CfC import failed. Using GRU fallback. Details: {exc}")
 
 
+LOGGER = get_project_logger()
+
+
 class _CfCFallback(nn.Module):
+    """Fallback recurrent block used when ncps CfC is unavailable."""
+
     def __init__(self, units: int, dropout: float = 0.1) -> None:
         super().__init__()
         self.gru = nn.GRU(
@@ -33,6 +40,8 @@ class _CfCFallback(nn.Module):
         x: torch.Tensor,
         hidden: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run fallback recurrent update and return sequence plus last hidden state."""
+
         h0 = hidden.unsqueeze(0) if hidden is not None and hidden.dim() == 2 else hidden
         y, h = self.gru(x, h0)
         y = self.dropout(y)
@@ -41,6 +50,8 @@ class _CfCFallback(nn.Module):
 
 
 class CfCBlock(nn.Module):
+    """Residual CfC block with LayerNorm and projection wrappers."""
+
     def __init__(
         self,
         d_model: int,
@@ -48,11 +59,20 @@ class CfCBlock(nn.Module):
         backbone_units: int = 128,
         backbone_layers: int = 2,
         dropout: float = 0.1,
+        residual_scale: float = 1.0,
         debug: bool = False,
     ) -> None:
         super().__init__()
+        if d_model <= 0:
+            raise ValueError("d_model must be > 0")
+        if cfc_units <= 0:
+            raise ValueError("cfc_units must be > 0")
+        if residual_scale <= 0.0:
+            raise ValueError("residual_scale must be > 0")
+
         self.d_model = d_model
         self.cfc_units = cfc_units
+        self.residual_scale = float(residual_scale)
         self.debug = debug
 
         self.norm = nn.LayerNorm(d_model)
@@ -62,45 +82,49 @@ class CfCBlock(nn.Module):
         self.output_proj = nn.Linear(cfc_units, d_model)
         self.dropout = nn.Dropout(dropout)
 
+        if self.cfc_units != self.d_model:
+            LOGGER.warning(
+                "CfC units (%d) differ from d_model (%d). "
+                "v3 presets are expected to keep these equal.",
+                self.cfc_units,
+                self.d_model,
+            )
+
         if CFC_AVAILABLE and _CfC is not None:
             cfc_ctor = _CfC
             cfc = None
-            mode_used = None
             creation_errors: list[str] = []
 
-            for mode in ("pure_memory", "pure"):
-                kwargs = {
-                    "mode": mode,
+            attempts = [
+                {
+                    "mode": "pure",
                     "batch_first": True,
+                    "return_sequences": True,
                     "backbone_units": backbone_units,
                     "backbone_layers": backbone_layers,
                     "backbone_dropout": dropout,
-                }
+                },
+                {
+                    "mode": "pure",
+                    "batch_first": True,
+                    "backbone_units": backbone_units,
+                    "backbone_layers": backbone_layers,
+                },
+                {
+                    "mode": "pure",
+                    "batch_first": True,
+                },
+                {
+                    "mode": "pure",
+                },
+            ]
+
+            for kwargs in attempts:
                 try:
                     cfc = cfc_ctor(cfc_units, cfc_units, **kwargs)
-                    mode_used = mode
                     break
                 except (TypeError, ValueError) as exc:
-                    creation_errors.append(f"mode={mode}, full kwargs: {exc}")
-
-                try:
-                    cfc = cfc_ctor(
-                        cfc_units,
-                        cfc_units,
-                        mode=mode,
-                        batch_first=True,
-                    )
-                    mode_used = mode
-                    break
-                except (TypeError, ValueError) as exc:
-                    creation_errors.append(f"mode={mode}, batch_first only: {exc}")
-
-                try:
-                    cfc = cfc_ctor(cfc_units, cfc_units, mode=mode)
-                    mode_used = mode
-                    break
-                except (TypeError, ValueError) as exc:
-                    creation_errors.append(f"mode={mode}, minimal: {exc}")
+                    creation_errors.append(f"kwargs={kwargs}: {exc}")
 
             if cfc is None:
                 warnings.warn(
@@ -111,14 +135,9 @@ class CfCBlock(nn.Module):
                 self.using_fallback = True
                 self.cfc_mode = "gru_fallback"
             else:
-                if mode_used != "pure_memory":
-                    warnings.warn(
-                        "CfC mode 'pure_memory' is unavailable in this ncps version. "
-                        "Falling back to mode='pure'."
-                    )
                 self.cfc = cfc
                 self.using_fallback = False
-                self.cfc_mode = mode_used
+                self.cfc_mode = "pure"
         else:
             self.cfc = _CfCFallback(cfc_units, dropout=dropout)
             self.using_fallback = True
@@ -129,6 +148,8 @@ class CfCBlock(nn.Module):
         x: torch.Tensor,
         hidden: Optional[Any] = None,
     ) -> Tuple[torch.Tensor, Any]:
+        """Run one residual CfC block and return updated hidden state."""
+
         if self.debug:
             assert x.ndim == 3, (
                 f"CfCBlock expects (batch, seq, feat), got {tuple(x.shape)}"
@@ -158,6 +179,7 @@ class CfCBlock(nn.Module):
 
         y = self.output_proj(y)
         y = self.dropout(y)
+        y = y * float(self.residual_scale)
         out = residual + y
 
         if self.debug:
@@ -169,6 +191,8 @@ class CfCBlock(nn.Module):
         return out, new_hidden
 
     def _forward_cfc(self, x: torch.Tensor, hidden: Any) -> Tuple[torch.Tensor, Any]:
+        """Call ncps CfC across supported signatures."""
+
         try:
             out = self.cfc(x, hidden)
         except TypeError:
