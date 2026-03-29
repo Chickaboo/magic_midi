@@ -159,6 +159,23 @@ class VariantAModel(nn.Module):
             nn.init.normal_(self.lm_head.weight, mean=0.0, std=std)
 
     @staticmethod
+    def _unwrap(model: Any) -> Any:
+        if isinstance(model, torch.nn.DataParallel):
+            return model.module
+        return model
+
+    def _prepare_generation_device(self) -> torch.device:
+        current_device = next(self.parameters()).device
+        if torch.cuda.is_available() and current_device.type == "cuda":
+            target_device = torch.device("cuda:0")
+        else:
+            target_device = current_device
+
+        if current_device != target_device:
+            self.to(target_device)
+        return target_device
+
+    @staticmethod
     def _to_seed_tensor(
         seed_tokens: Sequence[int] | torch.Tensor,
         *,
@@ -309,7 +326,7 @@ class VariantAModel(nn.Module):
         token_id_to_events: Any = None,
     ) -> List[int]:
         self.eval()
-        device = next(self.parameters()).device
+        device = self._prepare_generation_device()
 
         tokens = self._to_seed_tensor(seed_tokens, device=device)
         if seed_onset_times is None:
@@ -433,7 +450,7 @@ class VariantAModel(nn.Module):
         raise_on_failure: bool = True,
     ) -> Dict[str, float | bool]:
         self.eval()
-        device = next(self.parameters()).device
+        device = self._prepare_generation_device()
         tokens = self._to_seed_tensor(seed_tokens, device=device)
         onsets = (
             torch.arange(tokens.shape[1], device=device, dtype=torch.float32) * 0.1
