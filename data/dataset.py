@@ -144,7 +144,14 @@ class PianoDataset(Dataset):
             )
 
         max_start = int(token_seq.shape[0] - total_needed)
-        start = self.rng.randint(0, max_start) if max_start > 0 else 0
+        raw_start = self.rng.randint(0, max_start) if max_start > 0 else 0
+        start = self._snap_to_triplet_boundary(raw_start, max_start)
+
+        if start % 3 != 0:
+            raise AssertionError(
+                "Triplet boundary violation in dataset windowing: "
+                f"start={start} (raw_start={raw_start}) is not divisible by 3"
+            )
 
         seed = token_seq[start : start + self.data_config.seed_length]
         cont = token_seq[
@@ -168,6 +175,19 @@ class PianoDataset(Dataset):
             "durations": duration_t,
             "new_piece": torch.tensor(True),
         }
+
+    @staticmethod
+    def _snap_to_triplet_boundary(index: int, max_start: int) -> int:
+        """Snap a random index to nearest valid triplet boundary within bounds."""
+
+        idx = int(max(0, min(index, max_start)))
+        lower = idx - (idx % 3)
+        upper = lower + 3
+        if upper > max_start:
+            return lower
+        if (idx - lower) <= (upper - idx):
+            return lower
+        return upper
 
     @staticmethod
     def _load_time_feature_array(
