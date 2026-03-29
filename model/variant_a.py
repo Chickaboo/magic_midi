@@ -29,7 +29,7 @@ class VariantAConfig:
     gdn_inner_dim: int = 256
     gdn_num_heads: int = 4
 
-    cfc_units: int = 768
+    cfc_units: int = 512
     cfc_backbone_units: int = 384
     cfc_backbone_layers: int = 2
 
@@ -66,7 +66,7 @@ class _VariantABlock(nn.Module):
         self.norm_cfc = nn.LayerNorm(d)
         self.cfc = CfCBlock(
             d_model=d,
-            cfc_units=int(cfg.cfc_units),
+            cfc_units=d,
             backbone_units=int(cfg.cfc_backbone_units),
             backbone_layers=int(cfg.cfc_backbone_layers),
             dropout=float(cfg.dropout),
@@ -94,6 +94,7 @@ class _VariantABlock(nn.Module):
         cfc_in = self.norm_cfc(x)
         cfc_dtype = cfc_in.dtype
         cfc_x = cfc_in.float() if cfc_in.dtype != torch.float32 else cfc_in
+        cfc_x = self.cfc.input_proj(cfc_x)
         ts = timespans.to(dtype=cfc_x.dtype)
 
         # Explicit elapsed-time path for ncps CfC (timespans are deltas, not absolutes).

@@ -26,7 +26,7 @@ class VariantBConfig:
 
     # Attn (MHA+RoPE) -> CfC repeating block.
     num_attention_heads: int = 8
-    cfc_units: int = 768
+    cfc_units: int = 512
     cfc_backbone_units: int = 384
     cfc_backbone_layers: int = 2
 
@@ -51,7 +51,7 @@ class _VariantBBlock(nn.Module):
         self.norm_cfc = nn.LayerNorm(d)
         self.cfc = CfCBlock(
             d_model=d,
-            cfc_units=int(cfg.cfc_units),
+            cfc_units=d,
             backbone_units=int(cfg.cfc_backbone_units),
             backbone_layers=int(cfg.cfc_backbone_layers),
             dropout=float(cfg.dropout),
