@@ -8,11 +8,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-_GatedDeltaNet = None
 GDN_AVAILABLE = False
+_GatedDeltaNet = None
 
 
-def try_import_fla() -> bool:
+def try_import_fla():
     global GDN_AVAILABLE, _GatedDeltaNet
     try:
         from fla.layers import GatedDeltaNet as _GDN
