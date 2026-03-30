@@ -1,0 +1,5 @@
+symusic
+gradio>=4.0.0
+huggingface_hub>=0.20.0
+numpy
+safetensors
