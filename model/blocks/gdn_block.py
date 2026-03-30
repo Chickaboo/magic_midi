@@ -8,13 +8,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-try:
-    from fla.layers.gated_deltanet import GatedDeltaNet as _FLAGatedDeltaNet
+_GatedDeltaNet = None
+GDN_AVAILABLE = False
 
-    GDN_AVAILABLE = True
-except Exception:
-    _FLAGatedDeltaNet = None
-    GDN_AVAILABLE = False
+
+def try_import_fla() -> bool:
+    global GDN_AVAILABLE, _GatedDeltaNet
+    try:
+        from fla.layers import GatedDeltaNet as _GDN
+
+        _GatedDeltaNet = _GDN
+        GDN_AVAILABLE = True
+        return True
+    except Exception:
+        _GatedDeltaNet = None
+        GDN_AVAILABLE = False
+        return False
+
+
+try_import_fla()
 
 
 class _GatedDeltaFallback(nn.Module):
@@ -72,8 +84,8 @@ class GatedDeltaNetBlock(nn.Module):
             else nn.Linear(self.inner_dim, self.d_model, bias=False)
         )
 
-        if GDN_AVAILABLE and _FLAGatedDeltaNet is not None:
-            self.core = _FLAGatedDeltaNet(
+        if GDN_AVAILABLE and _GatedDeltaNet is not None:
+            self.core = _GatedDeltaNet(
                 hidden_size=self.inner_dim,
                 num_heads=self.num_heads,
                 head_dim=self.head_dim,
@@ -127,4 +139,4 @@ class GatedDeltaNetBlock(nn.Module):
         return y
 
 
-__all__ = ["GDN_AVAILABLE", "GatedDeltaNetBlock"]
+__all__ = ["GDN_AVAILABLE", "GatedDeltaNetBlock", "try_import_fla"]
