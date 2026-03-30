@@ -4,7 +4,7 @@ emoji: 🎹
 colorFrom: blue
 colorTo: purple
 sdk: gradio
-sdk_version: 4.0.0
+sdk_version: 5.50.0
 app_file: app.py
 pinned: false
 ---
@@ -81,6 +81,14 @@ The UI log prints a summary like:
 - Press **Start** to launch the worker thread.
 - Press **Stop** to request graceful stop (checkpoint + flush).
 - Status/log boxes auto-refresh every 10 seconds.
+
+## Python 3.13 Compatibility
+
+Python 3.13 removes the stdlib `audioop` module. Gradio imports `pydub`, which expects `audioop`.
+This Space pins `audioop-lts==0.2.1` in `requirements.txt` for Python 3.13 runtimes.
+
+Python 3.13 also removes `distutils`; older Gradio versions may still import it.
+This Space requires `gradio>=5.50.0` to avoid `distutils` imports during startup.
 
 ## Notes
 
