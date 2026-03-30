@@ -101,13 +101,35 @@ class _VariantABlock(nn.Module):
         if self.cfc.using_fallback:
             cfc_out, new_hidden = self.cfc.cfc(cfc_x, cfc_hidden)
         else:
-            try:
-                cfc_out, new_hidden = self.cfc.cfc(cfc_x, hx=cfc_hidden, timespans=ts)
-            except TypeError:
+            ts_candidates = [ts]
+            if ts.ndim == 2:
+                ts_candidates.append(ts.unsqueeze(-1))
+
+            cfc_out = None
+            new_hidden = cfc_hidden
+            call_succeeded = False
+            for ts_in in ts_candidates:
                 try:
-                    cfc_out, new_hidden = self.cfc.cfc(cfc_x, cfc_hidden, ts)
-                except TypeError:
-                    cfc_out, new_hidden = self.cfc.cfc(cfc_x, cfc_hidden)
+                    cfc_out, new_hidden = self.cfc.cfc(
+                        cfc_x,
+                        hx=cfc_hidden,
+                        timespans=ts_in,
+                    )
+                    call_succeeded = True
+                    break
+                except (TypeError, RuntimeError):
+                    try:
+                        cfc_out, new_hidden = self.cfc.cfc(cfc_x, cfc_hidden, ts_in)
+                        call_succeeded = True
+                        break
+                    except (TypeError, RuntimeError):
+                        continue
+
+            if not call_succeeded:
+                cfc_out, new_hidden = self.cfc.cfc(cfc_x, cfc_hidden)
+
+            if cfc_out is None:
+                raise RuntimeError("VariantA CfC call produced no output tensor.")
 
         if cfc_out.dtype != cfc_dtype:
             cfc_out = cfc_out.to(dtype=cfc_dtype)
