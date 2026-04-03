@@ -254,6 +254,7 @@ Notes:
 - If you want continuation demos, remove `--skip_generation` and provide `--seed_midi /path/to/seed.mid`.
 - `variant_a` is auto-tuned at runtime to stay comparable whether real GDN kernels are available or fallback mode is active.
 - `variant_b` and `variant_c` stay near ~12M as fixed anchors for comparison.
+- On multi-GPU Kaggle runs, Trainer auto-disables DataParallel when real Variant-A GDN kernels are detected to avoid Triton replica autotuner crashes.
 
 If you want one shared shape across all variants, use `--size_mode shared --d_model ... --n_layers ...`.
 

@@ -163,6 +163,17 @@ def rotate_kaggle_checkpoint_dir(
 class Trainer:
     """Training loop, validation, checkpointing, and resume utilities."""
 
+    @staticmethod
+    def _model_uses_real_gdn(model: torch.nn.Module) -> bool:
+        """Return True when model contains real (non-fallback) GatedDeltaNet blocks."""
+
+        for module in model.modules():
+            if module.__class__.__name__ != "GatedDeltaNetBlock":
+                continue
+            if not bool(getattr(module, "using_fallback", False)):
+                return True
+        return False
+
     def __init__(
         self,
         model: torch.nn.Module,
@@ -190,6 +201,17 @@ class Trainer:
             and self.device_count > 1
             and requested_data_parallel
         )
+        if self.use_data_parallel:
+            allow_gdn_data_parallel = bool(
+                getattr(self.config, "_allow_gdn_data_parallel", False)
+            )
+            if self._model_uses_real_gdn(self.model) and not allow_gdn_data_parallel:
+                self.use_data_parallel = False
+                LOGGER.warning(
+                    "Detected real GatedDeltaNet kernels; disabling DataParallel due known "
+                    "Triton autotuner instability across replicas. "
+                    "Using single-GPU mode. Set _allow_gdn_data_parallel=True to override."
+                )
         if self.use_data_parallel:
             device_ids = list(range(self.device_count))
             LOGGER.info("Using DataParallel across GPUs: %s", device_ids)
