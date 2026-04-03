@@ -247,10 +247,11 @@ python -m training.ablation_runner \
   --batch_size 4
 ```
 
-`balanced_small` uses per-variant profiles tuned for fair comparison:
-- `variant_a`: ~12.29M params
-- `variant_b`: ~12.23M params
-- `variant_c`: ~11.64M params
+`balanced_small` uses per-variant profiles tuned for fair comparison in the 10M-15M range.
+
+Notes:
+- `variant_a` is auto-tuned at runtime to stay comparable whether real GDN kernels are available or fallback mode is active.
+- `variant_b` and `variant_c` stay near ~12M as fixed anchors for comparison.
 
 If you want one shared shape across all variants, use `--size_mode shared --d_model ... --n_layers ...`.
 

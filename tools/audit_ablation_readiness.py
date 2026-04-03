@@ -5,6 +5,7 @@ import importlib.util
 import json
 import platform
 import sys
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -137,8 +138,8 @@ def _dependency_checks() -> List[CheckItem]:
         checks.append(
             CheckItem(
                 "Mamba kernel",
-                "WARN",
-                "mamba_ssm unavailable",
+                "PASS",
+                "mamba_ssm unavailable (optional for A/B/C ablation)",
             )
         )
 
@@ -214,23 +215,98 @@ def _variant_checks(
     checks: List[CheckItem] = []
     details: Dict[str, Dict[str, Any]] = {}
 
+    profiles: Dict[str, Dict[str, int]] = {}
     for name in variants:
         if size_mode == "balanced_small":
-            profile = BALANCED_SMALL_PROFILES[name]
+            base = BALANCED_SMALL_PROFILES[name]
+            profiles[name] = {
+                "d_model": int(base["d_model"]),
+                "n_layers": int(base["n_layers"]),
+            }
         else:
-            profile = {"d_model": int(shared_d_model), "n_layers": int(shared_n_layers)}
+            profiles[name] = {
+                "d_model": int(shared_d_model),
+                "n_layers": int(shared_n_layers),
+            }
+
+    if size_mode == "balanced_small" and "variant_a" in variants:
+        baseline_params: List[int] = []
+        for baseline_name in ("variant_b", "variant_c"):
+            if baseline_name not in variants:
+                continue
+            baseline_model, _ = _build_variant(
+                variant_name=baseline_name,
+                profile=profiles[baseline_name],
+                max_sequence_length=1024,
+            )
+            baseline_params.append(int(sum(p.numel() for p in baseline_model.parameters())))
+            del baseline_model
+
+        target_params = (
+            int(sum(baseline_params) / len(baseline_params))
+            if baseline_params
+            else 12_000_000
+        )
+        original = dict(profiles["variant_a"])
+
+        candidates: List[Tuple[Tuple[int, int, int, int], Dict[str, int], int]] = []
+        for d_model in range(416, 577, 32):
+            for n_layers in (3, 4, 5):
+                profile = {"d_model": int(d_model), "n_layers": int(n_layers)}
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        cand_model, _ = _build_variant(
+                            variant_name="variant_a",
+                            profile=profile,
+                            max_sequence_length=1024,
+                        )
+                    params = int(sum(p.numel() for p in cand_model.parameters()))
+                    del cand_model
+                except Exception:
+                    continue
+
+                in_budget = 10_000_000 <= params <= 15_000_000
+                score = (
+                    0 if in_budget else 1,
+                    abs(params - int(target_params)),
+                    abs(int(n_layers) - int(original["n_layers"])),
+                    abs(int(d_model) - int(original["d_model"])),
+                )
+                candidates.append((score, profile, int(params)))
+
+        if candidates:
+            candidates.sort(key=lambda x: x[0])
+            _score, best_profile, _params = candidates[0]
+            profiles["variant_a"] = best_profile
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    for name in variants:
+        profile = profiles[name]
 
         model, shape = _build_variant(
             variant_name=name,
             profile=profile,
             max_sequence_length=1024,
         )
+        model = model.to(device)
         params = int(sum(p.numel() for p in model.parameters()))
         backend = _variant_backend_status(model)
 
         # Quick forward smoke check.
-        token_ids = torch.randint(low=0, high=155, size=(2, 96), dtype=torch.long)
-        onsets = torch.arange(96, dtype=torch.float32).unsqueeze(0).repeat(2, 1) * 0.1
+        token_ids = torch.randint(
+            low=0,
+            high=155,
+            size=(2, 96),
+            dtype=torch.long,
+            device=device,
+        )
+        onsets = (
+            torch.arange(96, dtype=torch.float32, device=device)
+            .unsqueeze(0)
+            .repeat(2, 1)
+            * 0.1
+        )
         try:
             with torch.no_grad():
                 out = model(
@@ -270,6 +346,7 @@ def _variant_checks(
             "shape": shape,
             "backend_status": backend,
         }
+        del model
 
     if details:
         values = [int(v["params"]) for v in details.values()]

@@ -6,6 +6,7 @@ import json
 import math
 import random
 import sys
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -905,6 +906,73 @@ def main() -> None:
             "gqa_groups": int(gqa_groups),
         }
         return model, shape_meta
+
+    if str(args.size_mode) == "balanced_small" and "variant_a" in selected_variants:
+        baseline_params: List[int] = []
+        for baseline_name in ("variant_b", "variant_c"):
+            if baseline_name not in selected_variants:
+                continue
+            baseline_model, _ = _build_variant(baseline_name)
+            baseline_params.append(int(sum(p.numel() for p in baseline_model.parameters())))
+            del baseline_model
+
+        target_params = (
+            int(sum(baseline_params) / len(baseline_params))
+            if baseline_params
+            else 12_000_000
+        )
+        original_profile = dict(variant_profiles["variant_a"])
+
+        candidates: List[Tuple[Tuple[int, int, int, int], Dict[str, int], int]] = []
+        for d_model in range(416, 577, 32):
+            for n_layers in (3, 4, 5):
+                variant_profiles["variant_a"] = {
+                    "d_model": int(d_model),
+                    "n_layers": int(n_layers),
+                }
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        cand_model, _ = _build_variant("variant_a")
+                    params = int(sum(p.numel() for p in cand_model.parameters()))
+                    del cand_model
+                except Exception:
+                    continue
+
+                in_budget = 10_000_000 <= params <= 15_000_000
+                score = (
+                    0 if in_budget else 1,
+                    abs(params - int(target_params)),
+                    abs(int(n_layers) - int(original_profile["n_layers"])),
+                    abs(int(d_model) - int(original_profile["d_model"])),
+                )
+                candidates.append(
+                    (
+                        score,
+                        {"d_model": int(d_model), "n_layers": int(n_layers)},
+                        int(params),
+                    )
+                )
+
+        if candidates:
+            candidates.sort(key=lambda x: x[0])
+            best_score, best_profile, best_params = candidates[0]
+            variant_profiles["variant_a"] = best_profile
+            LOGGER.info(
+                "Balanced-small Variant A auto-tuned: target=%.2fM -> chosen d_model=%d n_layers=%d (%.2fM, score=%s)",
+                float(target_params) / 1e6,
+                int(best_profile["d_model"]),
+                int(best_profile["n_layers"]),
+                float(best_params) / 1e6,
+                best_score,
+            )
+        else:
+            variant_profiles["variant_a"] = original_profile
+            LOGGER.warning(
+                "Could not auto-tune Variant A balanced-small profile; using default d_model=%d n_layers=%d.",
+                int(original_profile["d_model"]),
+                int(original_profile["n_layers"]),
+            )
 
     variants: List[Tuple[str, torch.nn.Module, Dict[str, int], Dict[str, bool]]] = []
     param_by_variant: Dict[str, int] = {}
