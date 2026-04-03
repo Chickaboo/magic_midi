@@ -508,8 +508,8 @@ def _run_variant(
     train_cfg: TrainConfig,
     train_manifest: List[Dict[str, object]],
     val_manifest: List[Dict[str, object]],
-    seed_midi: Path,
-    output_midi_path: Path,
+    seed_midi: Optional[Path],
+    output_midi_path: Optional[Path],
 ) -> Dict[str, Any]:
     _set_global_seed(int(train_cfg.seed))
     train_loader, val_loader = _build_dataloaders(
@@ -532,14 +532,22 @@ def _run_variant(
     history = trainer.train()
 
     core_model = trainer._unwrap_model()
-    generation_meta = _generate_one_continuation(
-        model=core_model,
-        tokenizer=tokenizer,
-        seed_midi=seed_midi,
-        output_path=output_midi_path,
-        seed_length=int(data_cfg.seed_length),
-        continuation_seconds=30.0,
-    )
+    if seed_midi is not None and output_midi_path is not None:
+        generation_meta = _generate_one_continuation(
+            model=core_model,
+            tokenizer=tokenizer,
+            seed_midi=seed_midi,
+            output_path=output_midi_path,
+            seed_length=int(data_cfg.seed_length),
+            continuation_seconds=30.0,
+        )
+        output_midi = str(output_midi_path.resolve())
+    else:
+        generation_meta = {
+            "skipped": True,
+            "reason": "No --seed_midi provided (or --skip_generation enabled).",
+        }
+        output_midi = ""
 
     result = {
         "variant": variant_name,
@@ -548,7 +556,7 @@ def _run_variant(
         "val_loss": [float(v) for v in history.get("val_loss", [])],
         "perplexity": [float(v) for v in history.get("perplexity", [])],
         "checkpoint_dir": str(Path(train_cfg.checkpoint_dir).resolve()),
-        "output_midi": str(output_midi_path.resolve()),
+        "output_midi": output_midi,
         "generation": generation_meta,
     }
 
@@ -649,7 +657,12 @@ def parse_args() -> argparse.Namespace:
         "--seed_midi",
         type=str,
         default="",
-        help="Seed MIDI path for post-training generation (defaults to first MIDI in data_dir).",
+        help="Seed MIDI path for post-training generation (defaults to first MIDI in data_dir unless --skip_generation is set).",
+    )
+    parser.add_argument(
+        "--skip_generation",
+        action="store_true",
+        help="Skip post-training MIDI continuation export; useful for pretokenized-only runs.",
     )
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -776,7 +789,9 @@ def main() -> None:
         val_fraction=0.1,
     )
 
-    if str(args.seed_midi).strip():
+    if bool(args.skip_generation):
+        seed_midi: Optional[Path] = None
+    elif str(args.seed_midi).strip():
         seed_midi = Path(str(args.seed_midi)).expanduser()
     else:
         data_dir_raw = str(args.data_dir).strip()
@@ -785,7 +800,7 @@ def main() -> None:
                 "Provide --seed_midi when using --pretokenized_manifest without a raw MIDI --data_dir."
             )
         seed_midi = _default_seed_midi(Path(data_dir_raw))
-    if not seed_midi.exists():
+    if seed_midi is not None and not seed_midi.exists():
         raise FileNotFoundError(f"seed_midi not found: {seed_midi.resolve()}")
 
     data_cfg = DataConfig(
@@ -1012,7 +1027,8 @@ def main() -> None:
         "seed": int(args.seed),
         "data_dir": str(args.data_dir),
         "data_source": data_source,
-        "seed_midi": str(seed_midi.resolve()),
+        "seed_midi": str(seed_midi.resolve()) if seed_midi is not None else "",
+        "generation_enabled": seed_midi is not None,
         "tokenizer": "CustomDeltaTokenizer",
         "manifest_path": str(manifest_path.resolve()),
         "train_pieces": int(len(train_manifest)),
@@ -1056,7 +1072,7 @@ def main() -> None:
             train_manifest=train_manifest,
             val_manifest=val_manifest,
             seed_midi=seed_midi,
-            output_midi_path=output_dir / f"{name}.mid",
+            output_midi_path=(output_dir / f"{name}.mid") if seed_midi is not None else None,
         )
         result["architecture"] = ARCHITECTURE_LABELS.get(name, name)
         result["shape"] = shape_meta

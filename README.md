@@ -239,7 +239,7 @@ Run ablations in comparable small-model mode (10M-15M range per variant):
 python -m training.ablation_runner \
   --pretokenized_manifest processed/godzilla_tokenized/metadata/manifest.json \
   --pretokenized_root processed/godzilla_tokenized \
-  --seed_midi /path/to/seed.mid \
+  --skip_generation \
   --output_dir outputs/godzilla_ablation \
   --variants a,b,c \
   --size_mode balanced_small \
@@ -250,6 +250,8 @@ python -m training.ablation_runner \
 `balanced_small` uses per-variant profiles tuned for fair comparison in the 10M-15M range.
 
 Notes:
+- `--skip_generation` is the recommended mode for tokenized-only datasets that do not include raw `.mid` files.
+- If you want continuation demos, remove `--skip_generation` and provide `--seed_midi /path/to/seed.mid`.
 - `variant_a` is auto-tuned at runtime to stay comparable whether real GDN kernels are available or fallback mode is active.
 - `variant_b` and `variant_c` stay near ~12M as fixed anchors for comparison.
 
