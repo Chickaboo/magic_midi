@@ -225,6 +225,73 @@ cd app
 ./run.sh     # or run.bat on Windows
 ```
 
+## A/B/C Architecture Ablation
+
+For your current Godzilla research track, use these architecture labels consistently:
+
+1. `variant_a`: Gated Delta Net + CfC + Attention hybrid (novel)
+2. `variant_b`: Transformer + CfC hybrid (novel)
+3. `variant_c`: pure attention Transformer baseline (control)
+
+Run ablations in comparable small-model mode (10M-15M range per variant):
+
+```bash
+python -m training.ablation_runner \
+  --pretokenized_manifest processed/godzilla_tokenized/metadata/manifest.json \
+  --pretokenized_root processed/godzilla_tokenized \
+  --seed_midi /path/to/seed.mid \
+  --output_dir outputs/godzilla_ablation \
+  --variants a,b,c \
+  --size_mode balanced_small \
+  --epochs 3 \
+  --batch_size 4
+```
+
+`balanced_small` uses per-variant profiles tuned for fair comparison:
+- `variant_a`: ~12.29M params
+- `variant_b`: ~12.23M params
+- `variant_c`: ~11.64M params
+
+If you want one shared shape across all variants, use `--size_mode shared --d_model ... --n_layers ...`.
+
+Notes:
+- `variant_c` is the explicit baseline recorded in output metadata.
+- Use the same tokenizer/seed split across all variants to keep comparisons fair.
+
+## Local Godzilla Tokenization (No Hugging Face)
+
+Use the local tokenizer runner to produce resumable triplet `.npz` packs and manifests:
+
+```bash
+python scripts/tokenize_godzilla_local.py \
+  --source /path/to/Godzilla-Piano-MIDI-Dataset-CC-BY-NC-SA.tar.gz \
+  --output-root processed/godzilla_tokenized \
+  --checkpoint-every 1000 \
+  --progress-every 200
+```
+
+Key outputs:
+- `processed/godzilla_tokenized/data/*.npz`
+- `processed/godzilla_tokenized/metadata/manifest.json`
+- `processed/godzilla_tokenized/metadata/checkpoint.json`
+
+The script supports resume by default; rerunning with the same source/output continues from the checkpoint.
+
+Before long training runs, generate a readiness audit report:
+
+```bash
+python tools/audit_ablation_readiness.py \
+  --variants a,b,c \
+  --size_mode balanced_small \
+  --pretokenized_manifest processed/godzilla_tokenized/metadata/manifest.json \
+  --pretokenized_root processed/godzilla_tokenized \
+  --output outputs/ablation_audit_report.md
+```
+
+## Archived Components
+
+The Hugging Face tokenizer Space implementation has been moved out of active workflow and archived under `archive/hf_tokenizer_space`.
+
 ## Notes
 
 - CPU/local runtimes use the torch fallback implementation when `mamba-ssm` is unavailable.

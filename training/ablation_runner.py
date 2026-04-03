@@ -7,7 +7,7 @@ import math
 import random
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -37,6 +37,19 @@ except ModuleNotFoundError:
 
 
 LOGGER = get_project_logger()
+
+ARCHITECTURE_LABELS: Dict[str, str] = {
+    "variant_a": "gated_delta_cfc_attention_hybrid",
+    "variant_b": "transformer_cfc_hybrid",
+    "variant_c": "pure_attention_transformer_baseline",
+}
+
+BALANCED_SMALL_PROFILES: Dict[str, Dict[str, int]] = {
+    # Keep variants in a comparable 10M-15M budget for fair A/B/C tests.
+    "variant_a": {"d_model": 544, "n_layers": 4},
+    "variant_b": {"d_model": 544, "n_layers": 5},
+    "variant_c": {"d_model": 480, "n_layers": 4},
+}
 
 
 def _set_global_seed(seed: int) -> None:
@@ -99,10 +112,186 @@ def _build_manifest_with_custom_tokenizer(
                 "tokens": int(len(token_ids)),
                 "length": int(len(token_ids)),
                 "source": "custom",
+                "storage_format": "npy",
             }
         )
 
     return manifest
+
+
+def _resolve_existing_npz_path(
+    raw_path: str,
+    *,
+    manifest_path: Path,
+    pretokenized_root: Optional[Path],
+) -> Optional[Path]:
+    candidate = Path(str(raw_path))
+    probe_paths: List[Path] = []
+
+    if candidate.is_absolute():
+        probe_paths.append(candidate)
+    else:
+        if pretokenized_root is not None:
+            probe_paths.append(pretokenized_root / candidate)
+            probe_paths.append(pretokenized_root / candidate.name)
+        probe_paths.append(manifest_path.parent / candidate)
+        probe_paths.append(manifest_path.parent.parent / candidate)
+        probe_paths.append(manifest_path.parent.parent / "data" / candidate.name)
+
+    for path in probe_paths:
+        if path.exists() and path.is_file():
+            return path.resolve()
+    return None
+
+
+def _load_pretokenized_manifest(
+    *,
+    manifest_path: Path,
+    pretokenized_root: Optional[Path],
+    max_pieces: int,
+    min_required_tokens: int,
+) -> List[Dict[str, object]]:
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Pre-tokenized manifest not found: {manifest_path}")
+
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, list) or not raw:
+        raise RuntimeError(f"Invalid or empty pre-tokenized manifest: {manifest_path}")
+
+    loaded: List[Dict[str, object]] = []
+    skipped_unresolved = 0
+    skipped_short = 0
+
+    for row in raw:
+        if not isinstance(row, dict):
+            skipped_unresolved += 1
+            continue
+
+        raw_npz = str(row.get("npz_path", "")).strip()
+        if not raw_npz:
+            md5 = str(row.get("md5", "")).strip()
+            if md5:
+                raw_npz = f"{md5}.npz"
+
+        if not raw_npz:
+            skipped_unresolved += 1
+            continue
+
+        npz_path = _resolve_existing_npz_path(
+            raw_npz,
+            manifest_path=manifest_path,
+            pretokenized_root=pretokenized_root,
+        )
+        if npz_path is None:
+            skipped_unresolved += 1
+            continue
+
+        length = int(row.get("length", row.get("tokens", -1)))
+        if length <= 0:
+            with np.load(npz_path, allow_pickle=False) as pack:
+                length = int(pack["tokens"].shape[0])
+
+        if length < int(min_required_tokens):
+            skipped_short += 1
+            continue
+
+        loaded.append(
+            {
+                "piece_id": str(row.get("md5", npz_path.stem) or npz_path.stem),
+                "path": str(row.get("source_path", "")),
+                "tokens_path": str(npz_path),
+                "onset_times_path": "",
+                "durations_path": "",
+                "tokens": int(length),
+                "length": int(length),
+                "source": "godzilla_piano",
+                "storage_format": "npz",
+            }
+        )
+
+        if max_pieces > 0 and len(loaded) >= int(max_pieces):
+            break
+
+    LOGGER.info(
+        "Loaded pre-tokenized manifest: kept=%d skipped_unresolved=%d skipped_short=%d",
+        len(loaded),
+        skipped_unresolved,
+        skipped_short,
+    )
+    if len(loaded) < 2:
+        raise RuntimeError(
+            "Need at least two eligible entries in pre-tokenized manifest after filtering."
+        )
+    return loaded
+
+
+class NpzWindowDataset(PianoDataset):
+    """Adapt PianoDataset windowing logic to .npz token packs."""
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        item = self.manifest[idx]
+        npz_path = Path(str(item["tokens_path"]))
+
+        with np.load(npz_path, allow_pickle=False) as pack:
+            token_seq = np.asarray(pack["tokens"], dtype=np.int64)
+            if "onsets" in pack:
+                onset_seq = np.asarray(pack["onsets"], dtype=np.float32)
+            elif "onset_times" in pack:
+                onset_seq = np.asarray(pack["onset_times"], dtype=np.float32)
+            else:
+                step = float(
+                    max(1e-4, self.data_config.time_feature_fallback_step_seconds)
+                )
+                onset_seq = np.arange(token_seq.shape[0], dtype=np.float32) * step
+
+            if "durations" in pack:
+                duration_seq = np.asarray(pack["durations"], dtype=np.float32)
+            else:
+                step = float(
+                    max(1e-4, self.data_config.time_feature_fallback_step_seconds)
+                )
+                duration_seq = np.full((token_seq.shape[0],), fill_value=step, dtype=np.float32)
+
+        total_needed = (
+            self.data_config.seed_length + self.data_config.continuation_length
+        )
+        if token_seq.shape[0] < total_needed:
+            raise RuntimeError(
+                f"Piece {npz_path} shorter than required window {total_needed}."
+            )
+
+        max_start = int(token_seq.shape[0] - total_needed)
+        raw_start = self.rng.randint(0, max_start) if max_start > 0 else 0
+        start = self._snap_to_triplet_boundary(raw_start, max_start)
+
+        if start % 3 != 0:
+            raise AssertionError(
+                "Triplet boundary violation in dataset windowing: "
+                f"start={start} (raw_start={raw_start}) is not divisible by 3"
+            )
+
+        seed = token_seq[start : start + self.data_config.seed_length]
+        cont = token_seq[
+            start + self.data_config.seed_length : start
+            + self.data_config.seed_length
+            + self.data_config.continuation_length
+        ]
+
+        onset = onset_seq[start : start + total_needed]
+        duration = duration_seq[start : start + total_needed]
+
+        seed_t = torch.from_numpy(seed.astype(np.int64, copy=False))
+        cont_t = torch.from_numpy(cont.astype(np.int64, copy=False))
+        onset_t = torch.from_numpy(onset.astype(np.float32, copy=False))
+        duration_t = torch.from_numpy(duration.astype(np.float32, copy=False))
+        return {
+            "seed": seed_t,
+            "continuation": cont_t,
+            "token_ids": torch.cat([seed_t, cont_t], dim=0),
+            "onset_times": onset_t,
+            "durations": duration_t,
+            "new_piece": torch.tensor(True),
+        }
 
 
 def _train_val_split(
@@ -139,8 +328,15 @@ def _build_dataloaders(
     train_cfg: TrainConfig,
     seed: int,
 ) -> Tuple[DataLoader, DataLoader]:
-    train_ds = PianoDataset(train_manifest, data_cfg, seed=int(seed))
-    val_ds = PianoDataset(val_manifest, data_cfg, seed=int(seed) + 1)
+    combined = train_manifest + val_manifest
+    use_npz = any(
+        str(item.get("storage_format", "")).strip().lower() == "npz"
+        for item in combined
+    )
+    dataset_cls = NpzWindowDataset if use_npz else PianoDataset
+
+    train_ds = dataset_cls(train_manifest, data_cfg, seed=int(seed))
+    val_ds = dataset_cls(val_manifest, data_cfg, seed=int(seed) + 1)
 
     use_cuda = train_cfg.device == "cuda" or (
         train_cfg.device == "auto" and torch.cuda.is_available()
@@ -368,6 +564,64 @@ def _default_seed_midi(data_dir: Path) -> Path:
     return midi_files[0]
 
 
+def _resolve_num_heads(d_model: int, requested_heads: int) -> int:
+    heads = max(1, min(int(requested_heads), int(d_model)))
+    while heads > 1 and (int(d_model) % heads) != 0:
+        heads -= 1
+    return max(1, heads)
+
+
+def _parse_variants_arg(raw: str) -> List[str]:
+    mapping = {
+        "a": "variant_a",
+        "variant_a": "variant_a",
+        "gdn": "variant_a",
+        "gdn_cfc_attention": "variant_a",
+        "b": "variant_b",
+        "variant_b": "variant_b",
+        "transformer_cfc": "variant_b",
+        "c": "variant_c",
+        "variant_c": "variant_c",
+        "baseline": "variant_c",
+        "pure_attention": "variant_c",
+    }
+
+    seen = set()
+    resolved: List[str] = []
+    for token in str(raw).split(","):
+        key = token.strip().lower()
+        if not key:
+            continue
+        if key not in mapping:
+            valid = ", ".join(sorted(mapping.keys()))
+            raise ValueError(f"Unsupported variant token '{token}'. Valid: {valid}")
+        name = mapping[key]
+        if name in seen:
+            continue
+        seen.add(name)
+        resolved.append(name)
+
+    if not resolved:
+        raise ValueError("No variants selected. Use --variants a,b,c (or subset).")
+    return resolved
+
+
+def _variant_backend_status(model: torch.nn.Module) -> Dict[str, bool]:
+    status = {
+        "gdn_using_fallback": False,
+        "cfc_using_fallback": False,
+    }
+    for module in model.modules():
+        cls_name = module.__class__.__name__
+        if cls_name == "GatedDeltaNetBlock" and bool(
+            getattr(module, "using_fallback", False)
+        ):
+            status["gdn_using_fallback"] = True
+        if cls_name == "CfCBlock" and bool(getattr(module, "using_fallback", False)):
+            status["cfc_using_fallback"] = True
+    return status
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run A/B/C architecture ablation on custom triplet tokenizer data."
@@ -375,8 +629,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="maestro-v3.0.0",
+        default="",
         help="Root directory scanned recursively for .mid/.midi files.",
+    )
+    parser.add_argument(
+        "--pretokenized_manifest",
+        type=str,
+        default="",
+        help="Optional path to pre-tokenized manifest.json produced by local Godzilla tokenizer.",
+    )
+    parser.add_argument(
+        "--pretokenized_root",
+        type=str,
+        default="",
+        help="Optional root folder used to resolve relative npz paths from pre-tokenized manifest.",
     )
     parser.add_argument(
         "--seed_midi",
@@ -395,15 +661,53 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--seed_length", type=int, default=256)
     parser.add_argument("--continuation_length", type=int, default=768)
+    parser.add_argument(
+        "--max_pieces",
+        type=int,
+        default=0,
+        help="Optional cap on number of pieces used for training (0 means all).",
+    )
+    parser.add_argument(
+        "--variants",
+        type=str,
+        default="a,b,c",
+        help="Comma-separated subset of variants to run. Example: a,b,c or c.",
+    )
+    parser.add_argument(
+        "--size_mode",
+        type=str,
+        choices=["balanced_small", "shared"],
+        default="balanced_small",
+        help="balanced_small uses per-variant 10M-15M profiles; shared uses one d_model/n_layers for all variants.",
+    )
+    parser.add_argument(
+        "--d_model",
+        type=int,
+        default=512,
+        help="Model width used across selected variants when size_mode=shared.",
+    )
+    parser.add_argument(
+        "--n_layers",
+        type=int,
+        default=4,
+        help="Number of stacked blocks used across selected variants when size_mode=shared.",
+    )
+    parser.add_argument(
+        "--require_real_gdn",
+        action="store_true",
+        help="Fail run if Variant A cannot use real flash-linear-attention GDN kernels.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
 
-    data_dir = Path(args.data_dir)
-    if not data_dir.exists():
-        raise FileNotFoundError(f"data_dir not found: {data_dir.resolve()}")
+    if str(args.size_mode) == "shared":
+        if int(args.d_model) <= 0:
+            raise ValueError("--d_model must be > 0")
+        if int(args.n_layers) <= 0:
+            raise ValueError("--n_layers must be > 0")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -414,24 +718,55 @@ def main() -> None:
     tokenizer_path = output_dir / "custom_tokenizer.json"
     tokenizer.save(str(tokenizer_path))
 
-    midi_files = _scan_midi_files(data_dir)
-    if not midi_files:
-        raise RuntimeError(f"No MIDI files found under {data_dir.resolve()}")
-
     min_required = int(args.seed_length) + int(args.continuation_length)
-    processed_dir = output_dir / "processed_custom"
-    manifest = _build_manifest_with_custom_tokenizer(
-        midi_files=midi_files,
-        tokenizer=tokenizer,
-        processed_dir=processed_dir,
-        min_required_tokens=min_required,
-    )
-    if len(manifest) < 2:
-        raise RuntimeError(
-            "Need at least two eligible pieces after tokenization to build train/val split."
+    max_pieces = int(max(0, args.max_pieces))
+    data_source = "raw_midi"
+
+    if str(args.pretokenized_manifest).strip():
+        manifest_input_path = Path(str(args.pretokenized_manifest)).expanduser()
+        pretokenized_root = (
+            Path(str(args.pretokenized_root)).expanduser()
+            if str(args.pretokenized_root).strip()
+            else None
         )
+        manifest = _load_pretokenized_manifest(
+            manifest_path=manifest_input_path,
+            pretokenized_root=pretokenized_root,
+            max_pieces=max_pieces,
+            min_required_tokens=min_required,
+        )
+        processed_dir = output_dir / "processed_pretokenized"
+        data_source = "pretokenized_npz"
+    else:
+        data_dir_raw = str(args.data_dir).strip()
+        if not data_dir_raw:
+            raise ValueError(
+                "Provide --data_dir for raw MIDI mode, or provide --pretokenized_manifest."
+            )
+        data_dir = Path(data_dir_raw)
+        if not data_dir.exists():
+            raise FileNotFoundError(f"data_dir not found: {data_dir.resolve()}")
+
+        midi_files = _scan_midi_files(data_dir)
+        if max_pieces > 0:
+            midi_files = midi_files[:max_pieces]
+        if not midi_files:
+            raise RuntimeError(f"No MIDI files found under {data_dir.resolve()}")
+
+        processed_dir = output_dir / "processed_custom"
+        manifest = _build_manifest_with_custom_tokenizer(
+            midi_files=midi_files,
+            tokenizer=tokenizer,
+            processed_dir=processed_dir,
+            min_required_tokens=min_required,
+        )
+        if len(manifest) < 2:
+            raise RuntimeError(
+                "Need at least two eligible pieces after tokenization to build train/val split."
+            )
 
     manifest_path = processed_dir / "manifest.json"
+    processed_dir.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     train_manifest, val_manifest = _train_val_split(
@@ -440,7 +775,15 @@ def main() -> None:
         val_fraction=0.1,
     )
 
-    seed_midi = Path(args.seed_midi) if args.seed_midi else _default_seed_midi(data_dir)
+    if str(args.seed_midi).strip():
+        seed_midi = Path(str(args.seed_midi)).expanduser()
+    else:
+        data_dir_raw = str(args.data_dir).strip()
+        if not data_dir_raw:
+            raise ValueError(
+                "Provide --seed_midi when using --pretokenized_manifest without a raw MIDI --data_dir."
+            )
+        seed_midi = _default_seed_midi(Path(data_dir_raw))
     if not seed_midi.exists():
         raise FileNotFoundError(f"seed_midi not found: {seed_midi.resolve()}")
 
@@ -491,50 +834,127 @@ def main() -> None:
         warmup_steps,
     )
 
-    variants = [
-        (
-            "variant_a",
-            VariantAModel(
+    selected_variants = _parse_variants_arg(args.variants)
+    variant_profiles: Dict[str, Dict[str, int]] = {}
+    for variant_name in selected_variants:
+        if str(args.size_mode) == "balanced_small":
+            profile = BALANCED_SMALL_PROFILES[variant_name]
+            variant_profiles[variant_name] = {
+                "d_model": int(profile["d_model"]),
+                "n_layers": int(profile["n_layers"]),
+            }
+        else:
+            variant_profiles[variant_name] = {
+                "d_model": int(args.d_model),
+                "n_layers": int(args.n_layers),
+            }
+
+    def _build_variant(name: str) -> Tuple[torch.nn.Module, Dict[str, int]]:
+        profile = variant_profiles[name]
+        d_model = int(profile["d_model"])
+        n_layers = int(profile["n_layers"])
+        attn_heads = _resolve_num_heads(d_model=d_model, requested_heads=8)
+        gdn_heads = _resolve_num_heads(d_model=d_model, requested_heads=4)
+        gqa_groups = 4 if attn_heads % 4 == 0 else (2 if attn_heads % 2 == 0 else 1)
+        gdn_inner_dim = max(128, d_model // 2)
+        cfc_backbone_units = max(128, int(d_model * 0.75))
+
+        if name == "variant_a":
+            model = VariantAModel(
                 VariantAConfig(
                     vocab_size=tokenizer.vocab_size,
-                    d_model=512,
-                    n_layers=4,
+                    d_model=d_model,
+                    n_layers=n_layers,
                     max_sequence_length=data_cfg.max_sequence_length,
+                    gdn_inner_dim=gdn_inner_dim,
+                    gdn_num_heads=gdn_heads,
+                    cfc_backbone_units=cfc_backbone_units,
+                    gqa_num_heads=attn_heads,
+                    gqa_groups=gqa_groups,
                 )
-            ),
-        ),
-        (
-            "variant_b",
-            VariantBModel(
+            )
+        elif name == "variant_b":
+            model = VariantBModel(
                 VariantBConfig(
                     vocab_size=tokenizer.vocab_size,
-                    d_model=512,
-                    n_layers=4,
+                    d_model=d_model,
+                    n_layers=n_layers,
                     max_sequence_length=data_cfg.max_sequence_length,
+                    num_attention_heads=attn_heads,
+                    cfc_backbone_units=cfc_backbone_units,
                 )
-            ),
-        ),
-        (
-            "variant_c",
-            VariantCModel(
+            )
+        elif name == "variant_c":
+            model = VariantCModel(
                 VariantCConfig(
                     vocab_size=tokenizer.vocab_size,
-                    d_model=512,
-                    n_layers=4,
+                    d_model=d_model,
+                    n_layers=n_layers,
                     max_sequence_length=data_cfg.max_sequence_length,
+                    num_attention_heads=attn_heads,
                 )
-            ),
-        ),
-    ]
+            )
+        else:
+            raise ValueError(f"Unsupported variant {name}")
+
+        shape_meta = {
+            "d_model": int(d_model),
+            "n_layers": int(n_layers),
+            "attention_heads": int(attn_heads),
+            "gdn_heads": int(gdn_heads),
+            "gqa_groups": int(gqa_groups),
+        }
+        return model, shape_meta
+
+    variants: List[Tuple[str, torch.nn.Module, Dict[str, int], Dict[str, bool]]] = []
+    param_by_variant: Dict[str, int] = {}
+    for name in selected_variants:
+        model, shape_meta = _build_variant(name)
+        backend_status = _variant_backend_status(model)
+        if name == "variant_a" and bool(args.require_real_gdn):
+            if backend_status["gdn_using_fallback"]:
+                raise RuntimeError(
+                    "Variant A is using fallback GDN. Install flash-linear-attention or run without --require_real_gdn."
+                )
+
+        params = int(sum(p.numel() for p in model.parameters()))
+        param_by_variant[name] = params
+        LOGGER.info(
+            "Variant %s setup: d_model=%d n_layers=%d params=%.2fM backend=%s",
+            name,
+            int(shape_meta["d_model"]),
+            int(shape_meta["n_layers"]),
+            float(params) / 1e6,
+            backend_status,
+        )
+        variants.append((name, model, shape_meta, backend_status))
+
+    if param_by_variant:
+        min_params = min(param_by_variant.values())
+        max_params = max(param_by_variant.values())
+        ratio = float(max_params) / float(max(1, min_params))
+        LOGGER.info(
+            "Parameter comparability: min=%.2fM max=%.2fM ratio=%.3f",
+            float(min_params) / 1e6,
+            float(max_params) / 1e6,
+            ratio,
+        )
 
     results: Dict[str, Any] = {
         "seed": int(args.seed),
-        "data_dir": str(data_dir.resolve()),
+        "data_dir": str(args.data_dir),
+        "data_source": data_source,
         "seed_midi": str(seed_midi.resolve()),
         "tokenizer": "CustomDeltaTokenizer",
         "manifest_path": str(manifest_path.resolve()),
         "train_pieces": int(len(train_manifest)),
         "val_pieces": int(len(val_manifest)),
+        "baseline_variant": "variant_c",
+        "variant_definitions": ARCHITECTURE_LABELS,
+        "selected_variants": selected_variants,
+        "size_mode": str(args.size_mode),
+        "variant_profiles": variant_profiles,
+        "parameter_counts": param_by_variant,
         "train_config_shared": {
             "epochs": int(args.epochs),
             "batch_size": int(args.batch_size),
@@ -549,7 +969,7 @@ def main() -> None:
         "variants": {},
     }
 
-    for name, model in variants:
+    for name, model, shape_meta, backend_status in variants:
         LOGGER.info("Starting %s", name)
         ckpt_dir = output_dir / "checkpoints" / name
         train_cfg = _make_train_config(
@@ -570,6 +990,9 @@ def main() -> None:
             seed_midi=seed_midi,
             output_midi_path=output_dir / f"{name}.mid",
         )
+        result["architecture"] = ARCHITECTURE_LABELS.get(name, name)
+        result["shape"] = shape_meta
+        result["backend_status"] = backend_status
         results["variants"][name] = result
 
     results_path = output_dir / "ablation_results.json"

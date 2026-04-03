@@ -4,6 +4,7 @@
 torch>=2.1.0
 miditok>=3.0.0
 pretty_midi>=0.2.10
+symusic>=0.5.8
 ncps>=0.0.7
 numpy>=1.24.0
 tqdm>=4.65.0
