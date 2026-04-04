@@ -225,13 +225,14 @@ cd app
 ./run.sh     # or run.bat on Windows
 ```
 
-## A/B/C Architecture Ablation
+## A/B/C/D Architecture Ablation
 
 For your current Godzilla research track, use these architecture labels consistently:
 
 1. `variant_a`: Gated Delta Net + CfC + Attention hybrid (novel)
 2. `variant_b`: Transformer + CfC hybrid (novel)
 3. `variant_c`: pure attention Transformer baseline (control)
+4. `variant_d`: pure CfC recurrent baseline (no attention)
 
 Run ablations in comparable small-model mode (10M-15M range per variant):
 
@@ -241,7 +242,7 @@ python -m training.ablation_runner \
   --pretokenized_root processed/godzilla_tokenized \
   --skip_generation \
   --output_dir outputs/godzilla_ablation \
-  --variants a,b,c \
+  --variants a,b,c,d \
   --size_mode balanced_small \
   --epochs 3 \
   --batch_size 4
@@ -254,6 +255,7 @@ Notes:
 - If you want continuation demos, remove `--skip_generation` and provide `--seed_midi /path/to/seed.mid`.
 - `variant_a` is auto-tuned at runtime to stay comparable whether real GDN kernels are available or fallback mode is active.
 - `variant_b` and `variant_c` stay near ~12M as fixed anchors for comparison.
+- `variant_d` is the pure-CfC baseline (balanced profile targets ~12M for fair comparison).
 - On multi-GPU Kaggle runs, Trainer auto-disables DataParallel when real Variant-A GDN kernels are detected to avoid Triton replica autotuner crashes.
 
 If you want one shared shape across all variants, use `--size_mode shared --d_model ... --n_layers ...`.
@@ -285,7 +287,7 @@ Before long training runs, generate a readiness audit report:
 
 ```bash
 python tools/audit_ablation_readiness.py \
-  --variants a,b,c \
+  --variants a,b,c,d \
   --size_mode balanced_small \
   --pretokenized_manifest processed/godzilla_tokenized/metadata/manifest.json \
   --pretokenized_root processed/godzilla_tokenized \

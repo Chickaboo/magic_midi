@@ -143,6 +143,10 @@ class CfCBlock(nn.Module):
             self.using_fallback = True
             self.cfc_mode = "gru_fallback"
 
+        # Discover ncps CfC call signatures once, then reuse to avoid per-step probing.
+        self._call_mode: Optional[str] = None
+        self._timespan_call_mode: Optional[str] = None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -167,10 +171,7 @@ class CfCBlock(nn.Module):
             hidden = x.new_zeros((x.shape[0], self.cfc_units))
 
         x_cfc = x.float() if x.dtype != torch.float32 else x
-        if self.using_fallback:
-            y, new_hidden = self.cfc(x_cfc, hidden)
-        else:
-            y, new_hidden = self._forward_cfc(x_cfc, hidden)
+        y, new_hidden = self.call_core(x_cfc, hidden=hidden)
 
         if y.dtype != input_dtype:
             y = y.to(dtype=input_dtype)
@@ -190,26 +191,125 @@ class CfCBlock(nn.Module):
 
         return out, new_hidden
 
+    def call_core(
+        self,
+        x: torch.Tensor,
+        hidden: Any,
+        timespans: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Any]:
+        """Run recurrent core with optional elapsed-time deltas."""
+
+        if timespans is None:
+            return self._forward_cfc(x, hidden)
+
+        ts = timespans
+        if ts.dtype != x.dtype:
+            ts = ts.to(dtype=x.dtype)
+        return self._forward_cfc_with_timespans(x, hidden, ts)
+
     def _forward_cfc(self, x: torch.Tensor, hidden: Any) -> Tuple[torch.Tensor, Any]:
-        """Call ncps CfC across supported signatures."""
+        """Call recurrent core across supported non-timespan signatures."""
 
-        try:
+        if self.using_fallback:
             out = self.cfc(x, hidden)
-        except TypeError:
+            return self._normalize_cfc_output(out, hidden)
+
+        if self._call_mode == "x_hidden":
+            out = self.cfc(x, hidden)
+            return self._normalize_cfc_output(out, hidden)
+        if self._call_mode == "x_hx":
+            out = self.cfc(x, hx=hidden)
+            return self._normalize_cfc_output(out, hidden)
+        if self._call_mode == "x_only":
+            out = self.cfc(x)
+            return self._normalize_cfc_output(out, hidden)
+
+        attempts = [
+            ("x_hidden", lambda: self.cfc(x, hidden)),
+            ("x_hx", lambda: self.cfc(x, hx=hidden)),
+            ("x_only", lambda: self.cfc(x)),
+        ]
+        errors: list[str] = []
+        for mode, fn in attempts:
             try:
-                out = self.cfc(x, hx=hidden)
-            except TypeError:
-                out = self.cfc(x)
+                out = fn()
+                self._call_mode = mode
+                return self._normalize_cfc_output(out, hidden)
+            except TypeError as exc:
+                errors.append(f"{mode}: {exc}")
 
-        if isinstance(out, tuple) and len(out) == 2:
-            y = cast(torch.Tensor, out[0])
-            h = out[1]
-            return y, h
+        raise RuntimeError(
+            "CfCBlock could not resolve a non-timespan call signature. "
+            + " | ".join(errors)
+        )
 
-        if isinstance(out, tuple) and len(out) > 2:
-            y = cast(torch.Tensor, out[0])
-            h = out[1]
-            return y, h
+    def _forward_cfc_with_timespans(
+        self,
+        x: torch.Tensor,
+        hidden: Any,
+        timespans: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Any]:
+        """Call recurrent core across supported elapsed-time signatures."""
 
-        y = cast(torch.Tensor, out)
-        return y, hidden
+        if self.using_fallback:
+            out = self.cfc(x, hidden)
+            return self._normalize_cfc_output(out, hidden)
+
+        ts2d = timespans
+        ts3d = timespans.unsqueeze(-1) if timespans.ndim == 2 else timespans
+
+        def _call_mode(mode: str) -> Any:
+            if mode == "hx_ts_2d":
+                return self.cfc(x, hx=hidden, timespans=ts2d)
+            if mode == "hx_ts_3d":
+                return self.cfc(x, hx=hidden, timespans=ts3d)
+            if mode == "pos_ts_2d":
+                return self.cfc(x, hidden, ts2d)
+            if mode == "pos_ts_3d":
+                return self.cfc(x, hidden, ts3d)
+            if mode == "x_hidden":
+                return self.cfc(x, hidden)
+            if mode == "x_hx":
+                return self.cfc(x, hx=hidden)
+            if mode == "x_only":
+                return self.cfc(x)
+            raise ValueError(f"Unsupported CfC timespan mode: {mode}")
+
+        if self._timespan_call_mode is not None:
+            out = _call_mode(self._timespan_call_mode)
+            return self._normalize_cfc_output(out, hidden)
+
+        attempts = [
+            "hx_ts_2d",
+            "hx_ts_3d",
+            "pos_ts_2d",
+            "pos_ts_3d",
+            "x_hidden",
+            "x_hx",
+            "x_only",
+        ]
+        errors: list[str] = []
+        for mode in attempts:
+            try:
+                out = _call_mode(mode)
+                self._timespan_call_mode = mode
+                return self._normalize_cfc_output(out, hidden)
+            except (TypeError, RuntimeError, ValueError) as exc:
+                errors.append(f"{mode}: {exc}")
+
+        raise RuntimeError(
+            "CfCBlock could not resolve a timespan call signature. "
+            + " | ".join(errors)
+        )
+
+    @staticmethod
+    def _normalize_cfc_output(out: Any, hidden: Any) -> Tuple[torch.Tensor, Any]:
+        """Normalize varying CfC return signatures to (sequence, hidden)."""
+
+        if isinstance(out, tuple):
+            if len(out) >= 2:
+                return cast(torch.Tensor, out[0]), out[1]
+            if len(out) == 1:
+                return cast(torch.Tensor, out[0]), hidden
+
+        return cast(torch.Tensor, out), hidden

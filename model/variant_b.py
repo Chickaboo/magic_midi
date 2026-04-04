@@ -74,39 +74,11 @@ class _VariantBBlock(nn.Module):
         cfc_x = self.cfc.input_proj(cfc_x)
         ts = timespans.to(dtype=cfc_x.dtype)
 
-        # Explicit elapsed-time path for ncps CfC (timespans are deltas, not absolutes).
-        if self.cfc.using_fallback:
-            cfc_out, new_hidden = self.cfc.cfc(cfc_x, cfc_hidden)
-        else:
-            ts_candidates = [ts]
-            if ts.ndim == 2:
-                ts_candidates.append(ts.unsqueeze(-1))
-
-            cfc_out = None
-            new_hidden = cfc_hidden
-            call_succeeded = False
-            for ts_in in ts_candidates:
-                try:
-                    cfc_out, new_hidden = self.cfc.cfc(
-                        cfc_x,
-                        hx=cfc_hidden,
-                        timespans=ts_in,
-                    )
-                    call_succeeded = True
-                    break
-                except (TypeError, RuntimeError):
-                    try:
-                        cfc_out, new_hidden = self.cfc.cfc(cfc_x, cfc_hidden, ts_in)
-                        call_succeeded = True
-                        break
-                    except (TypeError, RuntimeError):
-                        continue
-
-            if not call_succeeded:
-                cfc_out, new_hidden = self.cfc.cfc(cfc_x, cfc_hidden)
-
-            if cfc_out is None:
-                raise RuntimeError("VariantB CfC call produced no output tensor.")
+        cfc_out, new_hidden = self.cfc.call_core(
+            cfc_x,
+            hidden=cfc_hidden,
+            timespans=ts,
+        )
 
         if cfc_out.dtype != cfc_dtype:
             cfc_out = cfc_out.to(dtype=cfc_dtype)

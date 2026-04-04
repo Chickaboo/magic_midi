@@ -245,6 +245,9 @@ class Trainer:
             getattr(self.config, "use_amp", True)
         )
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+        self.log_every_n_steps = max(
+            1, int(getattr(self.config, "_log_every_n_steps", 100))
+        )
 
         self.checkpoint_dir = Path(self.config.checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -399,6 +402,18 @@ class Trainer:
         epoch_start = time.time()
         self.model.train()
 
+        est_optimizer_steps = max(
+            1,
+            math.ceil(len(self.train_loader) / self.config.grad_accumulation_steps),
+        )
+        LOGGER.info(
+            "Epoch %03d start | train_batches=%d | est_optimizer_steps=%d | log_every=%d",
+            int(epoch),
+            int(len(self.train_loader)),
+            int(est_optimizer_steps),
+            int(self.log_every_n_steps),
+        )
+
         self.optimizer.zero_grad(set_to_none=True)
         running_loss = 0.0
         running_count = 0
@@ -484,7 +499,7 @@ class Trainer:
             if (
                 should_step
                 and self.global_step > 0
-                and self.global_step % 100 == 0
+                and self.global_step % int(self.log_every_n_steps) == 0
                 and running_count > 0
             ):
                 avg = running_loss / running_count

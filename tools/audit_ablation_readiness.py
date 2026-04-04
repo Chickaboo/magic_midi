@@ -18,6 +18,7 @@ try:
     from model.variant_a import VariantAConfig, VariantAModel
     from model.variant_b import VariantBConfig, VariantBModel
     from model.variant_c import VariantCConfig, VariantCModel
+    from model.variant_d import VariantDConfig, VariantDModel
 except ModuleNotFoundError:
     ROOT = Path(__file__).resolve().parents[1]
     if str(ROOT) not in sys.path:
@@ -25,18 +26,21 @@ except ModuleNotFoundError:
     from model.variant_a import VariantAConfig, VariantAModel
     from model.variant_b import VariantBConfig, VariantBModel
     from model.variant_c import VariantCConfig, VariantCModel
+    from model.variant_d import VariantDConfig, VariantDModel
 
 
 ARCH_LABELS: Dict[str, str] = {
     "variant_a": "gated_delta_cfc_attention_hybrid",
     "variant_b": "transformer_cfc_hybrid",
     "variant_c": "pure_attention_transformer_baseline",
+    "variant_d": "pure_cfc_recurrent_baseline",
 }
 
 BALANCED_SMALL_PROFILES: Dict[str, Dict[str, int]] = {
     "variant_a": {"d_model": 544, "n_layers": 4},
     "variant_b": {"d_model": 544, "n_layers": 5},
     "variant_c": {"d_model": 480, "n_layers": 4},
+    "variant_d": {"d_model": 608, "n_layers": 8},
 }
 
 
@@ -63,6 +67,10 @@ def _parse_variants(raw: str) -> List[str]:
         "c": "variant_c",
         "variant_c": "variant_c",
         "baseline": "variant_c",
+        "d": "variant_d",
+        "variant_d": "variant_d",
+        "pure_cfc": "variant_d",
+        "cfc_only": "variant_d",
     }
     out: List[str] = []
     seen = set()
@@ -139,7 +147,7 @@ def _dependency_checks() -> List[CheckItem]:
             CheckItem(
                 "Mamba kernel",
                 "PASS",
-                "mamba_ssm unavailable (optional for A/B/C ablation)",
+                "mamba_ssm unavailable (optional for architecture ablation)",
             )
         )
 
@@ -192,6 +200,16 @@ def _build_variant(
                 n_layers=n_layers,
                 max_sequence_length=max_sequence_length,
                 num_attention_heads=attn_heads,
+            )
+        )
+    elif variant_name == "variant_d":
+        model = VariantDModel(
+            VariantDConfig(
+                vocab_size=155,
+                d_model=d_model,
+                n_layers=n_layers,
+                max_sequence_length=max_sequence_length,
+                cfc_backbone_units=cfc_backbone_units,
             )
         )
     else:
@@ -356,7 +374,7 @@ def _variant_checks(
         status = "PASS" if ratio <= 1.20 else "WARN"
         checks.append(
             CheckItem(
-                "A/B/C parameter comparability",
+                "Variant parameter comparability",
                 status,
                 f"min={min_v / 1e6:.2f}M max={max_v / 1e6:.2f}M ratio={ratio:.3f}",
             )
@@ -461,7 +479,7 @@ def _render_report(
     overall = "WARN" if has_warn else "PASS"
 
     lines: List[str] = []
-    lines.append("# A/B/C Readiness Audit")
+    lines.append("# Architecture Readiness Audit")
     lines.append("")
     lines.append(f"Generated: {datetime.now().isoformat()}")
     lines.append(f"Overall: {overall}")
@@ -500,7 +518,7 @@ def _render_report(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Audit readiness for small A/B/C ablation runs.")
+    parser = argparse.ArgumentParser(description="Audit readiness for small architecture ablation runs.")
     parser.add_argument("--variants", type=str, default="a,b,c")
     parser.add_argument(
         "--size_mode",

@@ -21,6 +21,7 @@ try:
     from model.variant_a import VariantAConfig, VariantAModel
     from model.variant_b import VariantBConfig, VariantBModel
     from model.variant_c import VariantCConfig, VariantCModel
+    from model.variant_d import VariantDConfig, VariantDModel
     from training.trainer import Trainer
     from utils.logging_utils import get_project_logger
 except ModuleNotFoundError:
@@ -33,6 +34,7 @@ except ModuleNotFoundError:
     from model.variant_a import VariantAConfig, VariantAModel
     from model.variant_b import VariantBConfig, VariantBModel
     from model.variant_c import VariantCConfig, VariantCModel
+    from model.variant_d import VariantDConfig, VariantDModel
     from training.trainer import Trainer
     from utils.logging_utils import get_project_logger
 
@@ -43,13 +45,15 @@ ARCHITECTURE_LABELS: Dict[str, str] = {
     "variant_a": "gated_delta_cfc_attention_hybrid",
     "variant_b": "transformer_cfc_hybrid",
     "variant_c": "pure_attention_transformer_baseline",
+    "variant_d": "pure_cfc_recurrent_baseline",
 }
 
 BALANCED_SMALL_PROFILES: Dict[str, Dict[str, int]] = {
-    # Keep variants in a comparable 10M-15M budget for fair A/B/C tests.
+    # Keep variants in a comparable budget for fair architecture tests.
     "variant_a": {"d_model": 544, "n_layers": 4},
     "variant_b": {"d_model": 544, "n_layers": 5},
     "variant_c": {"d_model": 480, "n_layers": 4},
+    "variant_d": {"d_model": 608, "n_layers": 8},
 }
 
 
@@ -593,6 +597,10 @@ def _parse_variants_arg(raw: str) -> List[str]:
         "variant_c": "variant_c",
         "baseline": "variant_c",
         "pure_attention": "variant_c",
+        "d": "variant_d",
+        "variant_d": "variant_d",
+        "pure_cfc": "variant_d",
+        "cfc_only": "variant_d",
     }
 
     seen = set()
@@ -611,7 +619,7 @@ def _parse_variants_arg(raw: str) -> List[str]:
         resolved.append(name)
 
     if not resolved:
-        raise ValueError("No variants selected. Use --variants a,b,c (or subset).")
+        raise ValueError("No variants selected. Use --variants a,b,c,d (or subset).")
     return resolved
 
 
@@ -633,7 +641,7 @@ def _variant_backend_status(model: torch.nn.Module) -> Dict[str, bool]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run A/B/C architecture ablation on custom triplet tokenizer data."
+        description="Run architecture ablation on custom triplet tokenizer data."
     )
     parser.add_argument(
         "--data_dir",
@@ -685,7 +693,7 @@ def parse_args() -> argparse.Namespace:
         "--variants",
         type=str,
         default="a,b,c",
-        help="Comma-separated subset of variants to run. Example: a,b,c or c.",
+        help="Comma-separated subset of variants to run. Example: a,b,c,d or c.",
     )
     parser.add_argument(
         "--size_mode",
@@ -908,6 +916,16 @@ def main() -> None:
                     n_layers=n_layers,
                     max_sequence_length=data_cfg.max_sequence_length,
                     num_attention_heads=attn_heads,
+                )
+            )
+        elif name == "variant_d":
+            model = VariantDModel(
+                VariantDConfig(
+                    vocab_size=tokenizer.vocab_size,
+                    d_model=d_model,
+                    n_layers=n_layers,
+                    max_sequence_length=data_cfg.max_sequence_length,
+                    cfc_backbone_units=cfc_backbone_units,
                 )
             )
         else:

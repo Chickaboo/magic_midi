@@ -7,61 +7,36 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 
-from model.blocks.gdn_block import GatedDeltaNetBlock
-from model.blocks.gqa_block import GQABlock
 from model.cfc_block import CfCBlock
 from model.sampling import sample_next_token
 
 
 @dataclass
-class VariantAConfig:
+class VariantDConfig:
     vocab_size: int = 155
     d_model: int = 512
-    n_layers: int = 4
+    n_layers: int = 6
     max_sequence_length: int = 1024
     dropout: float = 0.1
-    attention_dropout: float = 0.1
     tie_embeddings: bool = True
     embedding_init_std: float = 0.02
     output_logit_scale: Optional[float] = None
 
-    # Keep params in 10-20M range at d_model=512, n_layers=4.
-    gdn_inner_dim: int = 256
-    gdn_num_heads: int = 4
-
+    # Pure recurrent CfC stack (no attention blocks).
     cfc_units: int = 512
     cfc_backbone_units: int = 384
     cfc_backbone_layers: int = 2
 
-    gqa_num_heads: int = 8
-    gqa_groups: int = 4
-
-    # Trainer compatibility gate (lets Trainer pass onset_times without modification).
+    # Trainer compatibility gate.
     use_v2_architecture: bool = True
 
 
-class _VariantABlock(nn.Module):
-    """One repeating Variant-A block: GDN -> GDN -> CfC -> GQA."""
+class _VariantDBlock(nn.Module):
+    """One repeating Variant-D block: CfC only."""
 
-    def __init__(self, cfg: VariantAConfig) -> None:
+    def __init__(self, cfg: VariantDConfig) -> None:
         super().__init__()
         d = int(cfg.d_model)
-
-        self.norm_gdn1 = nn.LayerNorm(d)
-        self.gdn1 = GatedDeltaNetBlock(
-            d_model=d,
-            inner_dim=int(cfg.gdn_inner_dim),
-            num_heads=int(cfg.gdn_num_heads),
-            dropout=float(cfg.dropout),
-        )
-
-        self.norm_gdn2 = nn.LayerNorm(d)
-        self.gdn2 = GatedDeltaNetBlock(
-            d_model=d,
-            inner_dim=int(cfg.gdn_inner_dim),
-            num_heads=int(cfg.gdn_num_heads),
-            dropout=float(cfg.dropout),
-        )
 
         self.norm_cfc = nn.LayerNorm(d)
         self.cfc = CfCBlock(
@@ -72,25 +47,12 @@ class _VariantABlock(nn.Module):
             dropout=float(cfg.dropout),
         )
 
-        kv_heads = max(1, int(cfg.gqa_num_heads) // max(1, int(cfg.gqa_groups)))
-        self.norm_gqa = nn.LayerNorm(d)
-        self.gqa = GQABlock(
-            d_model=d,
-            num_heads=int(cfg.gqa_num_heads),
-            num_kv_heads=kv_heads,
-            dropout=float(cfg.attention_dropout),
-        )
-
     def forward(
         self,
         x: torch.Tensor,
         cfc_hidden: Any,
         timespans: torch.Tensor,
-        position_offset: int,
     ) -> Tuple[torch.Tensor, Any]:
-        x = x + self.gdn1(self.norm_gdn1(x))
-        x = x + self.gdn2(self.norm_gdn2(x))
-
         cfc_in = self.norm_cfc(x)
         cfc_dtype = cfc_in.dtype
         cfc_x = cfc_in.float() if cfc_in.dtype != torch.float32 else cfc_in
@@ -108,17 +70,15 @@ class _VariantABlock(nn.Module):
         cfc_out = self.cfc.output_proj(cfc_out)
         cfc_out = self.cfc.dropout(cfc_out)
         x = x + cfc_out
-
-        x = x + self.gqa(self.norm_gqa(x), position_offset=int(max(0, position_offset)))
         return x, new_hidden
 
 
-class VariantAModel(nn.Module):
-    """Ablation Variant A model."""
+class VariantDModel(nn.Module):
+    """Ablation Variant D model (pure CfC recurrent stack)."""
 
-    def __init__(self, config: Optional[VariantAConfig] = None) -> None:
+    def __init__(self, config: Optional[VariantDConfig] = None) -> None:
         super().__init__()
-        self.config = config or VariantAConfig()
+        self.config = config or VariantDConfig()
         cfg = self.config
 
         self.vocab_size = int(cfg.vocab_size)
@@ -130,7 +90,7 @@ class VariantAModel(nn.Module):
         self.dropout = nn.Dropout(float(cfg.dropout))
 
         self.layers = nn.ModuleList(
-            [_VariantABlock(cfg) for _ in range(int(cfg.n_layers))]
+            [_VariantDBlock(cfg) for _ in range(int(cfg.n_layers))]
         )
 
         self.final_norm = nn.LayerNorm(self.d_model)
@@ -204,7 +164,9 @@ class VariantAModel(nn.Module):
         return torch.arange(0, vocab_size, dtype=torch.long)
 
     def _mask_logits_to_triplet_slot(
-        self, logits: torch.Tensor, slot: int
+        self,
+        logits: torch.Tensor,
+        slot: int,
     ) -> torch.Tensor:
         mask = torch.full_like(logits, fill_value=-float("inf"))
         allowed = self._allowed_ids_for_slot(slot, logits.shape[-1]).to(logits.device)
@@ -296,7 +258,6 @@ class VariantAModel(nn.Module):
                 x=x,
                 cfc_hidden=hidden_in[i],
                 timespans=timespans,
-                position_offset=int(max(0, position_offset)),
             )
             new_hidden.append(h)
 
@@ -365,7 +326,8 @@ class VariantAModel(nn.Module):
         for step in range(int(max_new_tokens)):
             next_slot = self._triplet_slot(int(tokens.shape[1]))
             masked_logits = self._mask_logits_to_triplet_slot(
-                logits[:, -1, :], next_slot
+                logits[:, -1, :],
+                next_slot,
             )
             next_token, diagnostics = sample_next_token(
                 logits=masked_logits,
@@ -472,7 +434,8 @@ class VariantAModel(nn.Module):
         for step in range(int(steps)):
             next_slot = self._triplet_slot(int(tokens.shape[1]))
             masked_logits = self._mask_logits_to_triplet_slot(
-                logits[:, -1, :], next_slot
+                logits[:, -1, :],
+                next_slot,
             )
             next_token, diagnostics = sample_next_token(
                 logits=masked_logits,
@@ -547,4 +510,4 @@ class VariantAModel(nn.Module):
         return result
 
 
-__all__ = ["VariantAConfig", "VariantAModel"]
+__all__ = ["VariantDConfig", "VariantDModel"]
