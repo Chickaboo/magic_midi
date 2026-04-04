@@ -225,7 +225,7 @@ cd app
 ./run.sh     # or run.bat on Windows
 ```
 
-## A/B/C/D Architecture Ablation
+## A/B/C/D/E Architecture Ablation
 
 For your current Godzilla research track, use these architecture labels consistently:
 
@@ -233,6 +233,7 @@ For your current Godzilla research track, use these architecture labels consiste
 2. `variant_b`: Transformer + CfC hybrid (novel)
 3. `variant_c`: pure attention Transformer baseline (control)
 4. `variant_d`: pure CfC recurrent baseline (no attention)
+5. `variant_e`: Gated Delta Net + sparse attention (no CfC)
 
 Run ablations in comparable small-model mode (10M-15M range per variant):
 
@@ -242,7 +243,7 @@ python -m training.ablation_runner \
   --pretokenized_root processed/godzilla_tokenized \
   --skip_generation \
   --output_dir outputs/godzilla_ablation \
-  --variants a,b,c,d \
+  --variants a,b,c,d,e \
   --size_mode balanced_small \
   --epochs 3 \
   --batch_size 4
@@ -256,7 +257,22 @@ Notes:
 - `variant_a` is auto-tuned at runtime to stay comparable whether real GDN kernels are available or fallback mode is active.
 - `variant_b` and `variant_c` stay near ~12M as fixed anchors for comparison.
 - `variant_d` is the pure-CfC baseline (balanced profile targets ~12M for fair comparison).
+- `variant_e` is auto-tuned at runtime in balanced mode and uses sparse attention anchors (every 2 layers, always final layer) without any CfC blocks.
 - On multi-GPU Kaggle runs, Trainer auto-disables DataParallel when real Variant-A GDN kernels are detected to avoid Triton replica autotuner crashes.
+
+To directly test the current champion (`variant_c`) against the new no-CfC GDN contender:
+
+```bash
+python -m training.ablation_runner \
+  --pretokenized_manifest processed/godzilla_tokenized/metadata/manifest.json \
+  --pretokenized_root processed/godzilla_tokenized \
+  --skip_generation \
+  --output_dir outputs/godzilla_c_vs_e \
+  --variants c,e \
+  --size_mode balanced_small \
+  --epochs 3 \
+  --batch_size 4
+```
 
 If you want one shared shape across all variants, use `--size_mode shared --d_model ... --n_layers ...`.
 
@@ -287,7 +303,7 @@ Before long training runs, generate a readiness audit report:
 
 ```bash
 python tools/audit_ablation_readiness.py \
-  --variants a,b,c,d \
+  --variants a,b,c,d,e \
   --size_mode balanced_small \
   --pretokenized_manifest processed/godzilla_tokenized/metadata/manifest.json \
   --pretokenized_root processed/godzilla_tokenized \

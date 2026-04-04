@@ -98,8 +98,8 @@ class GatedDeltaNetBlock(nn.Module):
             self.using_fallback = True
             warnings.warn(
                 "flash-linear-attention GatedDeltaNet is unavailable; using fallback "
-                "approximation block for Variant A. Install `flash-linear-attention` "
-                "for true GDN behavior."
+                "approximation block for GDN-based variants. Install "
+                "`flash-linear-attention` for true GDN behavior."
             )
 
         self.post_dropout = nn.Dropout(float(dropout))

@@ -275,24 +275,34 @@ class CfCBlock(nn.Module):
                 return self.cfc(x)
             raise ValueError(f"Unsupported CfC timespan mode: {mode}")
 
+        cached_error: Optional[str] = None
         if self._timespan_call_mode is not None:
-            out = _call_mode(self._timespan_call_mode)
-            return self._normalize_cfc_output(out, hidden)
+            try:
+                out = _call_mode(self._timespan_call_mode)
+                return self._normalize_cfc_output(out, hidden)
+            except (TypeError, RuntimeError, ValueError) as exc:
+                # Cached signature can become invalid when a probe succeeded on
+                # batch-size=1 but fails on larger batches (common for 2D ts).
+                cached_error = f"cached({self._timespan_call_mode}): {exc}"
+                self._timespan_call_mode = None
 
         attempts = [
-            "hx_ts_2d",
             "hx_ts_3d",
-            "pos_ts_2d",
             "pos_ts_3d",
+            "hx_ts_2d",
+            "pos_ts_2d",
             "x_hidden",
             "x_hx",
             "x_only",
         ]
-        errors: list[str] = []
+        errors: list[str] = [cached_error] if cached_error is not None else []
         for mode in attempts:
             try:
                 out = _call_mode(mode)
-                self._timespan_call_mode = mode
+                # Avoid persisting fragile 2D timespan modes discovered with
+                # batch-size=1; they can fail later on larger training batches.
+                if not (mode in {"hx_ts_2d", "pos_ts_2d"} and int(x.shape[0]) == 1):
+                    self._timespan_call_mode = mode
                 return self._normalize_cfc_output(out, hidden)
             except (TypeError, RuntimeError, ValueError) as exc:
                 errors.append(f"{mode}: {exc}")

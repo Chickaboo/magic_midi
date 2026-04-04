@@ -22,6 +22,7 @@ try:
     from model.variant_b import VariantBConfig, VariantBModel
     from model.variant_c import VariantCConfig, VariantCModel
     from model.variant_d import VariantDConfig, VariantDModel
+    from model.variant_e import VariantEConfig, VariantEModel
     from training.trainer import Trainer
     from utils.logging_utils import get_project_logger
 except ModuleNotFoundError:
@@ -35,6 +36,7 @@ except ModuleNotFoundError:
     from model.variant_b import VariantBConfig, VariantBModel
     from model.variant_c import VariantCConfig, VariantCModel
     from model.variant_d import VariantDConfig, VariantDModel
+    from model.variant_e import VariantEConfig, VariantEModel
     from training.trainer import Trainer
     from utils.logging_utils import get_project_logger
 
@@ -46,6 +48,7 @@ ARCHITECTURE_LABELS: Dict[str, str] = {
     "variant_b": "transformer_cfc_hybrid",
     "variant_c": "pure_attention_transformer_baseline",
     "variant_d": "pure_cfc_recurrent_baseline",
+    "variant_e": "gated_delta_sparse_attention_no_cfc",
 }
 
 BALANCED_SMALL_PROFILES: Dict[str, Dict[str, int]] = {
@@ -54,6 +57,7 @@ BALANCED_SMALL_PROFILES: Dict[str, Dict[str, int]] = {
     "variant_b": {"d_model": 544, "n_layers": 5},
     "variant_c": {"d_model": 480, "n_layers": 4},
     "variant_d": {"d_model": 608, "n_layers": 8},
+    "variant_e": {"d_model": 544, "n_layers": 6},
 }
 
 
@@ -601,6 +605,11 @@ def _parse_variants_arg(raw: str) -> List[str]:
         "variant_d": "variant_d",
         "pure_cfc": "variant_d",
         "cfc_only": "variant_d",
+        "e": "variant_e",
+        "variant_e": "variant_e",
+        "gdn_no_cfc": "variant_e",
+        "gdn_sparse_attention": "variant_e",
+        "gdn_attention_lite": "variant_e",
     }
 
     seen = set()
@@ -619,7 +628,7 @@ def _parse_variants_arg(raw: str) -> List[str]:
         resolved.append(name)
 
     if not resolved:
-        raise ValueError("No variants selected. Use --variants a,b,c,d (or subset).")
+        raise ValueError("No variants selected. Use --variants a,b,c,d,e (or subset).")
     return resolved
 
 
@@ -693,7 +702,7 @@ def parse_args() -> argparse.Namespace:
         "--variants",
         type=str,
         default="a,b,c",
-        help="Comma-separated subset of variants to run. Example: a,b,c,d or c.",
+        help="Comma-separated subset of variants to run. Example: a,b,c,d,e or c,e.",
     )
     parser.add_argument(
         "--size_mode",
@@ -928,6 +937,20 @@ def main() -> None:
                     cfc_backbone_units=cfc_backbone_units,
                 )
             )
+        elif name == "variant_e":
+            model = VariantEModel(
+                VariantEConfig(
+                    vocab_size=tokenizer.vocab_size,
+                    d_model=d_model,
+                    n_layers=n_layers,
+                    max_sequence_length=data_cfg.max_sequence_length,
+                    gdn_inner_dim=gdn_inner_dim,
+                    gdn_num_heads=gdn_heads,
+                    gqa_num_heads=attn_heads,
+                    gqa_groups=gqa_groups,
+                    attention_every_n_layers=2,
+                )
+            )
         else:
             raise ValueError(f"Unsupported variant {name}")
 
@@ -1007,15 +1030,82 @@ def main() -> None:
                 int(original_profile["n_layers"]),
             )
 
+    if str(args.size_mode) == "balanced_small" and "variant_e" in selected_variants:
+        baseline_params: List[int] = []
+        for baseline_name in ("variant_b", "variant_c"):
+            if baseline_name not in selected_variants:
+                continue
+            baseline_model, _ = _build_variant(baseline_name)
+            baseline_params.append(int(sum(p.numel() for p in baseline_model.parameters())))
+            del baseline_model
+
+        target_params = (
+            int(sum(baseline_params) / len(baseline_params))
+            if baseline_params
+            else 12_000_000
+        )
+        original_profile = dict(variant_profiles["variant_e"])
+
+        candidates: List[Tuple[Tuple[int, int, int, int], Dict[str, int], int]] = []
+        for d_model in range(448, 641, 32):
+            for n_layers in (4, 5, 6, 7, 8):
+                variant_profiles["variant_e"] = {
+                    "d_model": int(d_model),
+                    "n_layers": int(n_layers),
+                }
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        cand_model, _ = _build_variant("variant_e")
+                    params = int(sum(p.numel() for p in cand_model.parameters()))
+                    del cand_model
+                except Exception:
+                    continue
+
+                in_budget = 10_000_000 <= params <= 15_000_000
+                score = (
+                    0 if in_budget else 1,
+                    abs(params - int(target_params)),
+                    abs(int(n_layers) - int(original_profile["n_layers"])),
+                    abs(int(d_model) - int(original_profile["d_model"])),
+                )
+                candidates.append(
+                    (
+                        score,
+                        {"d_model": int(d_model), "n_layers": int(n_layers)},
+                        int(params),
+                    )
+                )
+
+        if candidates:
+            candidates.sort(key=lambda x: x[0])
+            best_score, best_profile, best_params = candidates[0]
+            variant_profiles["variant_e"] = best_profile
+            LOGGER.info(
+                "Balanced-small Variant E auto-tuned: target=%.2fM -> chosen d_model=%d n_layers=%d (%.2fM, score=%s)",
+                float(target_params) / 1e6,
+                int(best_profile["d_model"]),
+                int(best_profile["n_layers"]),
+                float(best_params) / 1e6,
+                best_score,
+            )
+        else:
+            variant_profiles["variant_e"] = original_profile
+            LOGGER.warning(
+                "Could not auto-tune Variant E balanced-small profile; using default d_model=%d n_layers=%d.",
+                int(original_profile["d_model"]),
+                int(original_profile["n_layers"]),
+            )
+
     variants: List[Tuple[str, torch.nn.Module, Dict[str, int], Dict[str, bool]]] = []
     param_by_variant: Dict[str, int] = {}
     for name in selected_variants:
         model, shape_meta = _build_variant(name)
         backend_status = _variant_backend_status(model)
-        if name == "variant_a" and bool(args.require_real_gdn):
+        if name in {"variant_a", "variant_e"} and bool(args.require_real_gdn):
             if backend_status["gdn_using_fallback"]:
                 raise RuntimeError(
-                    "Variant A is using fallback GDN. Install flash-linear-attention or run without --require_real_gdn."
+                    "Selected GDN variant is using fallback GDN. Install flash-linear-attention or run without --require_real_gdn."
                 )
 
         params = int(sum(p.numel() for p in model.parameters()))
