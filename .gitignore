@@ -45,6 +45,10 @@ generated/
 *.mid
 *.midi
 
+# Keep one seed MIDI tracked at repo root
+!/bluebird.mid
+!/Bluebird.mid
+
 # Local cache
 .session_cache/
 session_cache/

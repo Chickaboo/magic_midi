@@ -482,7 +482,8 @@ class Trainer:
             running_count += 1
 
             if (
-                self.global_step > 0
+                should_step
+                and self.global_step > 0
                 and self.global_step % 100 == 0
                 and running_count > 0
             ):
