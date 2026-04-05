@@ -31,7 +31,7 @@ from utils.config_compat import normalize_model_config_payload
 
 
 ROOT = Path(__file__).resolve().parent
-LOCAL_CKPT = ROOT / "local_drive" / "piano_model" / "checkpoints"
+LOCAL_CKPT = ROOT / "app" / "models"
 
 
 def _print_ok(label: str, payload: str) -> None:

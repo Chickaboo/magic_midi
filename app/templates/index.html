@@ -8,10 +8,31 @@
 </head>
 <body>
   <main class="shell">
-    <header class="header">
-      <h1>Itty Bitty Piano</h1>
-      <p>Seed MIDI in, continuation out.</p>
+    <header class="header hero">
+      <div>
+        <p class="eyebrow">Local CPU generation</p>
+        <h1>Itty Bitty Piano</h1>
+        <p class="lede">
+          Drop the Kaggle tokenizer and latest checkpoint into
+          <span>app/models + app/tokenizer</span>, then generate locally on CPU and
+          inspect the seed/output audio plus the MIDI map.
+        </p>
+      </div>
+      <div class="hero-status">
+        <span id="readyBadge" class="badge">Assessing local setup...</span>
+        <span id="tokenizerBadge" class="badge muted">Tokenizer unknown</span>
+      </div>
     </header>
+
+    <section class="panel assessment-panel">
+      <div class="panel-head">
+        <div>
+          <h2>Local Generation Assessment</h2>
+          <p id="assessmentSummary">Checking app assets and CPU preview support...</p>
+        </div>
+      </div>
+      <div id="assessmentGrid" class="assessment-grid"></div>
+    </section>
 
     <section class="panel">
       <form id="generateForm" enctype="multipart/form-data">
@@ -34,8 +55,8 @@
 
           <label class="field">
             <span>Length (new tokens)</span>
-            <input id="length" name="length" type="range" min="64" max="2048" step="64" value="512">
-            <em id="lengthVal">512</em>
+            <input id="length" name="length" type="range" min="32" max="1536" step="32" value="384">
+            <em id="lengthVal">384</em>
           </label>
 
           <label class="field">
@@ -53,9 +74,47 @@
 
         <div class="actions">
           <button id="generateBtn" type="submit">Generate</button>
-          <a id="downloadBtn" class="button ghost disabled" href="#" download>Download MIDI</a>
         </div>
       </form>
+    </section>
+
+    <section class="panel preview-panel" id="previewPanel">
+      <div class="panel-head">
+        <div>
+          <h2>Audio and MIDI Preview</h2>
+          <p>Rendered from the uploaded seed and the generated continuation.</p>
+        </div>
+      </div>
+
+      <div class="preview-grid">
+        <article class="preview-card">
+          <div class="card-head">
+            <h3>Seed Audio</h3>
+            <span class="chip">Input</span>
+          </div>
+          <audio id="seedAudio" controls preload="none"></audio>
+          <p class="card-note">The uploaded MIDI rendered with the built-in CPU preview synth.</p>
+        </article>
+
+        <article class="preview-card">
+          <div class="card-head">
+            <h3>Output Audio</h3>
+            <span class="chip accent">Output</span>
+          </div>
+          <audio id="outputAudio" controls preload="none"></audio>
+          <div class="actions compact">
+            <a id="downloadBtn" class="button ghost disabled" href="#" download>Download MIDI</a>
+          </div>
+        </article>
+      </div>
+
+      <article class="preview-card visual-card">
+        <div class="card-head">
+          <h3>MIDI Map</h3>
+          <span class="chip muted">Pianoroll</span>
+        </div>
+        <img id="midiMapImage" alt="Generated MIDI pianoroll preview">
+      </article>
     </section>
 
     <section class="panel status">

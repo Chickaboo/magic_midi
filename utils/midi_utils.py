@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import wave
 import warnings
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -21,6 +22,44 @@ def midi_duration(midi_path: str | Path) -> float:
 
     midi = pretty_midi.PrettyMIDI(str(midi_path))
     return float(midi.get_end_time())
+
+
+def render_midi_audio(
+    midi_path: str | Path,
+    wav_path: str | Path,
+    *,
+    sample_rate: int = 22050,
+) -> Path:
+    """Render a MIDI file to a small WAV preview using pretty_midi's built-in synth."""
+
+    midi = pretty_midi.PrettyMIDI(str(midi_path))
+    try:
+        waveform = midi.synthesize(fs=int(sample_rate))
+    except Exception:
+        duration = max(0.5, float(midi.get_end_time()))
+        waveform = np.zeros(int(duration * int(sample_rate)), dtype=np.float32)
+
+    waveform = np.asarray(waveform, dtype=np.float32)
+    if waveform.ndim == 2:
+        waveform = waveform.mean(axis=1)
+    if waveform.size == 0:
+        waveform = np.zeros(int(sample_rate * 0.5), dtype=np.float32)
+
+    peak = float(np.max(np.abs(waveform))) if waveform.size else 0.0
+    if peak > 0:
+        waveform = 0.95 * waveform / peak
+
+    pcm16 = np.clip(waveform, -1.0, 1.0)
+    pcm16 = (pcm16 * 32767.0).astype(np.int16)
+
+    out_path = Path(wav_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(out_path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(int(sample_rate))
+        wav_file.writeframes(pcm16.tobytes())
+    return out_path
 
 
 def _extract_note_events(midi_path: str | Path) -> List[Tuple[float, float, int, int]]:

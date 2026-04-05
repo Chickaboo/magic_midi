@@ -355,14 +355,21 @@ def _build_dataloaders(
     train_generator = torch.Generator()
     train_generator.manual_seed(int(seed))
 
+    num_workers = int(getattr(train_cfg, "_force_num_workers", 0))
+    if num_workers < 0:
+        num_workers = 0
+    persistent_workers = num_workers > 0
+
     loader_kwargs = {
         "batch_size": int(train_cfg.batch_size),
-        "num_workers": 0,
+        "num_workers": int(num_workers),
         "pin_memory": bool(use_cuda),
-        "persistent_workers": False,
+        "persistent_workers": bool(persistent_workers),
         "collate_fn": PianoDataset.collate_fn,
         "drop_last": False,
     }
+    if persistent_workers:
+        loader_kwargs["prefetch_factor"] = 2
 
     train_loader = DataLoader(
         train_ds,

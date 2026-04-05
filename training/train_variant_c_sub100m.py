@@ -368,6 +368,15 @@ def main() -> None:
         LOGGER.info("Detected CUDA GPUs (%d): %s", gpu_count, gpu_names)
         if gpu_count > 1 and not bool(args.disable_data_parallel):
             LOGGER.info("Variant C will use DataParallel across available GPUs.")
+            if int(args.batch_size) < int(gpu_count):
+                LOGGER.warning(
+                    "batch_size=%d is smaller than detected gpu_count=%d. "
+                    "DataParallel will leave some GPUs idle. "
+                    "Set --batch_size >= %d to utilize all GPUs.",
+                    int(args.batch_size),
+                    int(gpu_count),
+                    int(gpu_count),
+                )
 
     checkpoint_dir = output_dir / "checkpoints" / f"variant_c_{str(args.size_preset).lower()}"
     train_cfg = _build_train_config(

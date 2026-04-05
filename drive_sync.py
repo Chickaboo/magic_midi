@@ -24,15 +24,24 @@ class DriveSync:
 
         root = Path(drive_root)
         drive_root_norm = str(drive_root).replace("\\", "/")
+        use_app_layout = False
         if not self.in_colab and drive_root_norm.startswith("/content/drive"):
-            root = Path.cwd() / "local_drive" / "piano_model"
+            root = Path.cwd() / "app"
+            use_app_layout = True
 
         self.drive_root = root
-        self.checkpoints_dir = self.drive_root / "checkpoints"
-        self.logs_dir = self.drive_root / "logs"
-        self.tokenizer_dir = self.drive_root / "tokenizer"
-        self.processed_dir = self.drive_root / "processed"
-        self.generated_dir = self.drive_root / "generated"
+        if use_app_layout:
+            self.checkpoints_dir = self.drive_root / "models"
+            self.logs_dir = self.drive_root / "runtime" / "logs"
+            self.tokenizer_dir = self.drive_root / "tokenizer"
+            self.processed_dir = self.drive_root / "runtime" / "processed"
+            self.generated_dir = self.drive_root / "runtime" / "generated"
+        else:
+            self.checkpoints_dir = self.drive_root / "checkpoints"
+            self.logs_dir = self.drive_root / "logs"
+            self.tokenizer_dir = self.drive_root / "tokenizer"
+            self.processed_dir = self.drive_root / "processed"
+            self.generated_dir = self.drive_root / "generated"
 
         self.local_root = (
             Path("/content") if self.in_colab else Path.cwd() / ".session_cache"

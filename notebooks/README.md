@@ -12,6 +12,9 @@ This folder now contains the active, current notebooks for sub-100M quality vali
   - GDN Variant E workflow for short T4 runs.
   - Includes auto-resume checkpoint support and optional fallback GDN mode.
   - Auto-builds a manifest from NPZ files if one is missing.
+- 03_colab_bluebird_generation.ipynb
+  - Google Colab GPU generation notebook for Bluebird continuation runs.
+  - Uses `requirements_colab.txt`, app-only assets, and shorter token budgets for faster turnaround.
 
 ## Legacy notebooks
 

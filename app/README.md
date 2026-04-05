@@ -8,18 +8,31 @@ This is the web inference app for Itty Bitty Piano.
 - `app/templates/index.html` - UI.
 - `app/static/*` - styles and client logic.
 - `app/models/` - place checkpoint files here.
-- `app/tokenizer/tokenizer.json` - tokenizer loaded relative to app directory.
-- `app/runtime/outputs/` - generated MIDI outputs.
+- `app/tokenizer/` - place tokenizer JSON files here.
+- `app/runtime/outputs/` - generated MIDI, WAV previews, and pianoroll PNGs.
 
 ## Features
 
-- dark minimal interface with drag/drop seed upload,
+- dark dashboard UI with drag/drop seed upload,
 - model selector from `app/models/`,
+- CPU-first local generation using the pasted checkpoint/tokenizer pair,
+- automatic custom-tokenizer detection for Kaggle `custom_delta` checkpoints,
 - sliders: temperature, length, top-p, top-k,
-- generate endpoint uses shared `PianoHybridModel.generate()` + `model/sampling.py`,
-- DataParallel key stripping on checkpoint load,
-- generation health check + repetition warning if >60% token share,
-- downloadable continuation MIDI.
+- output MIDI download plus rendered seed/output audio previews,
+- pianoroll comparison image for the generated continuation,
+- generation health check + repetition warning when available.
+
+## Asset Workflow
+
+Copy the latest Kaggle artifacts into the app folders before starting the app:
+
+- `app/models/latest.safetensors`
+- `app/models/latest_state.pt`
+- `app/tokenizer/custom_tokenizer.json`
+
+If you use a plain MidiTok tokenizer instead, place it in `app/tokenizer/tokenizer.json`.
+
+The app loads checkpoints/tokenizers directly from these app folders, so you can swap in fresh artifacts without rebuilding the app package.
 
 ## Setup (Linux/macOS)
 

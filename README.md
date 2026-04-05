@@ -219,8 +219,17 @@ Features:
 
 - seed MIDI upload
 - checkpoint selection from `app/models/`
+- CPU-first local generation from the checkpoint/tokenizer pair you place into `app/models/` and `app/tokenizer/`
 - sampling controls (temperature/top-p/top-k/length)
 - downloadable generated MIDI
+- rendered seed/output audio previews
+- pianoroll comparison image for the generated continuation
+
+App asset drop-in files:
+
+- `app/models/latest.safetensors`
+- `app/models/latest_state.pt`
+- `app/tokenizer/custom_tokenizer.json`
 
 Run locally:
 
