@@ -205,6 +205,8 @@ Active notebooks:
 - `notebooks/01_t4_variant_c_sub100m.ipynb`
 - `notebooks/02_t4_variant_e_sub100m.ipynb`
 
+Both active notebooks can auto-build a fresh manifest from NPZ files when the dataset does not include `manifest.json`.
+
 Legacy notebooks were moved to:
 
 - `notebooks/archive/legacy_2026-04-04/`
