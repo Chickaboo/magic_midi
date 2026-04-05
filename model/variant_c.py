@@ -13,7 +13,7 @@ from model.sampling import sample_next_token
 
 @dataclass
 class VariantCConfig:
-    vocab_size: int = 155
+    vocab_size: int = 171
     d_model: int = 512
     n_layers: int = 4
     max_sequence_length: int = 1024
@@ -140,7 +140,7 @@ class VariantCModel(nn.Module):
 
     @staticmethod
     def _triplet_slot(index: int) -> int:
-        return int(index % 3)
+        return int(index % 4)
 
     @staticmethod
     def _allowed_ids_for_slot(slot: int, vocab_size: int) -> torch.Tensor:
@@ -150,6 +150,8 @@ class VariantCModel(nn.Module):
             return torch.arange(32, 120, dtype=torch.long)
         if slot == 2:
             return torch.arange(120, 152, dtype=torch.long)
+        if slot == 3:
+            return torch.arange(152, 168, dtype=torch.long)
         return torch.arange(0, vocab_size, dtype=torch.long)
 
     def _mask_logits_to_triplet_slot(
@@ -303,7 +305,7 @@ class VariantCModel(nn.Module):
                 top_k=top_k,
                 repetition_penalty=repetition_penalty,
                 recent_window=repetition_window,
-                min_tokens_to_keep=max(3, min_tokens_to_keep),
+                min_tokens_to_keep=max(4, min_tokens_to_keep),
                 top1_cap=0.95,
             )
 
@@ -389,7 +391,7 @@ class VariantCModel(nn.Module):
                 top_k=top_k,
                 repetition_penalty=repetition_penalty,
                 recent_window=repetition_window,
-                min_tokens_to_keep=max(3, min_tokens_to_keep),
+                min_tokens_to_keep=max(4, min_tokens_to_keep),
                 top1_cap=top1_threshold,
             )
 

@@ -119,8 +119,8 @@ class SourceIndex:
     members: List[str]
 
 
-class SymusicTripletTokenizer:
-    """Symusic parser + triplet quantizer compatible with CustomDeltaTokenizer bins."""
+class SymusicEventTokenizer:
+    """Symusic parser + event-quad quantizer compatible with CustomDeltaTokenizer bins."""
 
     DELTA_START = 0
     DELTA_END = 31
@@ -128,6 +128,8 @@ class SymusicTripletTokenizer:
     PITCH_END = 119
     DUR_START = 120
     DUR_END = 151
+    VEL_START = 152
+    VEL_END = 167
 
     def __init__(self) -> None:
         self.delta_bins = np.concatenate(
@@ -161,17 +163,23 @@ class SymusicTripletTokenizer:
         clamped = int(max(21, min(108, int(pitch))))
         return int(self.PITCH_START + (clamped - 21))
 
+    def _quantize_velocity(self, velocity: int) -> int:
+        clamped = int(max(0, min(127, int(velocity))))
+        idx = int(round((float(clamped) / 127.0) * 15.0))
+        idx = max(0, min(15, idx))
+        return int(self.VEL_START + idx)
+
     def parse_events(
         self,
         midi_bytes: bytes,
         strict_piano: bool = True,
-    ) -> Optional[List[Tuple[float, int, float]]]:
+    ) -> Optional[List[Tuple[float, int, float, int]]]:
         try:
             score = Score.from_midi(midi_bytes, ttype="second")
         except Exception:
             return None
 
-        events: List[Tuple[float, int, float]] = []
+        events: List[Tuple[float, int, float, int]] = []
         if len(score.tracks) == 0:
             return None
 
@@ -190,31 +198,37 @@ class SymusicTripletTokenizer:
                     continue
                 onset = float(max(0.0, float(note.time)))
                 duration = float(max(1e-4, float(note.duration)))
-                events.append((onset, pitch, duration))
+                velocity = int(max(0, min(127, int(note.velocity))))
+                events.append((onset, pitch, duration, velocity))
 
-        events.sort(key=lambda x: (x[0], x[1], x[2]))
+        events.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
         return events
 
     def encode_events(
         self,
-        events: List[Tuple[float, int, float]],
+        events: List[Tuple[float, int, float, int]],
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         token_ids: List[int] = []
         onset_times: List[float] = []
         durations: List[float] = []
         prev_onset = 0.0
 
-        for onset, pitch, duration in events:
+        for onset, pitch, duration, velocity in events:
             delta = float(max(0.0, onset - prev_onset))
             prev_onset = onset
 
             d_tok = self._quantize_delta(delta)
             p_tok = self._quantize_pitch(pitch)
             u_tok = self._quantize_duration(duration)
+            v_tok = self._quantize_velocity(velocity)
 
-            token_ids.extend([d_tok, p_tok, u_tok])
-            onset_times.extend([float(onset), float(onset), float(onset)])
-            durations.extend([float(duration), float(duration), float(duration)])
+            token_ids.extend([d_tok, p_tok, u_tok, v_tok])
+            onset_times.extend(
+                [float(onset), float(onset), float(onset), float(onset)]
+            )
+            durations.extend(
+                [float(duration), float(duration), float(duration), float(duration)]
+            )
 
         return (
             np.asarray(token_ids, dtype=np.int16),
@@ -308,7 +322,7 @@ def read_midi_bytes_from_tar(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Tokenize Godzilla MIDI locally into triplet .npz packs with resumable checkpoints."
+            "Tokenize Godzilla MIDI locally into event-quad .npz packs with resumable checkpoints."
         )
     )
     parser.add_argument(
@@ -443,8 +457,8 @@ def main() -> None:
 
     strict_piano = bool(args.strict_piano)
 
-    tokenizer = SymusicTripletTokenizer()
-    min_token_length = int(max(3, args.min_token_length))
+    tokenizer = SymusicEventTokenizer()
+    min_token_length = int(max(4, args.min_token_length))
     checkpoint_every = int(max(1, args.checkpoint_every))
     progress_every = int(max(1, args.progress_every))
     max_files = int(max(0, args.max_files))

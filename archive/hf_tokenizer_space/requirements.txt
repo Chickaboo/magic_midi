@@ -1,6 +1,0 @@
-symusic
-gradio>=5.50.0
-huggingface_hub>=0.20.0
-numpy
-safetensors
-audioop-lts==0.2.1; python_version >= "3.13"

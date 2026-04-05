@@ -200,11 +200,14 @@ Current local v2 `large_v2` measurement (fallback runtime): `102,884,834` params
 
 ## Kaggle Notebook
 
-Main notebook: `notebooks/00_kaggle_training.ipynb`
+Active notebooks:
 
-- set `SCALE = "large"` for v3 target runs
-- use dataset availability check cell before training
-- run `run_kaggle_session(scale=SCALE, max_epochs=MAX_EPOCHS)`
+- `notebooks/01_t4_variant_c_sub100m.ipynb`
+- `notebooks/02_t4_variant_e_sub100m.ipynb`
+
+Legacy notebooks were moved to:
+
+- `notebooks/archive/legacy_2026-04-04/`
 
 ## Web Inference App
 
@@ -282,12 +285,22 @@ Notes:
 
 ## Local Godzilla Tokenization (No Hugging Face)
 
-Use the local tokenizer runner to produce resumable triplet `.npz` packs and manifests:
+Use the local tokenizer runner to produce resumable event-quad `.npz` packs and manifests:
 
 ```bash
 python scripts/tokenize_godzilla_local.py \
   --source /path/to/Godzilla-Piano-MIDI-Dataset-CC-BY-NC-SA.tar.gz \
   --output-root processed/godzilla_tokenized \
+  --checkpoint-every 1000 \
+  --progress-every 200
+```
+
+Example SSD-to-SSD tokenization run:
+
+```bash
+python scripts/tokenize_godzilla_local.py \
+  --source "E:/datasets/godzilla-midi" \
+  --output-root "F:/tokenized/godzilla_full" \
   --checkpoint-every 1000 \
   --progress-every 200
 ```
@@ -299,6 +312,240 @@ Key outputs:
 
 The script supports resume by default; rerunning with the same source/output continues from the checkpoint.
 
+### Upload Tokenized Output to Kaggle
+
+From your local machine, package and publish your tokenized folder as a Kaggle dataset:
+
+```bash
+kaggle datasets init -p F:/tokenized/godzilla_full
+# edit F:/tokenized/godzilla_full/dataset-metadata.json
+kaggle datasets create -p F:/tokenized/godzilla_full
+```
+
+For later refreshes after re-tokenization:
+
+```bash
+kaggle datasets version -p F:/tokenized/godzilla_full -m "update tokenized corpus"
+```
+
+Keep both `data/` and `metadata/` in that Kaggle dataset so manifest-relative `.npz` paths resolve correctly.
+
+## Variant C/E Sub-100M Quality Validation (Kaggle)
+
+Use these dedicated runners to get fast musical-quality feedback before paid large-scale runs:
+
+- `training/train_variant_c_sub100m.py`
+- `training/train_variant_e_sub100m.py`
+
+Both runners default to:
+- `size_preset=80m`
+- `max_pieces=15000`
+- `seed_length=512`
+- `continuation_length=1536`
+- `max_sequence_length=2048`
+- `generation_max_new_tokens=8192`
+
+Resume support (new):
+
+- `--resume_from_checkpoint auto` to pick the latest checkpoint from this run's checkpoint dir.
+- `--resume_mode remaining` to treat `--epochs` as target total epoch count.
+- `--resume_mode additional` to run `--epochs` extra epochs after loading.
+
+Preset shapes:
+- Transformer C `40m`: `d_model=512`, `n_layers=12`, about `38.94M`
+- Transformer C `80m`: `d_model=640`, `n_layers=16`, about `80.16M`
+- GDN E `40m`: `d_model=768`, `n_layers=14`, about `40.98M`
+- GDN E `80m`: `d_model=1024`, `n_layers=16`, about `82.05M`
+
+### Transformer C (default 80m, 15k pieces)
+
+```bash
+python -m training.train_variant_c_sub100m \
+  --pretokenized_manifest /kaggle/input/<your-tokenized-dataset>/metadata/manifest.json \
+  --pretokenized_root /kaggle/input/<your-tokenized-dataset> \
+  --epochs 40 \
+  --seed 42
+```
+
+### GDN E (default 80m, 15k pieces)
+
+```bash
+python -m training.train_variant_e_sub100m \
+  --pretokenized_manifest /kaggle/input/<your-tokenized-dataset>/metadata/manifest.json \
+  --pretokenized_root /kaggle/input/<your-tokenized-dataset> \
+  --epochs 40 \
+  --seed 42
+```
+
+### Switch to 40m preset
+
+```bash
+python -m training.train_variant_c_sub100m \
+  --size_preset 40m \
+  --pretokenized_manifest /kaggle/input/<your-tokenized-dataset>/metadata/manifest.json \
+  --pretokenized_root /kaggle/input/<your-tokenized-dataset>
+```
+
+```bash
+python -m training.train_variant_e_sub100m \
+  --size_preset 40m \
+  --pretokenized_manifest /kaggle/input/<your-tokenized-dataset>/metadata/manifest.json \
+  --pretokenized_root /kaggle/input/<your-tokenized-dataset>
+```
+
+### Scale to 20k/50k pieces later
+
+```bash
+--max_pieces 20000
+```
+
+```bash
+--max_pieces 50000
+```
+
+## Variant C/E 150M Production Training (Kaggle)
+
+Use dedicated runners for large-scale quality comparisons between the two finalists:
+
+- `training/train_variant_c_150m.py`
+- `training/train_variant_e_150m.py`
+
+### Variant C (~149.4M, depth-fair)
+
+```bash
+python -m training.train_variant_c_150m \
+  --pretokenized_manifest /kaggle/input/<your-tokenized-dataset>/metadata/manifest.json \
+  --pretokenized_root /kaggle/input/<your-tokenized-dataset> \
+  --output_dir /kaggle/working/variant_c_150m \
+  --epochs 100 \
+  --batch_size 1 \
+  --grad_accumulation_steps 16 \
+  --learning_rate 2e-4 \
+  --seed 42
+```
+
+Default profile in `training/train_variant_c_150m.py`:
+- Variant: `variant_c`
+- Shape: `d_model=784`, `n_layers=20`, `num_attention_heads=8`
+- Expected params: about `149.4M` (`149,399,824`)
+- Closest valid depth-range match to the original E target (`149,822,400`) with `n_layers` in `[14, 20]`
+- DataParallel: enabled by default when multiple GPUs are available
+
+### Variant E (~151.2M after vocab/context expansion)
+
+```bash
+python -m training.train_variant_e_150m \
+  --pretokenized_manifest /kaggle/input/<your-tokenized-dataset>/metadata/manifest.json \
+  --pretokenized_root /kaggle/input/<your-tokenized-dataset> \
+  --output_dir /kaggle/working/variant_e_150m \
+  --epochs 100 \
+  --batch_size 1 \
+  --grad_accumulation_steps 16 \
+  --learning_rate 2e-4 \
+  --seed 42
+```
+
+Default profile in `training/train_variant_e_150m.py`:
+- Variant: `variant_e` (no CfC)
+- Shape: `d_model=1344`, `n_layers=17`
+- Expected params: about `151.2M` (`151,220,160`) with `vocab_size=171` and `max_sequence_length=2048`
+- Attention cadence: every 2 layers (plus final anchor by construction)
+- Real GDN kernels required by default (use `--allow_fallback_gdn` only for debugging)
+
+### Token Format (Quad)
+
+Tokenizer contract is now event-quads:
+- Event layout: `[delta_onset, pitch, duration, velocity_bin]`
+- Velocity bins: `0-15` mapped to token IDs `152-167`
+- Special IDs: `PAD=168`, `BOS=169`, `EOS=170`
+- Vocabulary: `171`
+
+### Kaggle Hardware Guidance
+
+- Variant C: prefer `2xT4` to use DataParallel throughput.
+- Variant E: prefer `P100` when running real GDN with default stability guard (single-GPU mode).
+- Use `2xT4` for E only if you intentionally override and validate DataParallel stability (`--allow_gdn_data_parallel`).
+
+Quickly benchmark current runtime throughput before long jobs:
+
+```bash
+python tools/benchmark_kaggle_throughput.py \
+  --variant c \
+  --d_model 784 \
+  --n_layers 20 \
+  --seq_len 2048 \
+  --batch_size 1 \
+  --steps 20 \
+  --use_data_parallel
+```
+
+```bash
+python tools/benchmark_kaggle_throughput.py \
+  --variant e \
+  --d_model 1344 \
+  --n_layers 17 \
+  --seq_len 2048 \
+  --batch_size 1 \
+  --steps 20
+```
+
+Compare `tokens_per_sec` across P100 and 2xT4 sessions, then choose hardware before starting 100-epoch runs.
+
+### Context and Long-Form Generation
+
+Both production runners default to 2K training context:
+- `--seed_length 512`
+- `--continuation_length 1536`
+- `--max_sequence_length 2048`
+
+You can still override context via:
+- `--seed_length`
+- `--continuation_length`
+- `--max_sequence_length`
+
+Examples:
+- 2K context: `--seed_length 512 --continuation_length 1536`
+- 4K context: `--seed_length 1024 --continuation_length 3072`
+
+Both runners also support longer sample export:
+- `--generation_max_new_tokens 8192`
+- `--generation_continuation_seconds 120`
+
+VRAM note for 2K context:
+- 2K roughly doubles activation memory versus 1K.
+- Keep `batch_size=1`; reduce effective batch by lowering `grad_accumulation_steps` only if you hit wall-clock limits.
+- On OOM, first reduce `d_model`/`n_layers` only as a last resort, since that changes the quality comparison.
+
+To export one sample MIDI after training, add:
+
+```bash
+--seed_midi /kaggle/input/<seed-dataset>/seed.mid
+```
+
+Before long runs, verify shape/forward with shared-size audits:
+
+```bash
+python tools/audit_ablation_readiness.py \
+  --variants c \
+  --size_mode shared \
+  --d_model 1248 \
+  --n_layers 8 \
+  --pretokenized_manifest /kaggle/input/<your-tokenized-dataset>/metadata/manifest.json \
+  --pretokenized_root /kaggle/input/<your-tokenized-dataset> \
+  --output /kaggle/working/ablation_audit_variant_c_150m.md
+```
+
+```bash
+python tools/audit_ablation_readiness.py \
+  --variants e \
+  --size_mode shared \
+  --d_model 1344 \
+  --n_layers 17 \
+  --pretokenized_manifest /kaggle/input/<your-tokenized-dataset>/metadata/manifest.json \
+  --pretokenized_root /kaggle/input/<your-tokenized-dataset> \
+  --output /kaggle/working/ablation_audit_variant_e_150m.md
+```
+
 Before long training runs, generate a readiness audit report:
 
 ```bash
@@ -309,10 +556,6 @@ python tools/audit_ablation_readiness.py \
   --pretokenized_root processed/godzilla_tokenized \
   --output outputs/ablation_audit_report.md
 ```
-
-## Archived Components
-
-The Hugging Face tokenizer Space implementation has been moved out of active workflow and archived under `archive/hf_tokenizer_space`.
 
 ## Notes
 

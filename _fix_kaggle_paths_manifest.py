@@ -395,9 +395,11 @@ def main() -> None:
 
                 max_start = int(token_seq.shape[0] - total_needed)
                 raw_start = self.rng.randint(0, max_start) if max_start > 0 else 0
-                start = self._snap_to_triplet_boundary(raw_start, max_start)
-                if start % 3 != 0:
-                    raise AssertionError(f"Triplet boundary violation: {start}")
+                start = self._snap_to_event_boundary(raw_start, max_start, self.event_size)
+                if self.event_size > 1 and (start % self.event_size) != 0:
+                    raise AssertionError(
+                        f"Event boundary violation: {start} not divisible by {self.event_size}"
+                    )
 
                 seed = token_seq[start : start + self.data_config.seed_length]
                 cont = token_seq[
@@ -424,7 +426,7 @@ def main() -> None:
         data_config = DataConfig(
             tokenizer_path="",
             processed_path=str(Path(DATA_DIR).resolve()),
-            vocab_size=155,
+            vocab_size=171,
             tokenization_strategy="custom_delta",
             seed_length=SEED_LENGTH,
             continuation_length=CONTINUATION_LENGTH,

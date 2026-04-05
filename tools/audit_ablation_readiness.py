@@ -179,7 +179,7 @@ def _build_variant(
     if variant_name == "variant_a":
         model = VariantAModel(
             VariantAConfig(
-                vocab_size=155,
+                vocab_size=171,
                 d_model=d_model,
                 n_layers=n_layers,
                 max_sequence_length=max_sequence_length,
@@ -193,7 +193,7 @@ def _build_variant(
     elif variant_name == "variant_b":
         model = VariantBModel(
             VariantBConfig(
-                vocab_size=155,
+                vocab_size=171,
                 d_model=d_model,
                 n_layers=n_layers,
                 max_sequence_length=max_sequence_length,
@@ -204,7 +204,7 @@ def _build_variant(
     elif variant_name == "variant_c":
         model = VariantCModel(
             VariantCConfig(
-                vocab_size=155,
+                vocab_size=171,
                 d_model=d_model,
                 n_layers=n_layers,
                 max_sequence_length=max_sequence_length,
@@ -214,7 +214,7 @@ def _build_variant(
     elif variant_name == "variant_d":
         model = VariantDModel(
             VariantDConfig(
-                vocab_size=155,
+                vocab_size=171,
                 d_model=d_model,
                 n_layers=n_layers,
                 max_sequence_length=max_sequence_length,
@@ -224,7 +224,7 @@ def _build_variant(
     elif variant_name == "variant_e":
         model = VariantEModel(
             VariantEConfig(
-                vocab_size=155,
+                vocab_size=171,
                 d_model=d_model,
                 n_layers=n_layers,
                 max_sequence_length=max_sequence_length,
@@ -388,7 +388,7 @@ def _variant_checks(
         # Quick forward smoke check.
         token_ids = torch.randint(
             low=0,
-            high=155,
+            high=171,
             size=(2, 96),
             dtype=torch.long,
             device=device,
@@ -412,7 +412,7 @@ def _variant_checks(
                 logits = out[0]
             else:
                 logits = out
-            ok = isinstance(logits, torch.Tensor) and tuple(logits.shape) == (2, 96, 155)
+            ok = isinstance(logits, torch.Tensor) and tuple(logits.shape) == (2, 96, 171)
             if ok:
                 checks.append(
                     CheckItem(

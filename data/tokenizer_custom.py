@@ -28,17 +28,20 @@ class _TokenSpec:
     pitch_end: int = 119
     duration_start: int = 120
     duration_end: int = 151
-    pad_id: int = 152
-    bos_id: int = 153
-    eos_id: int = 154
+    velocity_start: int = 152
+    velocity_end: int = 167
+    pad_id: int = 168
+    bos_id: int = 169
+    eos_id: int = 170
+    event_size: int = 4
 
     @property
     def vocab_size(self) -> int:
-        return 155
+        return 171
 
 
 class CustomDeltaTokenizer:
-    """Triplet tokenizer for solo piano: [delta_onset, pitch, duration]."""
+    """Quad tokenizer for solo piano: [delta_onset, pitch, duration, velocity_bin]."""
 
     def __init__(
         self,
@@ -69,9 +72,15 @@ class CustomDeltaTokenizer:
 
     @property
     def vocab_size(self) -> int:
-        """Return total vocabulary size (fixed at 155)."""
+        """Return total vocabulary size (fixed at 171)."""
 
         return self.spec.vocab_size
+
+    @property
+    def event_size(self) -> int:
+        """Return token group size for one note event."""
+
+        return int(self.spec.event_size)
 
     @property
     def pad_id(self) -> int:
@@ -106,11 +115,13 @@ class CustomDeltaTokenizer:
             "version": 1,
             "vocab_size": int(self.vocab_size),
             "default_velocity": int(self.default_velocity),
+            "event_size": int(self.event_size),
             "include_special_tokens": bool(self.include_special_tokens),
             "token_ids": {
                 "delta": [self.spec.delta_start, self.spec.delta_end],
                 "pitch": [self.spec.pitch_start, self.spec.pitch_end],
                 "duration": [self.spec.duration_start, self.spec.duration_end],
+                "velocity": [self.spec.velocity_start, self.spec.velocity_end],
                 "pad": self.spec.pad_id,
                 "bos": self.spec.bos_id,
                 "eos": self.spec.eos_id,
@@ -137,10 +148,10 @@ class CustomDeltaTokenizer:
             include_special_tokens=bool(payload.get("include_special_tokens", False)),
         )
 
-    def _note_events(self, midi_path: Path) -> List[Tuple[float, int, float]]:
+    def _note_events(self, midi_path: Path) -> List[Tuple[float, int, float, int]]:
         pretty_midi = _import_pretty_midi()
         midi = pretty_midi.PrettyMIDI(str(midi_path))
-        events: List[Tuple[float, int, float]] = []
+        events: List[Tuple[float, int, float, int]] = []
 
         for inst in midi.instruments:
             if inst.is_drum:
@@ -149,12 +160,13 @@ class CustomDeltaTokenizer:
                 onset = float(max(0.0, note.start))
                 duration = float(max(1e-4, note.end - note.start))
                 pitch = int(note.pitch)
+                velocity = int(max(0, min(127, int(note.velocity))))
                 if pitch < 21 or pitch > 108:
                     continue
-                events.append((onset, pitch, duration))
+                events.append((onset, pitch, duration, velocity))
 
-        # Deterministic ordering: onset -> pitch -> duration.
-        events.sort(key=lambda x: (x[0], x[1], x[2]))
+        # Deterministic ordering: onset -> pitch -> duration -> velocity.
+        events.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
         return events
 
     @staticmethod
@@ -176,6 +188,12 @@ class CustomDeltaTokenizer:
         pitch_i = int(max(21, min(108, pitch)))
         return int(self.spec.pitch_start + (pitch_i - 21))
 
+    def _quantize_velocity(self, velocity: int) -> int:
+        vel = int(max(0, min(127, int(velocity))))
+        bin_idx = int(round((float(vel) / 127.0) * 15.0))
+        bin_idx = max(0, min(15, bin_idx))
+        return int(self.spec.velocity_start + bin_idx)
+
     def _dequantize_delta(self, token_id: int) -> float:
         idx = int(token_id) - self.spec.delta_start
         idx = max(0, min(31, idx))
@@ -191,7 +209,12 @@ class CustomDeltaTokenizer:
         idx = max(0, min(87, idx))
         return int(21 + idx)
 
-    def _encode_triplets(
+    def _dequantize_velocity(self, token_id: int) -> int:
+        idx = int(token_id) - self.spec.velocity_start
+        idx = max(0, min(15, idx))
+        return int(round((float(idx) / 15.0) * 127.0))
+
+    def _encode_events(
         self,
         midi_path: Path,
     ) -> Tuple[List[int], List[float], List[float]]:
@@ -207,18 +230,23 @@ class CustomDeltaTokenizer:
             onset_times.append(0.0)
             durations.append(1e-4)
 
-        for onset, pitch, duration in events:
+        for onset, pitch, duration, velocity in events:
             delta = float(max(0.0, onset - prev_onset))
             prev_onset = onset
 
             d_tok = self._quantize_delta(delta)
             p_tok = self._quantize_pitch(pitch)
             u_tok = self._quantize_duration(duration)
-            token_ids.extend([d_tok, p_tok, u_tok])
+            v_tok = self._quantize_velocity(velocity)
+            token_ids.extend([d_tok, p_tok, u_tok, v_tok])
 
-            # Repeat onset/duration for all 3 tokens in the triplet.
-            onset_times.extend([float(onset), float(onset), float(onset)])
-            durations.extend([float(duration), float(duration), float(duration)])
+            # Repeat onset/duration for all 4 tokens in the event quad.
+            onset_times.extend(
+                [float(onset), float(onset), float(onset), float(onset)]
+            )
+            durations.extend(
+                [float(duration), float(duration), float(duration), float(duration)]
+            )
 
         if self.include_special_tokens:
             end_onset = float(onset_times[-1]) if onset_times else 0.0
@@ -234,9 +262,9 @@ class CustomDeltaTokenizer:
         return token_ids, onset_times, durations
 
     def encode(self, midi_path: Path) -> List[int]:
-        """Encode one MIDI file into flat delta/pitch/duration token IDs."""
+        """Encode one MIDI file into flat delta/pitch/duration/velocity token IDs."""
 
-        token_ids, _onsets, _durations = self._encode_triplets(Path(midi_path))
+        token_ids, _onsets, _durations = self._encode_events(Path(midi_path))
         return token_ids
 
     def encode_with_time_features(
@@ -245,7 +273,7 @@ class CustomDeltaTokenizer:
     ) -> Tuple[List[int], List[float], List[float]]:
         """Encode one MIDI and return token IDs + aligned onset/duration arrays."""
 
-        return self._encode_triplets(Path(midi_path))
+        return self._encode_events(Path(midi_path))
 
     def _is_delta(self, token_id: int) -> bool:
         return self.spec.delta_start <= int(token_id) <= self.spec.delta_end
@@ -255,6 +283,9 @@ class CustomDeltaTokenizer:
 
     def _is_duration(self, token_id: int) -> bool:
         return self.spec.duration_start <= int(token_id) <= self.spec.duration_end
+
+    def _is_velocity(self, token_id: int) -> bool:
+        return self.spec.velocity_start <= int(token_id) <= self.spec.velocity_end
 
     def _is_special(self, token_id: int) -> bool:
         token = int(token_id)
@@ -270,6 +301,8 @@ class CustomDeltaTokenizer:
             return [f"Pitch_{self._dequantize_pitch(token)}"]
         if self._is_duration(token):
             return [f"Duration_{self._dequantize_duration(token):.6f}"]
+        if self._is_velocity(token):
+            return [f"Velocity_{self._dequantize_velocity(token)}"]
         if token == self.spec.pad_id:
             return ["PAD_None"]
         if token == self.spec.bos_id:
@@ -308,29 +341,35 @@ class CustomDeltaTokenizer:
             if not self._is_delta(tok):
                 i += 1
                 continue
-            if i + 2 >= len(tokens):
+            if i + 3 >= len(tokens):
                 break
 
             p_tok = tokens[i + 1]
             d_tok = tokens[i + 2]
-            if (not self._is_pitch(p_tok)) or (not self._is_duration(d_tok)):
+            v_tok = tokens[i + 3]
+            if (
+                (not self._is_pitch(p_tok))
+                or (not self._is_duration(d_tok))
+                or (not self._is_velocity(v_tok))
+            ):
                 i += 1
                 continue
 
             delta = self._dequantize_delta(tok)
             pitch = self._dequantize_pitch(p_tok)
             duration = self._dequantize_duration(d_tok)
+            velocity = self._dequantize_velocity(v_tok)
 
             onset = float(max(0.0, onset + max(0.0, delta)))
             end = float(max(onset + 1e-4, onset + duration))
             note = pretty_midi.Note(
-                velocity=int(self.default_velocity),
+                velocity=int(velocity),
                 pitch=int(pitch),
                 start=float(onset),
                 end=float(end),
             )
             piano.notes.append(note)
-            i += 3
+            i += 4
 
         midi.instruments.append(piano)
 

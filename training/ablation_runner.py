@@ -271,12 +271,13 @@ class NpzWindowDataset(PianoDataset):
 
         max_start = int(token_seq.shape[0] - total_needed)
         raw_start = self.rng.randint(0, max_start) if max_start > 0 else 0
-        start = self._snap_to_triplet_boundary(raw_start, max_start)
+        start = self._snap_to_event_boundary(raw_start, max_start, self.event_size)
 
-        if start % 3 != 0:
+        if self.event_size > 1 and (start % self.event_size) != 0:
             raise AssertionError(
-                "Triplet boundary violation in dataset windowing: "
-                f"start={start} (raw_start={raw_start}) is not divisible by 3"
+                "Event boundary violation in dataset windowing: "
+                f"start={start} (raw_start={raw_start}) is not divisible by "
+                f"{self.event_size}"
             )
 
         seed = token_seq[start : start + self.data_config.seed_length]
@@ -423,7 +424,8 @@ def _generate_one_continuation(
     seed_midi: Path,
     output_path: Path,
     seed_length: int,
-    continuation_seconds: float = 30.0,
+    max_new_tokens: int = 8192,
+    continuation_seconds: float = 120.0,
 ) -> Dict[str, float]:
     try:
         import pretty_midi
@@ -434,18 +436,19 @@ def _generate_one_continuation(
     if not token_ids:
         raise RuntimeError(f"Seed MIDI tokenization produced no tokens: {seed_midi}")
 
+    event_size = int(getattr(tokenizer, "event_size", 3))
     seed_n = min(int(seed_length), len(token_ids))
-    seed_n = seed_n - (seed_n % 3)
-    if seed_n < 3:
+    seed_n = seed_n - (seed_n % max(1, event_size))
+    if seed_n < int(max(1, event_size)):
         raise RuntimeError(
-            "Seed MIDI is too short for triplet generation; need at least one full triplet."
+            "Seed MIDI is too short for generation; need at least one full event."
         )
     seed_tokens = token_ids[:seed_n]
     seed_onsets = onset_times[:seed_n]
 
     generated_ids = model.generate(
         seed_tokens=seed_tokens,
-        max_new_tokens=2048,
+        max_new_tokens=int(max(1, max_new_tokens)),
         temperature=0.9,
         top_p=0.95,
         top_k=50,
@@ -518,6 +521,10 @@ def _run_variant(
     val_manifest: List[Dict[str, object]],
     seed_midi: Optional[Path],
     output_midi_path: Optional[Path],
+    generation_max_new_tokens: int = 8192,
+    generation_continuation_seconds: float = 120.0,
+    resume_from_checkpoint: Optional[Path] = None,
+    resume_mode: str = "remaining",
 ) -> Dict[str, Any]:
     _set_global_seed(int(train_cfg.seed))
     train_loader, val_loader = _build_dataloaders(
@@ -537,7 +544,53 @@ def _run_variant(
         data_config=data_cfg,
         tokenizer=trainer_tokenizer,
     )
-    history = trainer.train()
+
+    resolved_resume_mode = str(resume_mode).strip().lower()
+    resumed_from_epoch = 0
+    epochs_ran_this_invocation = int(train_cfg.max_epochs)
+    resume_checkpoint_path = ""
+
+    if resume_from_checkpoint is not None:
+        if resolved_resume_mode not in {"remaining", "additional"}:
+            raise ValueError(
+                "resume_mode must be 'remaining' or 'additional'; "
+                f"got '{resume_mode}'."
+            )
+
+        resume_state = trainer.load_checkpoint(str(resume_from_checkpoint))
+        resumed_from_epoch = int(resume_state.get("epoch", 0))
+        epochs_requested = int(max(0, train_cfg.max_epochs))
+        if resolved_resume_mode == "remaining":
+            epochs_ran_this_invocation = max(0, epochs_requested - resumed_from_epoch)
+        else:
+            epochs_ran_this_invocation = epochs_requested
+
+        resume_checkpoint_path = str(Path(resume_from_checkpoint).resolve())
+        LOGGER.info(
+            "Resumed %s from %s at epoch=%d (mode=%s, epochs_to_run=%d)",
+            variant_name,
+            resume_checkpoint_path,
+            resumed_from_epoch,
+            resolved_resume_mode,
+            epochs_ran_this_invocation,
+        )
+
+        if epochs_ran_this_invocation > 0:
+            history = trainer.train_n_epochs(
+                n=int(epochs_ran_this_invocation),
+                start_epoch=int(resumed_from_epoch),
+            )
+        else:
+            LOGGER.info(
+                "No training steps scheduled for %s after resume (requested=%d, resumed_epoch=%d).",
+                variant_name,
+                epochs_requested,
+                resumed_from_epoch,
+            )
+            history = trainer.history
+    else:
+        resolved_resume_mode = "fresh"
+        history = trainer.train()
 
     core_model = trainer._unwrap_model()
     if seed_midi is not None and output_midi_path is not None:
@@ -547,7 +600,8 @@ def _run_variant(
             seed_midi=seed_midi,
             output_path=output_midi_path,
             seed_length=int(data_cfg.seed_length),
-            continuation_seconds=30.0,
+            max_new_tokens=int(max(1, generation_max_new_tokens)),
+            continuation_seconds=float(max(1.0, generation_continuation_seconds)),
         )
         output_midi = str(output_midi_path.resolve())
     else:
@@ -566,6 +620,13 @@ def _run_variant(
         "checkpoint_dir": str(Path(train_cfg.checkpoint_dir).resolve()),
         "output_midi": output_midi,
         "generation": generation_meta,
+        "resume": {
+            "enabled": bool(resume_from_checkpoint is not None),
+            "checkpoint": resume_checkpoint_path,
+            "mode": resolved_resume_mode,
+            "resumed_from_epoch": int(resumed_from_epoch),
+            "epochs_ran_this_invocation": int(epochs_ran_this_invocation),
+        },
     }
 
     del trainer
@@ -650,7 +711,7 @@ def _variant_backend_status(model: torch.nn.Module) -> Dict[str, bool]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run architecture ablation on custom triplet tokenizer data."
+        description="Run architecture ablation on custom event-tokenizer data."
     )
     parser.add_argument(
         "--data_dir",

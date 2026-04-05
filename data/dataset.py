@@ -78,9 +78,22 @@ class PianoDataset(Dataset):
         self.manifest = list(manifest)
         self.data_config = data_config
         self.rng = random.Random(seed)
+        self.event_size = self._resolve_event_size()
         self.min_required = (
             self.data_config.seed_length + self.data_config.continuation_length
         )
+
+        if self.event_size > 1:
+            if int(self.data_config.seed_length) % int(self.event_size) != 0:
+                raise ValueError(
+                    f"seed_length must be divisible by event size {self.event_size}, "
+                    f"got {self.data_config.seed_length}"
+                )
+            if int(self.data_config.continuation_length) % int(self.event_size) != 0:
+                raise ValueError(
+                    "continuation_length must be divisible by event size "
+                    f"{self.event_size}, got {self.data_config.continuation_length}"
+                )
 
         filtered_manifest: List[Dict[str, object]] = []
         for m in self.manifest:
@@ -145,12 +158,13 @@ class PianoDataset(Dataset):
 
         max_start = int(token_seq.shape[0] - total_needed)
         raw_start = self.rng.randint(0, max_start) if max_start > 0 else 0
-        start = self._snap_to_triplet_boundary(raw_start, max_start)
+        start = self._snap_to_event_boundary(raw_start, max_start, self.event_size)
 
-        if start % 3 != 0:
+        if self.event_size > 1 and (start % self.event_size) != 0:
             raise AssertionError(
-                "Triplet boundary violation in dataset windowing: "
-                f"start={start} (raw_start={raw_start}) is not divisible by 3"
+                "Event boundary violation in dataset windowing: "
+                f"start={start} (raw_start={raw_start}) is not divisible by "
+                f"{self.event_size}"
             )
 
         seed = token_seq[start : start + self.data_config.seed_length]
@@ -177,17 +191,27 @@ class PianoDataset(Dataset):
         }
 
     @staticmethod
-    def _snap_to_triplet_boundary(index: int, max_start: int) -> int:
-        """Snap a random index to nearest valid triplet boundary within bounds."""
+    def _snap_to_event_boundary(index: int, max_start: int, event_size: int) -> int:
+        """Snap index to nearest valid event boundary within bounds."""
+
+        if int(event_size) <= 1:
+            return int(max(0, min(index, max_start)))
 
         idx = int(max(0, min(index, max_start)))
-        lower = idx - (idx % 3)
-        upper = lower + 3
+        span = int(event_size)
+        lower = idx - (idx % span)
+        upper = lower + span
         if upper > max_start:
             return lower
         if (idx - lower) <= (upper - idx):
             return lower
         return upper
+
+    def _resolve_event_size(self) -> int:
+        strategy = str(getattr(self.data_config, "tokenization_strategy", "")).lower()
+        if strategy == "custom_delta":
+            return 4 if int(getattr(self.data_config, "vocab_size", 0)) >= 171 else 3
+        return 1
 
     @staticmethod
     def _load_time_feature_array(
