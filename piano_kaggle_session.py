@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import torch
-from safetensors.torch import load_file as safetensors_load_file
 
 from data.dataset import create_dataloaders
 from data.preprocess import MultiDatasetPreprocessor, preprocess_maestro
@@ -33,6 +32,7 @@ from training.trainer import (
     Trainer,
     rotate_kaggle_checkpoint_dir,
 )
+from utils import checkpoint_loading as ckpt_utils
 from utils.logging_utils import get_project_logger
 from utils.session_utils import SessionWatchdog, get_gpu_info
 
@@ -295,6 +295,87 @@ def _find_state_sidecar(model_path: Path) -> Optional[Path]:
     if latest_state.exists():
         return latest_state
     return None
+
+
+def _build_tokenizer_search_paths(
+    paths: Dict[str, str],
+    checkpoint_path: Path,
+) -> tuple[Path, ...]:
+    """Build ordered tokenizer search paths for inference-time checkpoint loading."""
+
+    candidates: list[Path] = []
+
+    configured_tokenizer = str(paths.get("tokenizer_path", "")).strip()
+    if configured_tokenizer:
+        configured_path = Path(configured_tokenizer)
+        candidates.append(configured_path.with_name("custom_tokenizer.json"))
+        candidates.append(configured_path.with_name("tokenizer.json"))
+        candidates.append(configured_path.expanduser())
+        candidates.append(configured_path)
+
+    candidates.append(checkpoint_path.parent / "custom_tokenizer.json")
+    candidates.append(checkpoint_path.parent / "tokenizer.json")
+
+    working_dir = str(paths.get("working_dir", "")).strip()
+    if working_dir:
+        tokenizer_dir = Path(working_dir) / "tokenizer"
+        candidates.append(tokenizer_dir / "custom_tokenizer.json")
+        candidates.append(tokenizer_dir / "tokenizer.json")
+
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+
+    return tuple(deduped)
+
+
+def _load_inference_assets(
+    checkpoint_path: Path,
+    paths: Dict[str, str],
+    device: torch.device,
+) -> tuple[torch.nn.Module, Any, Dict[str, Any]]:
+    """Load model and tokenizer for generation with strict checkpoint validation."""
+
+    sidecar_path = ckpt_utils.resolve_sidecar_path(checkpoint_path)
+    checkpoint_metadata = ckpt_utils.load_checkpoint_metadata(
+        model_path=checkpoint_path,
+        sidecar_path=sidecar_path,
+    )
+
+    tokenizer_search_paths = _build_tokenizer_search_paths(paths, checkpoint_path)
+    tokenizer, tokenizer_meta = ckpt_utils.load_tokenizer_for_checkpoint(
+        checkpoint_metadata=checkpoint_metadata,
+        search_paths=tokenizer_search_paths,
+    )
+
+    bundle = ckpt_utils.load_model_from_checkpoint(
+        model_path=checkpoint_path,
+        sidecar_path=sidecar_path,
+        device=device,
+        strict=True,
+    )
+
+    expected_vocab = int(bundle.model_config.get("vocab_size", tokenizer.vocab_size))
+    if int(tokenizer.vocab_size) != expected_vocab:
+        raise RuntimeError(
+            "Tokenizer/model vocab mismatch while loading checkpoint "
+            f"{checkpoint_path.name}: tokenizer vocab={tokenizer.vocab_size}, "
+            f"model vocab={expected_vocab}."
+        )
+
+    LOGGER.info(
+        "Loaded checkpoint %s with %s (missing=%d, unexpected=%d)",
+        checkpoint_path,
+        bundle.model_class,
+        bundle.missing_keys,
+        bundle.unexpected_keys,
+    )
+    return bundle.model, tokenizer, tokenizer_meta
 
 
 def _append_training_log(log_path: Path, record: Dict[str, Any]) -> None:
@@ -698,20 +779,10 @@ def generate_from_best_checkpoint(scale: str = "small") -> Path:
     _configure_mamba_backend()
     preset = get_preset(scale)
 
-    model_cfg = preset["model"]
     data_cfg = preset["data"]
     data_cfg.maestro_path = paths["maestro_root"]
     data_cfg.processed_path = paths["processed_dir"]
     data_cfg.tokenizer_path = paths["tokenizer_path"]
-
-    tokenizer_path = Path(data_cfg.tokenizer_path)
-    if not tokenizer_path.exists():
-        raise FileNotFoundError(
-            f"Tokenizer not found at {tokenizer_path}. Run run_kaggle_session first."
-        )
-    tokenizer = PianoTokenizer.load(str(tokenizer_path))
-    model_cfg.vocab_size = tokenizer.vocab_size
-    data_cfg.vocab_size = tokenizer.vocab_size
 
     checkpoint_dir = Path(paths["checkpoint_dir"])
     candidates = [
@@ -728,16 +799,15 @@ def generate_from_best_checkpoint(scale: str = "small") -> Path:
         )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_model(model_cfg)
-    state = safetensors_load_file(str(checkpoint_path), device="cpu")
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing:
-        LOGGER.info("Missing keys while loading checkpoint: %d", len(missing))
-    if unexpected:
-        LOGGER.info("Unexpected keys while loading checkpoint: %d", len(unexpected))
-
-    model.to(device)
-    model.eval()
+    model, tokenizer, tokenizer_meta = _load_inference_assets(
+        checkpoint_path=checkpoint_path,
+        paths=paths,
+        device=device,
+    )
+    data_cfg.vocab_size = int(tokenizer.vocab_size)
+    data_cfg.tokenizer_path = str(
+        tokenizer_meta.get("tokenizer_path", data_cfg.tokenizer_path)
+    )
 
     seed_path = _find_first_seed_midi(Path(paths["maestro_root"]))
     if seed_path is None:
@@ -786,20 +856,10 @@ def generate_from_seed_file(
     _configure_mamba_backend()
     preset = get_preset(scale)
 
-    model_cfg = preset["model"]
     data_cfg = preset["data"]
     data_cfg.maestro_path = paths["maestro_root"]
     data_cfg.processed_path = paths["processed_dir"]
     data_cfg.tokenizer_path = paths["tokenizer_path"]
-
-    tokenizer_path = Path(data_cfg.tokenizer_path)
-    if not tokenizer_path.exists():
-        raise FileNotFoundError(
-            f"Tokenizer not found at {tokenizer_path}. Run run_kaggle_session first."
-        )
-    tokenizer = PianoTokenizer.load(str(tokenizer_path))
-    model_cfg.vocab_size = tokenizer.vocab_size
-    data_cfg.vocab_size = tokenizer.vocab_size
 
     ckpt_dir = Path(paths["checkpoint_dir"])
     if checkpoint_path is None:
@@ -819,15 +879,15 @@ def generate_from_seed_file(
         )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_model(model_cfg)
-    state = safetensors_load_file(str(checkpoint_file), device="cpu")
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing:
-        LOGGER.info("Missing keys while loading checkpoint: %d", len(missing))
-    if unexpected:
-        LOGGER.info("Unexpected keys while loading checkpoint: %d", len(unexpected))
-    model.to(device)
-    model.eval()
+    model, tokenizer, tokenizer_meta = _load_inference_assets(
+        checkpoint_path=checkpoint_file,
+        paths=paths,
+        device=device,
+    )
+    data_cfg.vocab_size = int(tokenizer.vocab_size)
+    data_cfg.tokenizer_path = str(
+        tokenizer_meta.get("tokenizer_path", data_cfg.tokenizer_path)
+    )
 
     seed_path = Path(seed_path)
     if not seed_path.exists():

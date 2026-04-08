@@ -5,15 +5,13 @@ import os
 from pathlib import Path
 
 import torch
-from safetensors.torch import load_file as safetensors_load_file
 
-from config import DataConfig, ModelConfig
+from config import DataConfig
 from data.tokenizer import PianoTokenizer
 from data.tokenizer_custom import CustomDeltaTokenizer
 from generation.generate import GenerationConfig, generate_continuation
-from model.factory import build_model
+from utils import checkpoint_loading as ckpt_utils
 from utils.midi_utils import compare_pianorolls, render_midi_audio
-from utils.config_compat import normalize_model_config_payload
 
 
 ROOT = Path(__file__).resolve().parent
@@ -132,14 +130,28 @@ def main() -> None:
     output_path = OUTPUT_DIR / f"{seed_path.stem}_continuation.mid"
 
     state = torch.load(STATE_PATH, map_location="cpu")
-    model_cfg = ModelConfig(
-        **normalize_model_config_payload(dict(state["model_config"]))
-    )
-    data_cfg = DataConfig(**state["data_config"])
-    tokenizer = build_tokenizer_if_needed(data_cfg)
-    model_cfg.vocab_size = tokenizer.vocab_size
+    data_cfg_payload = dict(state.get("data_config") or {})
+    data_cfg = DataConfig(**data_cfg_payload)
+
+    checkpoint_metadata = {"data_config": data_cfg_payload}
+    try:
+        tokenizer, tokenizer_meta = ckpt_utils.load_tokenizer_for_checkpoint(
+            checkpoint_metadata,
+            search_paths=TOKENIZER_PATHS,
+        )
+        print(f"Loading tokenizer from {tokenizer_meta.get('tokenizer_path')}")
+    except FileNotFoundError:
+        tokenizer = build_tokenizer_if_needed(data_cfg)
+        tokenizer_meta = {
+            "tokenizer_path": str(
+                next((p for p in TOKENIZER_PATHS if p.exists()), TOKENIZER_PATHS[-1])
+            )
+        }
+
     data_cfg.vocab_size = tokenizer.vocab_size
-    data_cfg.tokenizer_path = str(next((p for p in TOKENIZER_PATHS if p.exists()), TOKENIZER_PATHS[-1]))
+    data_cfg.tokenizer_path = str(tokenizer_meta.get("tokenizer_path", "")).strip() or str(
+        next((p for p in TOKENIZER_PATHS if p.exists()), TOKENIZER_PATHS[-1])
+    )
     data_cfg.maestro_path = str(MAESTRO_ROOT)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -154,12 +166,17 @@ def main() -> None:
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    model = build_model(model_cfg)
-    model_state = safetensors_load_file(str(checkpoint_path), device="cpu")
-    missing, unexpected = model.load_state_dict(model_state, strict=False)
-    print(f"Missing keys: {len(missing)} | Unexpected keys: {len(unexpected)}")
-    model.to(device)
-    model.eval()
+    bundle = ckpt_utils.load_model_from_checkpoint(
+        model_path=checkpoint_path,
+        sidecar_path=STATE_PATH,
+        device=device,
+        strict=True,
+    )
+    model = bundle.model
+    print(f"Model class: {bundle.model_class}")
+    print(
+        f"Missing keys: {bundle.missing_keys} | Unexpected keys: {bundle.unexpected_keys}"
+    )
 
     max_new_tokens = _env_int(
         "IBP_MAX_NEW_TOKENS",

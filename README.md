@@ -202,13 +202,14 @@ Current local v2 `large_v2` measurement (fallback runtime): `102,884,834` params
 
 Active notebooks:
 
-- `notebooks/01_t4_variant_c_sub100m.ipynb`
-- `notebooks/02_t4_variant_e_sub100m.ipynb`
+- `notebooks/01_t4_sub100m_unified_variant_ce.ipynb`
+- `notebooks/03_colab_bluebird_generation.ipynb`
 
-Both active notebooks can auto-build a fresh manifest from NPZ files when the dataset does not include `manifest.json`.
+The unified sub-100M notebook can auto-build a fresh manifest from NPZ files when the dataset does not include `manifest.json`.
 
 Legacy notebooks were moved to:
 
+- `notebooks/archive/legacy_2026-04-06/`
 - `notebooks/archive/legacy_2026-04-04/`
 
 ## Web Inference App
@@ -296,12 +297,15 @@ Notes:
 
 ## Local Godzilla Tokenization (No Hugging Face)
 
-Use the local tokenizer runner to produce resumable event-quad `.npz` packs and manifests:
+Use the local tokenizer runner to produce resumable event-quad `.npz` packs and manifests.
+
+The tokenizer is frozen at spec version 1 and matches the exact event-quad tokenizer used by the 150M training runs and the 40M / 100k-piece sub-100M runs. Treat this as a one-time corpus pass: do not change token IDs, bin boundaries, or event size after tokenization starts.
 
 ```bash
 python scripts/tokenize_godzilla_local.py \
   --source /path/to/Godzilla-Piano-MIDI-Dataset-CC-BY-NC-SA.tar.gz \
   --output-root processed/godzilla_tokenized \
+  --workers 0 \
   --checkpoint-every 1000 \
   --progress-every 200
 ```
@@ -312,9 +316,15 @@ Example SSD-to-SSD tokenization run:
 python scripts/tokenize_godzilla_local.py \
   --source "E:/datasets/godzilla-midi" \
   --output-root "F:/tokenized/godzilla_full" \
+  --workers 0 \
   --checkpoint-every 1000 \
   --progress-every 200
 ```
+
+Performance notes:
+- Default output is uncompressed `.npz` for maximum throughput.
+- Use `--compress-output` only if you need smaller files and can tolerate slower tokenization.
+- If you already ran older versions against a `.tar/.tar.gz`, run once with `--start-over` to rebuild a consistent archive-order manifest.
 
 Key outputs:
 - `processed/godzilla_tokenized/data/*.npz`
@@ -322,6 +332,38 @@ Key outputs:
 - `processed/godzilla_tokenized/metadata/checkpoint.json`
 
 The script supports resume by default; rerunning with the same source/output continues from the checkpoint.
+
+### Stream Tokenization to Hugging Face in Batches
+
+If local storage is tight, run chunked tokenization to a temporary flash-drive folder,
+upload each chunk to a Hugging Face **dataset** repo, then delete the local chunk and continue.
+
+This workflow is implemented by:
+
+- `scripts/tokenize_upload_hf_batches.py`
+
+Recommended pattern (Windows PowerShell):
+
+```powershell
+$env:HF_TOKEN = "<your_hf_token>"
+python scripts/tokenize_upload_hf_batches.py \
+  --source "C:/datasets/godzilla-midi" \
+  --flash-root "F:/pulse88_tokenize_work" \
+  --repo-id "Chickaboo/Pulse88-data" \
+  --upload-prefix "tokenized/chunks" \
+  --chunk-members 100000 \
+  --workers 0 \
+  --checkpoint-every 2000 \
+  --progress-every 500
+```
+
+Notes:
+
+- The controller state is stored at `F:/pulse88_tokenize_work/_controller/state.json`.
+- Rerun the same command to resume from the saved `next_index`.
+- Use `--reset-state` to restart from a fresh index window.
+- Add `--allow-mixed-instruments` only if you intentionally want non-piano files.
+- Add `--keep-local` to keep each uploaded chunk on disk instead of deleting it.
 
 ### Upload Tokenized Output to Kaggle
 
@@ -343,75 +385,48 @@ Keep both `data/` and `metadata/` in that Kaggle dataset so manifest-relative `.
 
 ## Variant C/E Sub-100M Quality Validation (Kaggle)
 
-Use these dedicated runners to get fast musical-quality feedback before paid large-scale runs:
+Use the unified notebook for sub-100M architecture validation:
+
+- `notebooks/01_t4_sub100m_unified_variant_ce.ipynb`
+
+This notebook replaces the retired split scripts:
 
 - `training/train_variant_c_sub100m.py`
 - `training/train_variant_e_sub100m.py`
+- `training/retrain_sub100m_matrix.py`
 
-Both runners default to:
-- `size_preset=80m`
-- `max_pieces=15000`
-- `seed_length=512`
-- `continuation_length=1536`
-- `max_sequence_length=2048`
-- `generation_max_new_tokens=8192`
+Unified ~40M profile targets:
 
-Resume support (new):
+- Variant C: `d_model=512`, `n_layers=12`, `num_attention_heads=8`, `ffn_expansion=4` (~38.94M)
+- Variant E: `d_model=768`, `n_layers=13`, `attention_every_n_layers=2`, GDN inner ratio `0.5` (~38.92M)
 
-- `--resume_from_checkpoint auto` to pick the latest checkpoint from this run's checkpoint dir.
-- `--resume_mode remaining` to treat `--epochs` as target total epoch count.
-- `--resume_mode additional` to run `--epochs` extra epochs after loading.
+Recommended workflow for your larger pilot (100k pieces):
 
-Preset shapes:
-- Transformer C `40m`: `d_model=512`, `n_layers=12`, about `38.94M`
-- Transformer C `80m`: `d_model=640`, `n_layers=16`, about `80.16M`
-- GDN E `40m`: `d_model=768`, `n_layers=14`, about `40.98M`
-- GDN E `80m`: `d_model=1024`, `n_layers=16`, about `82.05M`
+1. Open `notebooks/01_t4_sub100m_unified_variant_ce.ipynb`.
+2. Set `VARIANT` to `"c"` or `"e"`.
+3. Keep `MAX_PIECES = 100_000` (or adjust).
+4. Set `RUN_TRAINING = True`.
+5. Run all cells top-to-bottom.
 
-### Transformer C (default 80m, 15k pieces)
+The notebook keeps:
 
-```bash
-python -m training.train_variant_c_sub100m \
-  --pretokenized_manifest /kaggle/input/<your-tokenized-dataset>/metadata/manifest.json \
-  --pretokenized_root /kaggle/input/<your-tokenized-dataset> \
-  --epochs 40 \
-  --seed 42
-```
+- automatic NPZ manifest creation
+- checkpoint auto-resume (`AUTO_RESUME` + optional `RESUME_FROM_CHECKPOINT`)
+- generation controls and result JSON export
+- identical preprocessing/training pipeline for both variants to keep comparisons fair
 
-### GDN E (default 80m, 15k pieces)
+Optional CLI (same unified backend used by the notebook):
 
 ```bash
-python -m training.train_variant_e_sub100m \
-  --pretokenized_manifest /kaggle/input/<your-tokenized-dataset>/metadata/manifest.json \
-  --pretokenized_root /kaggle/input/<your-tokenized-dataset> \
-  --epochs 40 \
-  --seed 42
-```
-
-### Switch to 40m preset
-
-```bash
-python -m training.train_variant_c_sub100m \
-  --size_preset 40m \
-  --pretokenized_manifest /kaggle/input/<your-tokenized-dataset>/metadata/manifest.json \
-  --pretokenized_root /kaggle/input/<your-tokenized-dataset>
-```
-
-```bash
-python -m training.train_variant_e_sub100m \
-  --size_preset 40m \
-  --pretokenized_manifest /kaggle/input/<your-tokenized-dataset>/metadata/manifest.json \
-  --pretokenized_root /kaggle/input/<your-tokenized-dataset>
-```
-
-### Scale to 20k/50k pieces later
-
-```bash
---max_pieces 20000
-```
-
-```bash
---max_pieces 50000
+python -m training.sub100m_unified \
+  --variant e \
+  --npz_root /kaggle/input/<your-tokenized-dataset>/data \
+  --output_dir /kaggle/working/sub100m_e_100k \
+  --max_pieces 100000 \
+  --epochs 20 \
+  --batch_size 1 \
+  --grad_accumulation_steps 32 \
+  --auto_resume
 ```
 
 ## Variant C/E 150M Production Training (Kaggle)

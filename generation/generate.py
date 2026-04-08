@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
 from pathlib import Path
+import tempfile
 from typing import Any, Dict, List, Sequence
 
 import torch
@@ -23,6 +25,8 @@ class GenerationConfig:
     repetition_window: int = 64
     min_tokens_to_keep: int = 3
     num_samples: int = 1
+    max_consecutive_zero_deltas: int = 8
+    save_continuation_only: bool = True
 
 
 def _unwrap_parallel_model(model: Any) -> Any:
@@ -111,6 +115,8 @@ def _generate_batched_sequences(
     final_top1_probs: List[float] = []
     raw_top1_probs: List[float] = []
     candidate_counts: List[int] = []
+    zero_delta_streaks = torch.zeros((batch_size,), dtype=torch.int32, device=device)
+    max_zero_delta = max(0, int(generation_config.max_consecutive_zero_deltas))
 
     for _ in range(int(generation_config.max_new_tokens)):
         context_tokens = tokens[:, -base_model.max_sequence_length :]
@@ -130,6 +136,14 @@ def _generate_batched_sequences(
             logits[:, -1, :],
             next_slot,
         )
+        if next_slot == 0 and max_zero_delta > 0 and masked_logits.shape[-1] > 1:
+            over_limit = zero_delta_streaks >= max_zero_delta
+            if bool(over_limit.any()):
+                valid_non_zero = torch.isfinite(masked_logits[:, 1:]).any(dim=-1)
+                rows = torch.where(over_limit & valid_non_zero)[0]
+                if rows.numel() > 0:
+                    masked_logits = masked_logits.clone()
+                    masked_logits[rows, 0] = float("-inf")
         next_token, diagnostics = sample_next_token(
             logits=masked_logits,
             context_tokens=context_tokens,
@@ -155,6 +169,12 @@ def _generate_batched_sequences(
         tokens = torch.cat([tokens, next_token], dim=1)
         slot = base_model._triplet_slot(int(tokens.shape[1] - 1))
         if slot == 0:
+            sampled = next_token.view(-1)
+            zero_delta_streaks = torch.where(
+                sampled == 0,
+                zero_delta_streaks + 1,
+                torch.zeros_like(zero_delta_streaks),
+            )
             delta_values = [
                 float(
                     max(
@@ -216,7 +236,17 @@ def generate_continuation(
             f"using the available seed length instead of configured {config.seed_length}."
         )
 
-    seed_tokens = tokens[: min(len(tokens), config.seed_length)]
+    seed_token_count = min(len(tokens), int(config.seed_length))
+    event_size = int(getattr(tokenizer, "event_size", 0) or 0)
+    if event_size > 0 and seed_token_count > 0:
+        aligned_count = seed_token_count - (seed_token_count % event_size)
+        if aligned_count > 0:
+            seed_token_count = aligned_count
+        else:
+            seed_token_count = min(len(tokens), event_size)
+
+    # Continue from the end of the seed clip instead of replaying the opening bars.
+    seed_tokens = tokens[-seed_token_count:]
     seed_onset_times = [
         float(i) * float(max(1e-4, config.time_feature_fallback_step_seconds))
         for i in range(len(seed_tokens))
@@ -232,10 +262,28 @@ def generate_continuation(
             token_ids, onset_times, _durations = tokenizer.encode_with_time_features(
                 seed_midi_path
             )
-            seed_tokens = token_ids[: min(len(token_ids), config.seed_length)]
-            seed_onset_times = onset_times[: len(seed_tokens)]
+            seed_token_count = min(len(token_ids), int(config.seed_length))
+            event_size = int(getattr(tokenizer, "event_size", 0) or 0)
+            if event_size > 0 and seed_token_count > 0:
+                aligned_count = seed_token_count - (seed_token_count % event_size)
+                if aligned_count > 0:
+                    seed_token_count = aligned_count
+                else:
+                    seed_token_count = min(len(token_ids), event_size)
+
+            seed_tokens = token_ids[-seed_token_count:]
+            seed_onset_times = onset_times[-len(seed_tokens):]
         except Exception:
             pass
+
+    prompt_duration: float | None = None
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prompt_path = Path(tmpdir) / "seed_prompt.mid"
+            tokenizer.decode(seed_tokens, prompt_path)
+            prompt_duration = midi_duration(prompt_path)
+    except Exception:
+        prompt_duration = None
 
     token_id_to_events = getattr(tokenizer, "decode_token_id_events", None)
     if not callable(token_id_to_events):
@@ -247,6 +295,16 @@ def generate_continuation(
             bind_tokenizer(tokenizer)
         except Exception:
             pass
+
+    generate_optional_kwargs: Dict[str, Any] = {}
+    try:
+        generate_params = inspect.signature(base_model.generate).parameters
+    except (TypeError, ValueError):
+        generate_params = {}
+    if "max_consecutive_zero_deltas" in generate_params:
+        generate_optional_kwargs["max_consecutive_zero_deltas"] = max(
+            0, int(generation_config.max_consecutive_zero_deltas)
+        )
 
     batch_supported = bool(
         generation_config.num_samples > 1
@@ -276,7 +334,15 @@ def generate_continuation(
             tokenizer.decode(generated_tokens, out_file)
             out_paths.append(out_file)
 
-            seed_dur = midi_duration(seed_midi_path)
+            if generation_config.save_continuation_only:
+                continuation_tokens = generated_tokens[len(seed_tokens) :]
+                if continuation_tokens:
+                    continuation_file = out_file.with_name(
+                        f"{out_file.stem}_new{out_file.suffix}"
+                    )
+                    tokenizer.decode(continuation_tokens, continuation_file)
+
+            seed_dur = prompt_duration if prompt_duration is not None else midi_duration(seed_midi_path)
             gen_dur = max(0.0, midi_duration(out_file) - seed_dur)
             total_dur = midi_duration(out_file)
             print(
@@ -302,6 +368,7 @@ def generate_continuation(
                     max(1e-4, config.time_feature_fallback_step_seconds)
                 ),
                 token_id_to_events=token_id_to_events,
+                **generate_optional_kwargs,
             )
         else:
             generated_tokens = base_model.generate(
@@ -313,6 +380,7 @@ def generate_continuation(
                 repetition_penalty=generation_config.repetition_penalty,
                 repetition_window=generation_config.repetition_window,
                 min_tokens_to_keep=generation_config.min_tokens_to_keep,
+                **generate_optional_kwargs,
             )
 
         out_file = output_path
@@ -324,7 +392,15 @@ def generate_continuation(
         tokenizer.decode(generated_tokens, out_file)
         out_paths.append(out_file)
 
-        seed_dur = midi_duration(seed_midi_path)
+        if generation_config.save_continuation_only:
+            continuation_tokens = generated_tokens[len(seed_tokens) :]
+            if continuation_tokens:
+                continuation_file = out_file.with_name(
+                    f"{out_file.stem}_new{out_file.suffix}"
+                )
+                tokenizer.decode(continuation_tokens, continuation_file)
+
+        seed_dur = prompt_duration if prompt_duration is not None else midi_duration(seed_midi_path)
         gen_dur = max(0.0, midi_duration(out_file) - seed_dur)
         total_dur = midi_duration(out_file)
         print(

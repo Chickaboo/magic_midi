@@ -1,18 +1,30 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 import hashlib
 import json
 import math
+import os
+import stat
 import shutil
 import tarfile
 import time
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
+
+try:
+    from data.tokenizer_custom import CustomDeltaTokenizer
+except ModuleNotFoundError:
+    ROOT = Path(__file__).resolve().parents[1]
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from data.tokenizer_custom import CustomDeltaTokenizer
 
 
 def _import_symusic_score() -> Any:
@@ -112,6 +124,31 @@ def format_eta(seconds: Optional[float]) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+def _rmtree_onerror(func: Any, path: str, exc_info: Any) -> None:
+    # Windows can leave read-only files around; make one retry writable before failing.
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except Exception:
+        pass
+
+
+def remove_tree_strict(path: Path, retries: int = 3) -> None:
+    if not path.exists():
+        return
+
+    for attempt in range(max(1, int(retries))):
+        shutil.rmtree(path, onerror=_rmtree_onerror)
+        if not path.exists():
+            return
+        time.sleep(0.2 * float(attempt + 1))
+
+    if path.exists():
+        raise OSError(
+            f"--start-over requested, but output root could not be deleted cleanly: {path}"
+        )
+
+
 @dataclass
 class SourceIndex:
     source_type: str
@@ -119,55 +156,11 @@ class SourceIndex:
     members: List[str]
 
 
-class SymusicEventTokenizer:
-    """Symusic parser + event-quad quantizer compatible with CustomDeltaTokenizer bins."""
-
-    DELTA_START = 0
-    DELTA_END = 31
-    PITCH_START = 32
-    PITCH_END = 119
-    DUR_START = 120
-    DUR_END = 151
-    VEL_START = 152
-    VEL_END = 167
+class SymusicEventTokenizer(CustomDeltaTokenizer):
+    """Symusic parser adapter over the frozen CustomDeltaTokenizer event-quad spec."""
 
     def __init__(self) -> None:
-        self.delta_bins = np.concatenate(
-            [
-                np.asarray([0.0], dtype=np.float64),
-                np.logspace(math.log10(1e-4), math.log10(2.0), num=31),
-            ],
-            axis=0,
-        )
-        self.duration_bins = np.logspace(
-            math.log10(0.05),
-            math.log10(4.0),
-            num=32,
-        ).astype(np.float64)
-
-    @staticmethod
-    def _nearest_bin(value: float, bins: np.ndarray) -> int:
-        return int(np.argmin(np.abs(bins - float(value))))
-
-    def _quantize_delta(self, delta_seconds: float) -> int:
-        clamped = float(max(0.0, min(2.0, delta_seconds)))
-        idx = self._nearest_bin(clamped, self.delta_bins)
-        return int(self.DELTA_START + idx)
-
-    def _quantize_duration(self, duration_seconds: float) -> int:
-        clamped = float(max(0.05, min(4.0, duration_seconds)))
-        idx = self._nearest_bin(clamped, self.duration_bins)
-        return int(self.DUR_START + idx)
-
-    def _quantize_pitch(self, pitch: int) -> int:
-        clamped = int(max(21, min(108, int(pitch))))
-        return int(self.PITCH_START + (clamped - 21))
-
-    def _quantize_velocity(self, velocity: int) -> int:
-        clamped = int(max(0, min(127, int(velocity))))
-        idx = int(round((float(clamped) / 127.0) * 15.0))
-        idx = max(0, min(15, idx))
-        return int(self.VEL_START + idx)
+        super().__init__(default_velocity=88, include_special_tokens=False)
 
     def parse_events(
         self,
@@ -204,39 +197,6 @@ class SymusicEventTokenizer:
         events.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
         return events
 
-    def encode_events(
-        self,
-        events: List[Tuple[float, int, float, int]],
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        token_ids: List[int] = []
-        onset_times: List[float] = []
-        durations: List[float] = []
-        prev_onset = 0.0
-
-        for onset, pitch, duration, velocity in events:
-            delta = float(max(0.0, onset - prev_onset))
-            prev_onset = onset
-
-            d_tok = self._quantize_delta(delta)
-            p_tok = self._quantize_pitch(pitch)
-            u_tok = self._quantize_duration(duration)
-            v_tok = self._quantize_velocity(velocity)
-
-            token_ids.extend([d_tok, p_tok, u_tok, v_tok])
-            onset_times.extend(
-                [float(onset), float(onset), float(onset), float(onset)]
-            )
-            durations.extend(
-                [float(duration), float(duration), float(duration), float(duration)]
-            )
-
-        return (
-            np.asarray(token_ids, dtype=np.int16),
-            np.asarray(onset_times, dtype=np.float32),
-            np.asarray(durations, dtype=np.float32),
-        )
-
-
 def build_source_index(source: Path) -> SourceIndex:
     source_resolved = str(source.resolve())
 
@@ -254,8 +214,10 @@ def build_source_index(source: Path) -> SourceIndex:
 
     if source.is_file():
         with tarfile.open(source, mode="r:*") as tar:
-            members = [m.name for m in tar.getmembers() if m.isfile() and is_midi_name(m.name)]
-        members.sort()
+            # Preserve archive order for streaming .tar.gz access.
+            members = [
+                m.name for m in tar.getmembers() if m.isfile() and is_midi_name(m.name)
+            ]
         return SourceIndex(
             source_type="tar",
             source_path=source_resolved,
@@ -274,12 +236,19 @@ def load_or_create_source_index(
         payload = safe_json_read(index_path, default={})
         source_type = str(payload.get("source_type", "")).strip().lower()
         source_path = str(payload.get("source_path", "")).strip()
+        member_order = str(payload.get("member_order", "")).strip().lower()
         members = payload.get("members", [])
+        index_compatible = True
+        # Older tar indexes used sorted member order, which is extremely slow for
+        # random access into .tar.gz. Force rebuild to archive order when needed.
+        if source_type == "tar" and member_order != "archive":
+            index_compatible = False
         if (
             source_type in {"directory", "tar"}
             and source_path == str(source.resolve())
             and isinstance(members, list)
             and members
+            and index_compatible
         ):
             return SourceIndex(
                 source_type=source_type,
@@ -294,11 +263,227 @@ def load_or_create_source_index(
             "created_at": utc_now_iso(),
             "source_type": index.source_type,
             "source_path": index.source_path,
+            "member_order": "archive" if index.source_type == "tar" else "sorted",
             "total_members": int(len(index.members)),
             "members": index.members,
         },
     )
     return index
+
+
+_WORKER_TOKENIZER: Optional["SymusicEventTokenizer"] = None
+
+
+def _get_worker_tokenizer() -> "SymusicEventTokenizer":
+    global _WORKER_TOKENIZER
+    if _WORKER_TOKENIZER is None:
+        _WORKER_TOKENIZER = SymusicEventTokenizer()
+    return _WORKER_TOKENIZER
+
+
+def save_npz_with_retries(
+    *,
+    out_npz_path: Path,
+    tokens: np.ndarray,
+    onsets: np.ndarray,
+    durations: np.ndarray,
+    use_compression: bool,
+    retries: int = 5,
+) -> Optional[str]:
+    """Best-effort npz save with retries for transient Windows file locks."""
+    attempts = max(1, int(retries))
+    last_error: Optional[Exception] = None
+    for attempt in range(attempts):
+        try:
+            if out_npz_path.exists():
+                try:
+                    out_npz_path.unlink()
+                except Exception:
+                    pass
+
+            if bool(use_compression):
+                np.savez_compressed(
+                    out_npz_path,
+                    tokens=tokens,
+                    onsets=onsets,
+                    durations=durations,
+                )
+            else:
+                np.savez(
+                    out_npz_path,
+                    tokens=tokens,
+                    onsets=onsets,
+                    durations=durations,
+                )
+
+            return None
+        except PermissionError as exc:
+            last_error = exc
+        except OSError as exc:
+            last_error = exc
+        except Exception as exc:
+            last_error = exc
+            break
+
+        time.sleep(min(1.0, 0.05 * float(2**attempt)))
+
+    if last_error is None:
+        return "unknown-write-error"
+    return f"{type(last_error).__name__}: {last_error}"
+
+
+def build_npz_relative_path(idx: int, member_name: str, shard_size: int = 50000) -> str:
+    safe_shard_size = max(1, int(shard_size))
+    shard = int(idx) // safe_shard_size
+    md5 = md5_text(member_name)
+    return f"data/{shard:05d}/{idx:07d}_{md5}.npz"
+
+
+def _worker_tokenize_and_write(
+    *,
+    idx: int,
+    member_name: str,
+    midi_bytes: Optional[bytes],
+    strict_piano: bool,
+    min_token_length: int,
+    output_root: str,
+    output_shard_size: int,
+    use_compression: bool,
+    read_error: str = "",
+) -> Dict[str, Any]:
+    if read_error:
+        return {
+            "index": int(idx),
+            "source_path": str(member_name),
+            "status": "error",
+            "error": str(read_error),
+        }
+    if not midi_bytes:
+        return {
+            "index": int(idx),
+            "source_path": str(member_name),
+            "status": "skip",
+            "error": "empty-midi-bytes",
+        }
+
+    tokenizer = _get_worker_tokenizer()
+    events = tokenizer.parse_events(midi_bytes=midi_bytes, strict_piano=bool(strict_piano))
+    if not events:
+        return {
+            "index": int(idx),
+            "source_path": str(member_name),
+            "status": "skip",
+            "error": "parse-or-filter",
+        }
+
+    tokens, onsets, durations = tokenizer.encode_events(events)
+    token_len = int(tokens.shape[0])
+    if token_len < int(min_token_length):
+        return {
+            "index": int(idx),
+            "source_path": str(member_name),
+            "status": "skip",
+            "error": "short",
+        }
+
+    md5 = md5_text(member_name)
+    rel_npz_path = build_npz_relative_path(
+        idx=idx,
+        member_name=member_name,
+        shard_size=int(output_shard_size),
+    )
+    out_npz_path = Path(output_root) / rel_npz_path
+    out_npz_path.parent.mkdir(parents=True, exist_ok=True)
+
+    write_error = save_npz_with_retries(
+        out_npz_path=out_npz_path,
+        tokens=tokens,
+        onsets=onsets,
+        durations=durations,
+        use_compression=bool(use_compression),
+    )
+    if write_error is not None:
+        return {
+            "index": int(idx),
+            "source_path": str(member_name),
+            "status": "error",
+            "error": f"write-failed: {write_error}",
+        }
+
+    return {
+        "index": int(idx),
+        "source_path": str(member_name),
+        "status": "accepted",
+        "md5": md5,
+        "npz_path": rel_npz_path,
+        "length": int(token_len),
+    }
+
+
+def _worker_tokenize_from_path(payload: Tuple[Any, ...]) -> Dict[str, Any]:
+    (
+        idx,
+        source_root,
+        member_name,
+        strict_piano,
+        min_token_length,
+        output_root,
+        output_shard_size,
+        use_compression,
+    ) = payload
+    try:
+        midi_bytes = read_midi_bytes_from_directory(
+            source_root=Path(str(source_root)),
+            relative_name=str(member_name),
+        )
+    except Exception as exc:
+        return _worker_tokenize_and_write(
+            idx=int(idx),
+            member_name=str(member_name),
+            midi_bytes=None,
+            strict_piano=bool(strict_piano),
+            min_token_length=int(min_token_length),
+            output_root=str(output_root),
+            output_shard_size=int(output_shard_size),
+            use_compression=bool(use_compression),
+            read_error=str(exc),
+        )
+
+    return _worker_tokenize_and_write(
+        idx=int(idx),
+        member_name=str(member_name),
+        midi_bytes=midi_bytes,
+        strict_piano=bool(strict_piano),
+        min_token_length=int(min_token_length),
+        output_root=str(output_root),
+        output_shard_size=int(output_shard_size),
+        use_compression=bool(use_compression),
+    )
+
+
+def _worker_tokenize_from_bytes(payload: Tuple[Any, ...]) -> Dict[str, Any]:
+    (
+        idx,
+        member_name,
+        midi_bytes,
+        strict_piano,
+        min_token_length,
+        output_root,
+        output_shard_size,
+        use_compression,
+        read_error,
+    ) = payload
+    return _worker_tokenize_and_write(
+        idx=int(idx),
+        member_name=str(member_name),
+        midi_bytes=midi_bytes,
+        strict_piano=bool(strict_piano),
+        min_token_length=int(min_token_length),
+        output_root=str(output_root),
+        output_shard_size=int(output_shard_size),
+        use_compression=bool(use_compression),
+        read_error=str(read_error),
+    )
 
 
 def read_midi_bytes_from_directory(source_root: Path, relative_name: str) -> bytes:
@@ -356,6 +541,29 @@ def parse_args() -> argparse.Namespace:
         help="Print progress update every N processed files.",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help=(
+            "Parallel worker count. 0 = auto. "
+            "Auto uses a conservative worker cap for .tar/.tar.gz to reduce IPC overhead."
+        ),
+    )
+    parser.add_argument(
+        "--compress-output",
+        action="store_true",
+        help=(
+            "Write compressed .npz (smaller files, slower). "
+            "Default writes uncompressed .npz for maximum throughput."
+        ),
+    )
+    parser.add_argument(
+        "--output-shard-size",
+        type=int,
+        default=50000,
+        help="Number of source indices per output data/ shard folder.",
+    )
+    parser.add_argument(
         "--max-files",
         type=int,
         default=0,
@@ -389,6 +597,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Force rebuild of source member index even if it exists.",
     )
+    parser.add_argument(
+        "--start-index",
+        type=int,
+        default=-1,
+        help=(
+            "Optional source member start index (0-based). "
+            "Default (-1) resumes from checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--end-index",
+        type=int,
+        default=-1,
+        help=(
+            "Optional exclusive source member end index (0-based). "
+            "Default (-1) processes to source end."
+        ),
+    )
     parser.set_defaults(strict_piano=True)
     return parser.parse_args()
 
@@ -406,7 +632,7 @@ def main() -> None:
 
     if bool(args.start_over) and output_root.exists():
         print(f"START_OVER=True, deleting existing output: {output_root}")
-        shutil.rmtree(output_root, ignore_errors=True)
+        remove_tree_strict(output_root)
 
     data_dir.mkdir(parents=True, exist_ok=True)
     meta_dir.mkdir(parents=True, exist_ok=True)
@@ -437,6 +663,7 @@ def main() -> None:
             "total_members": int(total_members),
             "source_type": source_index.source_type,
             "source_path": source_index.source_path,
+            "member_order": "archive" if source_index.source_type == "tar" else "sorted",
             "updated_at": utc_now_iso(),
         },
     )
@@ -449,20 +676,90 @@ def main() -> None:
             "Checkpoint source mismatch. Use --start-over or choose the original source path."
         )
 
+    current_member_order = "archive" if source_index.source_type == "tar" else "sorted"
+    checkpoint_member_order = str(checkpoint.get("member_order", "")).strip().lower()
+    if checkpoint_member_order and checkpoint_member_order != current_member_order:
+        raise RuntimeError(
+            "Checkpoint member-order mismatch. Use --start-over to rebuild tokenization output."
+        )
+    if (
+        source_index.source_type == "tar"
+        and not checkpoint_member_order
+        and manifest_count > 0
+        and not bool(args.start_over)
+    ):
+        raise RuntimeError(
+            "Existing output was created before archive-order indexing optimization. "
+            "Run once with --start-over to rebuild a consistent manifest."
+        )
+
     accepted = int(max(int(checkpoint.get("accepted", 0)), manifest_count))
     skipped = int(checkpoint.get("skipped", 0))
     last_completed_index = int(checkpoint.get("last_completed_index", -1))
     last_completed_name = str(checkpoint.get("last_completed_name", ""))
-    start_index = max(0, last_completed_index + 1)
+    auto_start_index = max(0, last_completed_index + 1)
+    requested_start_index = int(args.start_index)
+    if requested_start_index >= 0:
+        if requested_start_index < auto_start_index:
+            print(
+                "WARNING: requested --start-index is behind checkpoint progress; "
+                f"using checkpoint resume index {auto_start_index:,} instead of {requested_start_index:,}."
+            )
+            start_index = int(auto_start_index)
+        else:
+            start_index = int(requested_start_index)
+    else:
+        start_index = int(auto_start_index)
+
+    requested_end_index = int(args.end_index)
+    if requested_end_index >= 0:
+        end_index_exclusive = int(min(total_members, max(0, requested_end_index)))
+    else:
+        end_index_exclusive = int(total_members)
+
+    if end_index_exclusive < start_index:
+        end_index_exclusive = int(start_index)
+
+    checkpoint_accepted = int(checkpoint.get("accepted", 0))
+    if checkpoint_accepted != manifest_count:
+        print(
+            "WARNING: checkpoint accepted count and manifest entry count differ; "
+            f"checkpoint={checkpoint_accepted:,} manifest={manifest_count:,}. "
+            "Using the larger count for reporting."
+        )
 
     strict_piano = bool(args.strict_piano)
 
-    tokenizer = SymusicEventTokenizer()
+    tokenizer_meta = SymusicEventTokenizer()
     min_token_length = int(max(4, args.min_token_length))
     checkpoint_every = int(max(1, args.checkpoint_every))
     progress_every = int(max(1, args.progress_every))
     max_files = int(max(0, args.max_files))
     stop_after_seconds = int(max(0, args.stop_after_seconds))
+    use_compression = bool(args.compress_output)
+    output_shard_size = int(max(1, args.output_shard_size))
+
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    requested_workers = int(max(0, args.workers))
+    if requested_workers > 0:
+        workers = requested_workers
+    else:
+        if source_index.source_type == "tar":
+            auto_cap = min(8, max(1, cpu_count // 2))
+            workers = auto_cap
+            if workers > 1:
+                workers = max(1, workers - 1)
+        else:
+            workers = cpu_count
+    parallel_mode = bool(workers > 1 and max_files == 0 and stop_after_seconds == 0)
+
+    tokenizer_info = {
+        "name": "CustomDeltaTokenizer",
+        "version": 1,
+        "frozen": True,
+        "event_size": int(tokenizer_meta.event_size),
+        "vocab_size": int(tokenizer_meta.vocab_size),
+    }
 
     print("Tokenization session")
     print(f"  source_type: {source_index.source_type}")
@@ -470,11 +767,26 @@ def main() -> None:
     print(f"  output_root: {output_root.resolve()}")
     print(f"  total_members: {total_members:,}")
     print(f"  start_index: {start_index:,}")
+    print(f"  end_index_exclusive: {end_index_exclusive:,}")
     print(f"  accepted_so_far: {accepted:,}")
     print(f"  skipped_so_far: {skipped:,}")
     print(f"  strict_piano: {strict_piano}")
+    print("  tokenizer: CustomDeltaTokenizer v1 (frozen)")
+    print(f"  workers: {workers} ({'parallel' if parallel_mode else 'single-process'})")
+    print(f"  output_compression: {'on' if use_compression else 'off'}")
+    print(f"  output_shard_size: {output_shard_size:,}")
+    if source_index.source_type == "tar":
+        print(
+            "  note: tar archive streaming is often slower than directory tokenization. "
+            "For max throughput, extract to SSD and use --source <directory>."
+        )
+    if workers > 1 and not parallel_mode:
+        print(
+            "  note: parallel mode is disabled when --max-files or --stop-after-seconds is set."
+        )
 
     session_start = time.time()
+    accepted_at_run_start = int(accepted)
     processed_since_checkpoint = 0
     processed_this_run = 0
 
@@ -484,113 +796,7 @@ def main() -> None:
         tar_obj = tarfile.open(source, mode="r:*")
         tar_lookup = {m.name: m for m in tar_obj.getmembers() if m.isfile()}
 
-    try:
-        for idx in range(start_index, total_members):
-            if max_files > 0 and accepted >= max_files:
-                print(f"MAX_FILES reached ({max_files}). Stopping.")
-                break
-
-            if stop_after_seconds > 0 and (time.time() - session_start) >= stop_after_seconds:
-                print(f"STOP_AFTER_SECONDS reached ({stop_after_seconds}s). Stopping.")
-                break
-
-            member_name = source_index.members[idx]
-            last_completed_index = int(idx)
-            last_completed_name = member_name
-            processed_since_checkpoint += 1
-            processed_this_run += 1
-
-            if idx in done_indices:
-                continue
-
-            midi_bytes: Optional[bytes] = None
-            try:
-                if source_index.source_type == "directory":
-                    midi_bytes = read_midi_bytes_from_directory(
-                        source_root=source,
-                        relative_name=member_name,
-                    )
-                else:
-                    if tar_obj is None:
-                        raise RuntimeError("Internal error: tar source selected but tar object is not open")
-                    midi_bytes = read_midi_bytes_from_tar(
-                        tar_obj=tar_obj,
-                        member_lookup=tar_lookup,
-                        member_name=member_name,
-                    )
-            except Exception as exc:
-                skipped += 1
-                print(f"Read error at index {idx}: {member_name} ({exc})")
-                midi_bytes = None
-
-            if not midi_bytes:
-                continue
-
-            events = tokenizer.parse_events(midi_bytes=midi_bytes, strict_piano=strict_piano)
-            if not events:
-                skipped += 1
-                continue
-
-            tokens, onsets, durations = tokenizer.encode_events(events)
-            token_len = int(tokens.shape[0])
-            if token_len < min_token_length:
-                skipped += 1
-                continue
-
-            md5 = md5_text(member_name)
-            rel_npz_path = f"data/{idx:07d}_{md5}.npz"
-            out_npz_path = output_root / rel_npz_path
-            out_npz_path.parent.mkdir(parents=True, exist_ok=True)
-
-            np.savez_compressed(
-                out_npz_path,
-                tokens=tokens,
-                onsets=onsets,
-                durations=durations,
-            )
-
-            append_manifest_entry(
-                manifest_jsonl_path,
-                {
-                    "index": int(idx),
-                    "md5": md5,
-                    "npz_path": rel_npz_path,
-                    "length": int(token_len),
-                    "source_path": member_name,
-                },
-            )
-            done_indices.add(idx)
-            accepted += 1
-
-            if processed_this_run % progress_every == 0:
-                elapsed = max(1e-6, time.time() - session_start)
-                rate = processed_this_run / elapsed
-                remaining = max(0, total_members - idx - 1)
-                eta = (remaining / rate) if rate > 0 else None
-                print(
-                    f"idx={idx:,}/{total_members:,} accepted={accepted:,} skipped={skipped:,} "
-                    f"rate={rate:.2f}/s eta={format_eta(eta)}"
-                )
-
-            if processed_since_checkpoint >= checkpoint_every:
-                checkpoint_payload = {
-                    "last_completed_index": int(last_completed_index),
-                    "accepted": int(accepted),
-                    "skipped": int(skipped),
-                    "last_completed_name": str(last_completed_name),
-                    "total_members": int(total_members),
-                    "source_type": source_index.source_type,
-                    "source_path": source_index.source_path,
-                    "updated_at": utc_now_iso(),
-                }
-                safe_json_write(checkpoint_path, checkpoint_payload)
-                manifest_len = rebuild_manifest_json(manifest_jsonl_path, manifest_json_path)
-                print(
-                    f"Checkpoint saved at idx={last_completed_index:,} "
-                    f"accepted={accepted:,} skipped={skipped:,} manifest={manifest_len:,}"
-                )
-                processed_since_checkpoint = 0
-
+    def _save_checkpoint(*, rebuild_manifest: bool) -> int:
         checkpoint_payload = {
             "last_completed_index": int(last_completed_index),
             "accepted": int(accepted),
@@ -599,9 +805,256 @@ def main() -> None:
             "total_members": int(total_members),
             "source_type": source_index.source_type,
             "source_path": source_index.source_path,
+            "member_order": current_member_order,
+            "tokenizer": dict(tokenizer_info),
             "updated_at": utc_now_iso(),
         }
         safe_json_write(checkpoint_path, checkpoint_payload)
+        if rebuild_manifest:
+            return rebuild_manifest_json(manifest_jsonl_path, manifest_json_path)
+        return -1
+
+    def _handle_result(result: Dict[str, Any]) -> None:
+        nonlocal accepted
+        nonlocal skipped
+        nonlocal last_completed_index
+        nonlocal last_completed_name
+        nonlocal processed_since_checkpoint
+        nonlocal processed_this_run
+
+        idx = int(result.get("index", -1))
+        member_name = str(result.get("source_path", ""))
+        if idx >= 0:
+            last_completed_index = idx
+            last_completed_name = member_name
+
+        processed_since_checkpoint += 1
+        processed_this_run += 1
+
+        status = str(result.get("status", "skip"))
+        if status == "accepted":
+            row = {
+                "index": int(idx),
+                "md5": str(result.get("md5", "")),
+                "npz_path": str(result.get("npz_path", "")),
+                "length": int(result.get("length", 0)),
+                "source_path": member_name,
+            }
+            append_manifest_entry(manifest_jsonl_path, row)
+            done_indices.add(int(idx))
+            accepted += 1
+        else:
+            skipped += 1
+            if status == "error":
+                err = str(result.get("error", "unknown-error"))
+                if processed_this_run <= 20 or (processed_this_run % progress_every == 0):
+                    print(f"Read/tokenize error at index {idx}: {member_name} ({err})")
+
+        if processed_this_run % progress_every == 0:
+            elapsed = max(1e-6, time.time() - session_start)
+            processed_rate = processed_this_run / elapsed
+            accepted_this_run = max(0, accepted - accepted_at_run_start)
+            accepted_rate = accepted_this_run / elapsed
+            remaining = max(0, int(end_index_exclusive) - max(last_completed_index + 1, int(start_index)))
+            eta = (remaining / processed_rate) if processed_rate > 0 else None
+            print(
+                f"idx={last_completed_index:,}/{end_index_exclusive:,} accepted={accepted:,} skipped={skipped:,} "
+                f"proc_rate={processed_rate:.2f}/s acc_rate={accepted_rate:.2f}/s eta={format_eta(eta)}"
+            )
+
+        if processed_since_checkpoint >= checkpoint_every:
+            manifest_len = _save_checkpoint(rebuild_manifest=True)
+            print(
+                f"Checkpoint saved at idx={last_completed_index:,} "
+                f"accepted={accepted:,} skipped={skipped:,} manifest={manifest_len:,}"
+            )
+            processed_since_checkpoint = 0
+
+    try:
+        if parallel_mode:
+            if source_index.source_type == "directory":
+
+                def _iter_dir_payloads() -> Iterator[Tuple[Any, ...]]:
+                    nonlocal last_completed_index
+                    nonlocal last_completed_name
+                    for idx in range(start_index, end_index_exclusive):
+                        member_name = source_index.members[idx]
+                        if idx in done_indices:
+                            last_completed_index = int(idx)
+                            last_completed_name = str(member_name)
+                            continue
+                        yield (
+                            int(idx),
+                            str(source),
+                            str(member_name),
+                            bool(strict_piano),
+                            int(min_token_length),
+                            str(output_root),
+                            int(output_shard_size),
+                            bool(use_compression),
+                        )
+
+                chunk = max(1, min(256, workers * 4))
+                with ProcessPoolExecutor(max_workers=workers) as pool:
+                    for result in pool.map(
+                        _worker_tokenize_from_path,
+                        _iter_dir_payloads(),
+                        chunksize=chunk,
+                    ):
+                        _handle_result(result)
+            else:
+                if tar_obj is None:
+                    raise RuntimeError("Internal error: tar source selected but tar object is not open")
+
+                def _iter_tar_payloads() -> Iterator[Tuple[Any, ...]]:
+                    nonlocal last_completed_index
+                    nonlocal last_completed_name
+                    for idx in range(start_index, end_index_exclusive):
+                        member_name = source_index.members[idx]
+                        if idx in done_indices:
+                            last_completed_index = int(idx)
+                            last_completed_name = str(member_name)
+                            continue
+                        midi_bytes: Optional[bytes] = None
+                        read_error = ""
+                        try:
+                            midi_bytes = read_midi_bytes_from_tar(
+                                tar_obj=tar_obj,
+                                member_lookup=tar_lookup,
+                                member_name=member_name,
+                            )
+                        except Exception as exc:
+                            read_error = str(exc)
+                        yield (
+                            int(idx),
+                            str(member_name),
+                            midi_bytes,
+                            bool(strict_piano),
+                            int(min_token_length),
+                            str(output_root),
+                            int(output_shard_size),
+                            bool(use_compression),
+                            str(read_error),
+                        )
+
+                chunk = max(1, min(128, workers * 2))
+                with ProcessPoolExecutor(max_workers=workers) as pool:
+                    for result in pool.map(
+                        _worker_tokenize_from_bytes,
+                        _iter_tar_payloads(),
+                        chunksize=chunk,
+                    ):
+                        _handle_result(result)
+        else:
+            for idx in range(start_index, end_index_exclusive):
+                if max_files > 0 and accepted >= max_files:
+                    print(f"MAX_FILES reached ({max_files}). Stopping.")
+                    break
+
+                if stop_after_seconds > 0 and (time.time() - session_start) >= stop_after_seconds:
+                    print(f"STOP_AFTER_SECONDS reached ({stop_after_seconds}s). Stopping.")
+                    break
+
+                member_name = source_index.members[idx]
+                last_completed_index = int(idx)
+                last_completed_name = member_name
+                processed_since_checkpoint += 1
+                processed_this_run += 1
+
+                if idx in done_indices:
+                    continue
+
+                midi_bytes: Optional[bytes] = None
+                try:
+                    if source_index.source_type == "directory":
+                        midi_bytes = read_midi_bytes_from_directory(
+                            source_root=source,
+                            relative_name=member_name,
+                        )
+                    else:
+                        if tar_obj is None:
+                            raise RuntimeError("Internal error: tar source selected but tar object is not open")
+                        midi_bytes = read_midi_bytes_from_tar(
+                            tar_obj=tar_obj,
+                            member_lookup=tar_lookup,
+                            member_name=member_name,
+                        )
+                except Exception as exc:
+                    skipped += 1
+                    print(f"Read error at index {idx}: {member_name} ({exc})")
+                    midi_bytes = None
+
+                if not midi_bytes:
+                    continue
+
+                events = tokenizer_meta.parse_events(midi_bytes=midi_bytes, strict_piano=strict_piano)
+                if not events:
+                    skipped += 1
+                    continue
+
+                tokens, onsets, durations = tokenizer_meta.encode_events(events)
+                token_len = int(tokens.shape[0])
+                if token_len < min_token_length:
+                    skipped += 1
+                    continue
+
+                md5 = md5_text(member_name)
+                rel_npz_path = build_npz_relative_path(
+                    idx=idx,
+                    member_name=member_name,
+                    shard_size=int(output_shard_size),
+                )
+                out_npz_path = output_root / rel_npz_path
+                out_npz_path.parent.mkdir(parents=True, exist_ok=True)
+
+                write_error = save_npz_with_retries(
+                    out_npz_path=out_npz_path,
+                    tokens=tokens,
+                    onsets=onsets,
+                    durations=durations,
+                    use_compression=bool(use_compression),
+                )
+                if write_error is not None:
+                    skipped += 1
+                    print(
+                        f"Write error at index {idx}: {member_name} ({write_error})"
+                    )
+                    continue
+
+                append_manifest_entry(
+                    manifest_jsonl_path,
+                    {
+                        "index": int(idx),
+                        "md5": md5,
+                        "npz_path": rel_npz_path,
+                        "length": int(token_len),
+                        "source_path": member_name,
+                    },
+                )
+                done_indices.add(idx)
+                accepted += 1
+
+                if processed_this_run % progress_every == 0:
+                    elapsed = max(1e-6, time.time() - session_start)
+                    processed_rate = processed_this_run / elapsed
+                    accepted_this_run = max(0, accepted - accepted_at_run_start)
+                    accepted_rate = accepted_this_run / elapsed
+                    remaining = max(0, int(end_index_exclusive) - idx - 1)
+                    eta = (remaining / processed_rate) if processed_rate > 0 else None
+                    print(
+                        f"idx={idx:,}/{end_index_exclusive:,} accepted={accepted:,} skipped={skipped:,} "
+                        f"proc_rate={processed_rate:.2f}/s acc_rate={accepted_rate:.2f}/s eta={format_eta(eta)}"
+                    )
+
+                if processed_since_checkpoint >= checkpoint_every:
+                    manifest_len = _save_checkpoint(rebuild_manifest=True)
+                    print(
+                        f"Checkpoint saved at idx={last_completed_index:,} "
+                        f"accepted={accepted:,} skipped={skipped:,} manifest={manifest_len:,}"
+                    )
+                    processed_since_checkpoint = 0
+
+        _save_checkpoint(rebuild_manifest=False)
         manifest_len = rebuild_manifest_json(manifest_jsonl_path, manifest_json_path)
 
         elapsed = max(1e-6, time.time() - session_start)
@@ -610,10 +1063,17 @@ def main() -> None:
             "source_path": source_index.source_path,
             "output_root": str(output_root.resolve()),
             "total_members": int(total_members),
+            "start_index": int(start_index),
+            "end_index_exclusive": int(end_index_exclusive),
+            "window_members": int(max(0, end_index_exclusive - start_index)),
             "accepted": int(accepted),
             "skipped": int(skipped),
             "manifest_entries": int(manifest_len),
             "processed_this_run": int(processed_this_run),
+            "tokenizer": dict(tokenizer_info),
+            "workers": int(workers),
+            "parallel_mode": bool(parallel_mode),
+            "output_compression": bool(use_compression),
             "elapsed_seconds": float(elapsed),
             "updated_at": utc_now_iso(),
         }

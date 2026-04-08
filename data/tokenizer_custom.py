@@ -41,7 +41,7 @@ class _TokenSpec:
 
 
 class CustomDeltaTokenizer:
-    """Quad tokenizer for solo piano: [delta_onset, pitch, duration, velocity_bin]."""
+    """Frozen quad tokenizer for solo piano: [delta_onset, pitch, duration, velocity_bin]."""
 
     def __init__(
         self,
@@ -113,6 +113,8 @@ class CustomDeltaTokenizer:
         payload = {
             "type": "CustomDeltaTokenizer",
             "version": 1,
+            "spec_version": 1,
+            "frozen": True,
             "vocab_size": int(self.vocab_size),
             "default_velocity": int(self.default_velocity),
             "event_size": int(self.event_size),
@@ -128,6 +130,51 @@ class CustomDeltaTokenizer:
             },
         }
         out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def _encode_event_tuples(
+        self,
+        events: Iterable[Tuple[float, int, float, int]],
+    ) -> Tuple[List[int], List[float], List[float]]:
+        token_ids: List[int] = []
+        onset_times: List[float] = []
+        durations: List[float] = []
+        prev_onset = 0.0
+
+        if self.include_special_tokens:
+            token_ids.append(self.spec.bos_id)
+            onset_times.append(0.0)
+            durations.append(1e-4)
+
+        for onset, pitch, duration, velocity in events:
+            delta = float(max(0.0, onset - prev_onset))
+            prev_onset = onset
+
+            d_tok = self._quantize_delta(delta)
+            p_tok = self._quantize_pitch(pitch)
+            u_tok = self._quantize_duration(duration)
+            v_tok = self._quantize_velocity(velocity)
+            token_ids.extend([d_tok, p_tok, u_tok, v_tok])
+
+            # Repeat onset/duration for all 4 tokens in the event quad.
+            onset_times.extend(
+                [float(onset), float(onset), float(onset), float(onset)]
+            )
+            durations.extend(
+                [float(duration), float(duration), float(duration), float(duration)]
+            )
+
+        if self.include_special_tokens:
+            end_onset = float(onset_times[-1]) if onset_times else 0.0
+            token_ids.append(self.spec.eos_id)
+            onset_times.append(end_onset)
+            durations.append(1e-4)
+
+        if len(token_ids) != len(onset_times):
+            raise AssertionError(
+                "CustomDeltaTokenizer alignment error: "
+                f"len(ids)={len(token_ids)} len(onsets)={len(onset_times)}"
+            )
+        return token_ids, onset_times, durations
 
     @classmethod
     def load(cls, path: str) -> "CustomDeltaTokenizer":
@@ -219,47 +266,7 @@ class CustomDeltaTokenizer:
         midi_path: Path,
     ) -> Tuple[List[int], List[float], List[float]]:
         events = self._note_events(midi_path)
-
-        token_ids: List[int] = []
-        onset_times: List[float] = []
-        durations: List[float] = []
-        prev_onset = 0.0
-
-        if self.include_special_tokens:
-            token_ids.append(self.spec.bos_id)
-            onset_times.append(0.0)
-            durations.append(1e-4)
-
-        for onset, pitch, duration, velocity in events:
-            delta = float(max(0.0, onset - prev_onset))
-            prev_onset = onset
-
-            d_tok = self._quantize_delta(delta)
-            p_tok = self._quantize_pitch(pitch)
-            u_tok = self._quantize_duration(duration)
-            v_tok = self._quantize_velocity(velocity)
-            token_ids.extend([d_tok, p_tok, u_tok, v_tok])
-
-            # Repeat onset/duration for all 4 tokens in the event quad.
-            onset_times.extend(
-                [float(onset), float(onset), float(onset), float(onset)]
-            )
-            durations.extend(
-                [float(duration), float(duration), float(duration), float(duration)]
-            )
-
-        if self.include_special_tokens:
-            end_onset = float(onset_times[-1]) if onset_times else 0.0
-            token_ids.append(self.spec.eos_id)
-            onset_times.append(end_onset)
-            durations.append(1e-4)
-
-        if len(token_ids) != len(onset_times):
-            raise AssertionError(
-                "CustomDeltaTokenizer alignment error: "
-                f"len(ids)={len(token_ids)} len(onsets)={len(onset_times)}"
-            )
-        return token_ids, onset_times, durations
+        return self._encode_event_tuples(events)
 
     def encode(self, midi_path: Path) -> List[int]:
         """Encode one MIDI file into flat delta/pitch/duration/velocity token IDs."""
@@ -274,6 +281,19 @@ class CustomDeltaTokenizer:
         """Encode one MIDI and return token IDs + aligned onset/duration arrays."""
 
         return self._encode_events(Path(midi_path))
+
+    def encode_events(
+        self,
+        events: Iterable[Tuple[float, int, float, int]],
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Encode already-parsed note events using the frozen tokenizer spec."""
+
+        token_ids, onset_times, durations = self._encode_event_tuples(events)
+        return (
+            np.asarray(token_ids, dtype=np.int16),
+            np.asarray(onset_times, dtype=np.float32),
+            np.asarray(durations, dtype=np.float32),
+        )
 
     def _is_delta(self, token_id: int) -> bool:
         return self.spec.delta_start <= int(token_id) <= self.spec.delta_end

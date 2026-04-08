@@ -1,29 +1,25 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
-from safetensors.torch import load_file as safetensors_load_file
 
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from config import DataConfig, ModelConfig
-from data.tokenizer import PianoTokenizer
-from model.factory import build_model
+from config import DataConfig
 from scale_config import SCALE_PRESETS
-from utils.config_compat import normalize_model_config_payload
+from utils import checkpoint_loading as ckpt_utils
 
 
-def _load_state_dict(path: Path) -> Dict[str, Any]:
-    if not path.exists():
+def _load_state_payload(path: Optional[Path]) -> Dict[str, Any]:
+    if path is None or not path.exists():
         return {}
     if path.suffix != ".pt":
         return {}
@@ -36,43 +32,194 @@ def _load_state_dict(path: Path) -> Dict[str, Any]:
     return {}
 
 
-def _find_state_sidecar(checkpoint_path: Path) -> Optional[Path]:
-    if checkpoint_path.suffix == ".pt":
-        return checkpoint_path if checkpoint_path.exists() else None
-    if checkpoint_path.name.endswith("_model.safetensors"):
-        candidate = checkpoint_path.with_name(
-            checkpoint_path.name.replace("_model.safetensors", "_state.pt")
-        )
-        if candidate.exists():
-            return candidate
-    latest_state = checkpoint_path.parent / "latest_state.pt"
-    if latest_state.exists():
-        return latest_state
-    best_state = checkpoint_path.parent / "best_state.pt"
-    if best_state.exists():
-        return best_state
-    return None
-
-
-def _resolve_tokenizer_path(
-    state: Dict[str, Any], fallback_root: Path
-) -> Optional[Path]:
-    data_cfg = state.get("data_config")
-    if isinstance(data_cfg, dict):
-        tok = data_cfg.get("tokenizer_path")
-        if isinstance(tok, str):
-            p = Path(tok)
-            if p.exists():
-                return p
-    candidates = [
-        fallback_root / "tokenizer.json",
-        fallback_root / "tokenizer" / "tokenizer.json",
+def _tokenizer_search_paths(checkpoint_path: Path) -> list[Path]:
+    return [
+        checkpoint_path.parent / "custom_tokenizer.json",
+        checkpoint_path.parent / "tokenizer.json",
+        checkpoint_path.parent / "tokenizer" / "custom_tokenizer.json",
+        checkpoint_path.parent / "tokenizer" / "tokenizer.json",
         Path("tokenizer.json"),
     ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return None
+
+
+def _config_value(model_config: Dict[str, Any], key: str, default: Any = "n/a") -> Any:
+    value = model_config.get(key, default)
+    if value is None:
+        return default
+    return value
+
+
+def _optional_arch_line(
+    model_config: Dict[str, Any],
+    key: str,
+    label: str,
+) -> Optional[str]:
+    if key not in model_config:
+        return None
+    return f"- {label}: `{model_config.get(key)}`"
+
+
+def _load_tokenizer_for_card(
+    checkpoint_metadata: Dict[str, Any],
+    checkpoint_path: Path,
+) -> tuple[Any | None, Optional[Path]]:
+    try:
+        tokenizer, tokenizer_meta = ckpt_utils.load_tokenizer_for_checkpoint(
+            checkpoint_metadata,
+            search_paths=_tokenizer_search_paths(checkpoint_path),
+        )
+    except FileNotFoundError:
+        return None, None
+
+    tokenizer_path = tokenizer_meta.get("tokenizer_path")
+    if isinstance(tokenizer_path, str) and tokenizer_path.strip():
+        return tokenizer, Path(tokenizer_path)
+    return tokenizer, None
+
+
+def _output_logit_scale_text(model: Any) -> str:
+    raw = getattr(model, "output_logit_scale", None)
+    if raw is None:
+        return "n/a"
+    try:
+        return f"{float(raw):.6f}"
+    except Exception:
+        return str(raw)
+
+
+def _to_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _safe_seed_and_continuation_lengths(data_cfg: DataConfig) -> tuple[int, int]:
+    seed_length = max(1, _to_int(getattr(data_cfg, "seed_length", 128), 128))
+    continuation = max(
+        1,
+        _to_int(getattr(data_cfg, "continuation_length", 128), 128),
+    )
+    return seed_length, continuation
+
+
+def _history_metrics(state: Dict[str, Any]) -> tuple[list[Any], list[Any], list[Any]]:
+    history = state.get("history") if isinstance(state.get("history"), dict) else {}
+    train_loss = history.get("train_loss") if isinstance(history, dict) else []
+    val_loss = history.get("val_loss") if isinstance(history, dict) else []
+    gen_health = (
+        history.get("gen_health_max_final_top1") if isinstance(history, dict) else []
+    )
+    return (
+        train_loss if isinstance(train_loss, list) else [],
+        val_loss if isinstance(val_loss, list) else [],
+        gen_health if isinstance(gen_health, list) else [],
+    )
+
+
+def _model_architecture_name(model_config: Dict[str, Any]) -> str:
+    if not model_config:
+        return "unknown"
+    return ckpt_utils.infer_model_architecture(model_config)
+
+
+def _build_architecture_lines(model: Any, model_config: Dict[str, Any]) -> list[str]:
+    lines: list[str] = [
+        f"- Model class: `{type(model).__name__}`",
+        f"- Inferred architecture: `{_model_architecture_name(model_config)}`",
+        f"- d_model: `{_config_value(model_config, 'd_model')}`",
+        f"- layers: `{_config_value(model_config, 'n_layers')}`",
+    ]
+
+    for key, label in (
+        ("use_mamba", "Mamba enabled"),
+        ("use_cfc", "CfC enabled"),
+        ("ffn_expansion", "FFN expansion"),
+        ("num_attention_heads", "Attention heads"),
+        ("attention_every_n_layers", "Attention cadence"),
+        ("attention_bias_type", "Attention bias"),
+        ("tie_embeddings", "Tied embeddings"),
+    ):
+        line = _optional_arch_line(model_config, key, label)
+        if line is not None:
+            lines.append(line)
+
+    lines.append(f"- Output logit scale: `{_output_logit_scale_text(model)}`")
+    return lines
+
+
+def _build_data_lines(data_cfg: DataConfig, model_config: Dict[str, Any]) -> list[str]:
+    seed_length, continuation = _safe_seed_and_continuation_lengths(data_cfg)
+    vocab_size = _to_int(_config_value(model_config, "vocab_size", data_cfg.vocab_size), data_cfg.vocab_size)
+    return [
+        f"- Vocabulary size: `{vocab_size}`",
+        f"- Tokenization strategy: `{getattr(data_cfg, 'tokenization_strategy', 'n/a')}`",
+        f"- Seed length: `{seed_length}`",
+        f"- Continuation length: `{continuation}`",
+    ]
+
+
+def _build_history_lines(state: Dict[str, Any]) -> tuple[list[str], list[Any]]:
+    train_loss, val_loss, gen_health = _history_metrics(state)
+    lines = [
+        f"- Epoch in checkpoint: `{state.get('epoch', 'n/a')}`",
+        f"- Last val loss in checkpoint: `{state.get('val_loss', 'n/a')}`",
+        f"- Best val loss tracked: `{state.get('best_val_loss', 'n/a')}`",
+        f"- Train loss entries: `{len(train_loss)}`",
+        f"- Val loss entries: `{len(val_loss)}`",
+        f"- Generation health entries: `{len(gen_health)}`",
+    ]
+    return lines, gen_health
+
+
+def _checkpoint_diagnostic_lines(bundle: ckpt_utils.LoadedModelBundle) -> list[str]:
+    return [
+        f"- Missing keys: `{int(bundle.missing_keys)}`",
+        f"- Unexpected keys: `{int(bundle.unexpected_keys)}`",
+    ]
+
+
+def _preview_lines(preview_tokens: List[int], preview_unique: int) -> list[str]:
+    return [
+        f"- Preview token count: `{len(preview_tokens)}`",
+        f"- Preview unique token count: `{preview_unique}`",
+        "- First 32 tokens:",
+        "",
+        "```text",
+        " ".join(str(int(t)) for t in preview_tokens[:32]),
+        "```",
+    ]
+
+
+def _resolve_data_config(checkpoint_metadata: Dict[str, Any]) -> DataConfig:
+    data_cfg_payload = ckpt_utils.extract_data_config(checkpoint_metadata)
+    if isinstance(data_cfg_payload, dict) and data_cfg_payload:
+        return DataConfig(**data_cfg_payload)
+    return DataConfig()
+
+
+def _validate_tokenizer_vocab(
+    tokenizer: Any | None,
+    model_config: Dict[str, Any],
+) -> None:
+    if tokenizer is None:
+        return
+    model_vocab = _to_int(model_config.get("vocab_size", -1), -1)
+    tokenizer_vocab = _to_int(getattr(tokenizer, "vocab_size", -1), -1)
+    if model_vocab > 0 and tokenizer_vocab > 0 and model_vocab != tokenizer_vocab:
+        raise RuntimeError(
+            "Tokenizer/model vocab mismatch while generating model card: "
+            f"tokenizer vocab={tokenizer_vocab}, model vocab={model_vocab}."
+        )
+
+
+def _preview_generation_lengths(data_cfg: DataConfig) -> tuple[int, int]:
+    seed_length, continuation = _safe_seed_and_continuation_lengths(data_cfg)
+    return seed_length, min(128, continuation)
+
+
+def _state_path_for_card(checkpoint_path: Path) -> Optional[Path]:
+    return ckpt_utils.resolve_sidecar_path(checkpoint_path)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -83,7 +230,7 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 def _make_preview_tokens(
     model: Any,
-    tokenizer: Optional[PianoTokenizer],
+    tokenizer: Optional[Any],
     seed_length: int,
     max_new_tokens: int,
 ) -> List[int]:
@@ -117,56 +264,43 @@ def _make_preview_tokens(
 def build_model_card(checkpoint_path: Path, output_path: Path) -> Path:
     """Build markdown model card from checkpoint and sidecar metadata."""
 
-    state_path = _find_state_sidecar(checkpoint_path)
-    state = _load_state_dict(state_path) if state_path is not None else {}
+    state_path = _state_path_for_card(checkpoint_path)
+    state = _load_state_payload(state_path)
 
-    model_cfg_payload = state.get("model_config")
-    if isinstance(model_cfg_payload, dict):
-        model_cfg = ModelConfig(
-            **normalize_model_config_payload(dict(model_cfg_payload))
-        )
-    else:
-        model_cfg = SCALE_PRESETS["small"]["model"]
+    bundle = ckpt_utils.load_model_from_checkpoint(
+        model_path=checkpoint_path,
+        sidecar_path=state_path,
+        device="cpu",
+        strict=True,
+    )
 
-    model = build_model(model_cfg)
-    missing: List[str] = []
-    unexpected: List[str] = []
-    if checkpoint_path.suffix == ".safetensors" and checkpoint_path.exists():
-        raw = safetensors_load_file(str(checkpoint_path), device="cpu")
-        missing, unexpected = model.load_state_dict(raw, strict=False)
-
-    model.eval()
+    model = bundle.model
+    model_config = dict(bundle.model_config)
     total_params = sum(p.numel() for p in model.parameters())
 
-    data_cfg_payload = state.get("data_config")
-    if isinstance(data_cfg_payload, dict):
-        data_cfg = DataConfig(**data_cfg_payload)
-    else:
-        data_cfg = DataConfig()
+    data_cfg = _resolve_data_config(bundle.checkpoint_metadata)
 
-    tokenizer_path = _resolve_tokenizer_path(state, checkpoint_path.parent)
-    tokenizer = None
-    if tokenizer_path is not None:
-        try:
-            tokenizer = PianoTokenizer.load(str(tokenizer_path))
-        except Exception:
-            tokenizer = None
+    tokenizer, tokenizer_path = _load_tokenizer_for_card(
+        checkpoint_metadata=bundle.checkpoint_metadata,
+        checkpoint_path=checkpoint_path,
+    )
+    _validate_tokenizer_vocab(tokenizer, model_config)
 
+    seed_length, preview_new_tokens = _preview_generation_lengths(data_cfg)
     preview_tokens = _make_preview_tokens(
         model=model,
         tokenizer=tokenizer,
-        seed_length=int(data_cfg.seed_length),
-        max_new_tokens=min(128, int(data_cfg.continuation_length)),
+        seed_length=seed_length,
+        max_new_tokens=preview_new_tokens,
     )
     preview_array = np.asarray(preview_tokens, dtype=np.int64)
     preview_unique = int(len(np.unique(preview_array))) if preview_array.size else 0
 
-    history = state.get("history") if isinstance(state.get("history"), dict) else {}
-    train_loss = history.get("train_loss") if isinstance(history, dict) else []
-    val_loss = history.get("val_loss") if isinstance(history, dict) else []
-    gen_health = (
-        history.get("gen_health_max_final_top1") if isinstance(history, dict) else []
-    )
+    history_lines, gen_health = _build_history_lines(state)
+
+    default_small_cfg = SCALE_PRESETS["small"]["model"]
+    if not model_config:
+        model_config = dict(getattr(default_small_cfg, "__dict__", {}))
 
     card_lines = [
         f"# Model Card: {checkpoint_path.name}",
@@ -175,25 +309,16 @@ def build_model_card(checkpoint_path: Path, output_path: Path) -> Path:
         "- Name: `Itty Bitty Piano`",
         "",
         "## Architecture",
-        f"- Model class: `PianoHybridModel`",
-        f"- d_model: `{model_cfg.d_model}`",
-        f"- layers: `{model_cfg.n_layers}`",
-        f"- Mamba enabled: `{model_cfg.use_mamba}`",
-        f"- CfC enabled: `{model_cfg.use_cfc}`",
-        f"- FFN expansion: `{model_cfg.ffn_expansion}`",
-        f"- Attention heads: `{model_cfg.num_attention_heads}`",
-        f"- Attention cadence: every `{model_cfg.attention_every_n_layers}` layers",
-        f"- Attention bias: `{model_cfg.attention_bias_type}`",
-        f"- Output logit scale: `{model.output_logit_scale:.6f}`",
-        f"- Tied embeddings: `{model_cfg.tie_embeddings}`",
+    ]
+    card_lines.extend(_build_architecture_lines(model, model_config))
+    card_lines.extend(
+        [
         f"- Total parameters (measured): `{total_params:,}`",
         "",
         "## Data / Tokenization",
-        f"- Vocabulary size: `{model_cfg.vocab_size}`",
-        f"- Tokenization strategy: `{data_cfg.tokenization_strategy}`",
-        f"- Seed length: `{data_cfg.seed_length}`",
-        f"- Continuation length: `{data_cfg.continuation_length}`",
-    ]
+        ]
+    )
+    card_lines.extend(_build_data_lines(data_cfg, model_config))
 
     if tokenizer_path is not None:
         card_lines.append(f"- Tokenizer path: `{tokenizer_path}`")
@@ -202,16 +327,11 @@ def build_model_card(checkpoint_path: Path, output_path: Path) -> Path:
         [
             "",
             "## Training History",
-            f"- Epoch in checkpoint: `{state.get('epoch', 'n/a')}`",
-            f"- Last val loss in checkpoint: `{state.get('val_loss', 'n/a')}`",
-            f"- Best val loss tracked: `{state.get('best_val_loss', 'n/a')}`",
-            f"- Train loss entries: `{len(train_loss) if isinstance(train_loss, list) else 0}`",
-            f"- Val loss entries: `{len(val_loss) if isinstance(val_loss, list) else 0}`",
-            f"- Generation health entries: `{len(gen_health) if isinstance(gen_health, list) else 0}`",
         ]
     )
+    card_lines.extend(history_lines)
 
-    if isinstance(gen_health, list) and gen_health:
+    if gen_health:
         card_lines.append(
             f"- Last generation max top-1 prob: `{_safe_float(gen_health[-1]):.4f}`"
         )
@@ -220,19 +340,11 @@ def build_model_card(checkpoint_path: Path, output_path: Path) -> Path:
         [
             "",
             "## Checkpoint Load Diagnostics",
-            f"- Missing keys: `{len(missing)}`",
-            f"- Unexpected keys: `{len(unexpected)}`",
-            "",
-            "## Generation Preview",
-            f"- Preview token count: `{len(preview_tokens)}`",
-            f"- Preview unique token count: `{preview_unique}`",
-            "- First 32 tokens:",
-            "",
-            "```text",
-            " ".join(str(int(t)) for t in preview_tokens[:32]),
-            "```",
         ]
     )
+    card_lines.extend(_checkpoint_diagnostic_lines(bundle))
+    card_lines.extend(["", "## Generation Preview"])
+    card_lines.extend(_preview_lines(preview_tokens, preview_unique))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text("\n".join(card_lines) + "\n", encoding="utf-8")

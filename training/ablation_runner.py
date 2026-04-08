@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import math
 import random
@@ -433,6 +434,13 @@ def _generate_one_continuation(
     seed_length: int,
     max_new_tokens: int = 8192,
     continuation_seconds: float = 120.0,
+    temperature: float = 0.9,
+    top_p: float = 0.95,
+    top_k: int = 50,
+    repetition_penalty: float = 1.1,
+    repetition_window: int = 64,
+    min_tokens_to_keep: int = 3,
+    max_consecutive_zero_deltas: int = 12,
 ) -> Dict[str, float]:
     try:
         import pretty_midi
@@ -443,29 +451,40 @@ def _generate_one_continuation(
     if not token_ids:
         raise RuntimeError(f"Seed MIDI tokenization produced no tokens: {seed_midi}")
 
-    event_size = int(getattr(tokenizer, "event_size", 3))
+    event_size = int(getattr(tokenizer, "event_size", 4))
     seed_n = min(int(seed_length), len(token_ids))
     seed_n = seed_n - (seed_n % max(1, event_size))
     if seed_n < int(max(1, event_size)):
         raise RuntimeError(
             "Seed MIDI is too short for generation; need at least one full event."
         )
-    seed_tokens = token_ids[:seed_n]
-    seed_onsets = onset_times[:seed_n]
+    seed_tokens = token_ids[-seed_n:]
+    seed_onsets = onset_times[-seed_n:]
 
-    generated_ids = model.generate(
-        seed_tokens=seed_tokens,
-        max_new_tokens=int(max(1, max_new_tokens)),
-        temperature=0.9,
-        top_p=0.95,
-        top_k=50,
-        repetition_penalty=1.1,
-        repetition_window=64,
-        min_tokens_to_keep=3,
-        seed_onset_times=torch.tensor(seed_onsets, dtype=torch.float32),
-        step_seconds=0.1,
-        token_id_to_events=tokenizer.decode_token_id_events,
-    )
+    generate_kwargs: Dict[str, Any] = {
+        "seed_tokens": seed_tokens,
+        "max_new_tokens": int(max(1, max_new_tokens)),
+        "temperature": float(max(0.1, temperature)),
+        "top_p": float(min(1.0, max(0.0, top_p))),
+        "top_k": int(max(1, top_k)),
+        "repetition_penalty": float(max(1.0, repetition_penalty)),
+        "repetition_window": int(max(1, repetition_window)),
+        "min_tokens_to_keep": int(max(1, min_tokens_to_keep)),
+        "seed_onset_times": torch.tensor(seed_onsets, dtype=torch.float32),
+        "step_seconds": 0.1,
+        "token_id_to_events": tokenizer.decode_token_id_events,
+    }
+
+    try:
+        generate_params = inspect.signature(model.generate).parameters
+    except (TypeError, ValueError):
+        generate_params = {}
+    if "max_consecutive_zero_deltas" in generate_params:
+        generate_kwargs["max_consecutive_zero_deltas"] = int(
+            max(1, max_consecutive_zero_deltas)
+        )
+
+    generated_ids = model.generate(**generate_kwargs)
 
     decoded_midi = tokenizer.decode(generated_ids)
     seed_duration = float(pretty_midi.PrettyMIDI(str(seed_midi)).get_end_time())
@@ -530,6 +549,13 @@ def _run_variant(
     output_midi_path: Optional[Path],
     generation_max_new_tokens: int = 8192,
     generation_continuation_seconds: float = 120.0,
+    generation_temperature: float = 0.9,
+    generation_top_p: float = 0.95,
+    generation_top_k: int = 50,
+    generation_repetition_penalty: float = 1.1,
+    generation_repetition_window: int = 64,
+    generation_min_tokens_to_keep: int = 3,
+    generation_max_consecutive_zero_deltas: int = 12,
     resume_from_checkpoint: Optional[Path] = None,
     resume_mode: str = "remaining",
 ) -> Dict[str, Any]:
@@ -609,6 +635,15 @@ def _run_variant(
             seed_length=int(data_cfg.seed_length),
             max_new_tokens=int(max(1, generation_max_new_tokens)),
             continuation_seconds=float(max(1.0, generation_continuation_seconds)),
+            temperature=float(max(0.1, generation_temperature)),
+            top_p=float(min(1.0, max(0.0, generation_top_p))),
+            top_k=int(max(1, generation_top_k)),
+            repetition_penalty=float(max(1.0, generation_repetition_penalty)),
+            repetition_window=int(max(1, generation_repetition_window)),
+            min_tokens_to_keep=int(max(1, generation_min_tokens_to_keep)),
+            max_consecutive_zero_deltas=int(
+                max(1, generation_max_consecutive_zero_deltas)
+            ),
         )
         output_midi = str(output_midi_path.resolve())
     else:

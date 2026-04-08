@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import io
-import json
 import mimetypes
 import os
 import sys
@@ -13,8 +12,6 @@ from typing import Any, Dict, Tuple
 import numpy as np
 import torch
 from flask import Flask, jsonify, render_template, request, send_file
-from safetensors.torch import load_file as safetensors_load_file
-from safetensors import safe_open as safetensors_safe_open
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -22,13 +19,10 @@ REPO_ROOT = APP_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from config import DataConfig, ModelConfig
-from data.tokenizer import PianoTokenizer
-from data.tokenizer_custom import CustomDeltaTokenizer
+from config import DataConfig
 from generation.generate import GenerationConfig, generate_continuation
-from model.factory import build_model
+from utils import checkpoint_loading as ckpt_utils
 from utils.midi_utils import compare_pianorolls, midi_duration, render_midi_audio
-from utils.config_compat import normalize_model_config_payload
 
 
 app = Flask(__name__, template_folder=str(APP_DIR / "templates"))
@@ -56,133 +50,6 @@ _model_cache: Dict[str, Tuple[Tuple[str, int, int], Any, Dict[str, Any]]] = {}
 _tokenizer_cache: Tuple[Tuple[str, int, int], Any, Dict[str, Any]] | None = None
 
 
-def _strip_dataparallel_prefix(
-    state_dict: Dict[str, torch.Tensor],
-) -> Dict[str, torch.Tensor]:
-    """Strip `module.` prefixes produced by DataParallel checkpoints."""
-
-    stripped: Dict[str, torch.Tensor] = {}
-    for key, value in state_dict.items():
-        if key.startswith("module."):
-            stripped[key[len("module.") :]] = value
-        else:
-            stripped[key] = value
-    return stripped
-
-
-def _resolve_sidecar(model_path: Path) -> Path | None:
-    """Resolve checkpoint sidecar state path for a model file."""
-
-    if model_path.suffix == ".pt":
-        return model_path if model_path.exists() else None
-    if model_path.suffix != ".safetensors":
-        return None
-
-    candidates = []
-    stem = model_path.stem
-    candidates.append(model_path.with_name(f"{stem}_state.pt"))
-
-    if stem.endswith("_model"):
-        candidates.append(model_path.with_name(f"{stem[:-6]}_state.pt"))
-
-    if model_path.name.endswith("_model.safetensors"):
-        candidates.append(
-            model_path.with_name(
-                model_path.name.replace("_model.safetensors", "_state.pt")
-            )
-        )
-
-    candidates.append(model_path.with_name("latest_state.pt"))
-
-    for sidecar in candidates:
-        if sidecar.exists():
-            return sidecar
-    return None
-
-
-def _load_safetensors_metadata(model_path: Path) -> Dict[str, Any]:
-    """Load safetensors metadata dictionary when available."""
-
-    if model_path.suffix != ".safetensors" or not model_path.exists():
-        return {}
-    try:
-        with safetensors_safe_open(str(model_path), framework="pt", device="cpu") as f:
-            metadata = f.metadata() or {}
-        if isinstance(metadata, dict):
-            return dict(metadata)
-    except Exception:
-        return {}
-    return {}
-
-
-def _metadata_from_sidecar_payload(sidecar_path: Path | None) -> Dict[str, Any]:
-    """Extract metadata-like fields from a `.pt` sidecar payload."""
-
-    if (
-        sidecar_path is None
-        or not sidecar_path.exists()
-        or sidecar_path.suffix != ".pt"
-    ):
-        return {}
-    try:
-        state = torch.load(sidecar_path, map_location="cpu")
-    except Exception:
-        return {}
-    if not isinstance(state, dict):
-        return {}
-
-    metadata: Dict[str, Any] = {}
-    for key in ("epoch", "val_loss", "train_config", "data_config", "model_config"):
-        value = state.get(key)
-        if value is None:
-            continue
-        if isinstance(value, (dict, list, str, int, float, bool)):
-            metadata[key] = value
-        else:
-            try:
-                metadata[key] = value.__dict__
-            except Exception:
-                continue
-    return metadata
-
-
-def _resolve_checkpoint_metadata(
-    model_path: Path, sidecar_path: Path | None
-) -> Dict[str, Any]:
-    """Load checkpoint metadata from safetensors or sidecar fallback."""
-
-    metadata = _load_safetensors_metadata(model_path)
-    if metadata:
-        return metadata
-
-    sidecar_metadata = _metadata_from_sidecar_payload(sidecar_path)
-    if sidecar_metadata:
-        return sidecar_metadata
-
-    return {}
-
-
-def _coerce_mapping(value: Any) -> Dict[str, Any]:
-    """Coerce dict-like payloads or JSON strings into dictionaries."""
-
-    if isinstance(value, dict):
-        return dict(value)
-    if isinstance(value, str) and value.strip():
-        try:
-            payload = json.loads(value)
-        except Exception:
-            return {}
-        if isinstance(payload, dict):
-            return dict(payload)
-    return {}
-
-
-def _extract_data_config(metadata: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract the nested data_config payload from checkpoint metadata."""
-
-    return _coerce_mapping(metadata.get("data_config"))
-
-
 def _path_signature(path: Path) -> Tuple[str, int, int]:
     """Build a lightweight cache key for a file path."""
 
@@ -197,151 +64,6 @@ def _resolve_existing_path(paths: tuple[Path, ...]) -> Path | None:
         if candidate.exists():
             return candidate
     return None
-
-
-def _detect_tokenizer_kind(tokenizer_path: Path, data_config: Dict[str, Any]) -> str:
-    """Detect which tokenizer loader should be used for a checkpoint."""
-
-    strategy = str(data_config.get("tokenization_strategy", "")).strip().lower()
-    if strategy == "custom_delta":
-        return "custom_delta"
-
-    if tokenizer_path.suffix.lower() == ".json":
-        try:
-            payload = json.loads(tokenizer_path.read_text(encoding="utf-8"))
-        except Exception:
-            payload = {}
-        if str(payload.get("type", "")).strip() == "CustomDeltaTokenizer":
-            return "custom_delta"
-
-    return "piano"
-
-
-def _resolve_tokenizer_path(data_config: Dict[str, Any]) -> Path:
-    """Resolve the tokenizer file from checkpoint metadata or known search paths."""
-
-    strategy = str(data_config.get("tokenization_strategy", "")).strip().lower()
-    candidates = []
-
-    if strategy == "custom_delta":
-        candidates.append(TOKENIZER_CUSTOM_PATH)
-
-    tokenizer_path = str(data_config.get("tokenizer_path", "")).strip()
-    if tokenizer_path:
-        candidates.append(Path(tokenizer_path).expanduser())
-        candidates.append(Path(tokenizer_path))
-
-    if strategy != "custom_delta":
-        candidates.append(TOKENIZER_CUSTOM_PATH)
-
-    candidates.extend(TOKENIZER_SEARCH_PATHS)
-    resolved = _resolve_existing_path(tuple(dict.fromkeys(candidates)))
-    if resolved is None:
-        raise FileNotFoundError(
-            f"Tokenizer not found in: {', '.join(str(p) for p in TOKENIZER_SEARCH_PATHS)}"
-        )
-    return resolved
-
-
-def _load_tokenizer_from_path(tokenizer_path: Path, data_config: Dict[str, Any]) -> tuple[Any, Dict[str, Any]]:
-    """Load tokenizer with the correct class for the file format."""
-
-    tokenizer_kind = _detect_tokenizer_kind(tokenizer_path, data_config)
-    if tokenizer_kind == "custom_delta":
-        tokenizer = CustomDeltaTokenizer.load(str(tokenizer_path))
-    else:
-        tokenizer = PianoTokenizer.load(str(tokenizer_path))
-
-    meta = {
-        "tokenizer_path": str(tokenizer_path),
-        "tokenizer_kind": tokenizer_kind,
-    }
-    return tokenizer, meta
-def _parse_json_metadata_value(
-    metadata: Dict[str, Any], key: str
-) -> Dict[str, Any] | None:
-    """Parse JSON-encoded metadata payload for a specific key."""
-
-    raw = metadata.get(key)
-    if not isinstance(raw, str) or not raw.strip():
-        return None
-    try:
-        payload = json.loads(raw)
-    except Exception:
-        return None
-    if isinstance(payload, dict):
-        return payload
-    return None
-
-
-def _load_model_config_from_sidecar(sidecar_path: Path | None) -> ModelConfig | None:
-    """Load model configuration from sidecar state if present."""
-
-    if sidecar_path is None or sidecar_path.suffix != ".pt":
-        return None
-    try:
-        state = torch.load(sidecar_path, map_location="cpu")
-    except Exception:
-        return None
-    payload = state.get("model_config") if isinstance(state, dict) else None
-    if not isinstance(payload, dict):
-        return None
-    try:
-        return ModelConfig(**normalize_model_config_payload(dict(payload)))
-    except Exception:
-        return None
-
-
-def _load_model_config_from_checkpoint_metadata(model_path: Path) -> ModelConfig | None:
-    """Load model configuration from safetensors metadata payload."""
-
-    metadata = _load_safetensors_metadata(model_path)
-    payload = _parse_json_metadata_value(metadata, "model_config")
-    if payload is None:
-        return None
-    try:
-        return ModelConfig(**normalize_model_config_payload(dict(payload)))
-    except Exception:
-        return None
-
-
-def _validate_model_config_against_state(
-    model_cfg: ModelConfig, state_dict: Dict[str, torch.Tensor], model_path: Path
-) -> None:
-    """Validate config dimensions match checkpoint tensor shapes."""
-
-    token_weight = state_dict.get("token_embedding.weight")
-    if token_weight is None:
-        raise RuntimeError(
-            f"Checkpoint {model_path.name} is missing token_embedding.weight; "
-            "cannot validate model dimensions."
-        )
-
-    inferred_vocab = int(token_weight.shape[0])
-    inferred_d_model = int(token_weight.shape[1])
-    if model_cfg.vocab_size != inferred_vocab or model_cfg.d_model != inferred_d_model:
-        raise RuntimeError(
-            f"Checkpoint {model_path.name} config mismatch: metadata/sidecar says "
-            f"vocab_size={model_cfg.vocab_size}, d_model={model_cfg.d_model}, but "
-            f"weights are vocab_size={inferred_vocab}, d_model={inferred_d_model}."
-        )
-
-
-def _load_state_dict(model_path: Path) -> Dict[str, torch.Tensor]:
-    """Load model weights from `.safetensors` or `.pt` checkpoint."""
-
-    if model_path.suffix == ".safetensors":
-        raw = safetensors_load_file(str(model_path), device="cpu")
-        return _strip_dataparallel_prefix(raw)
-
-    state = torch.load(model_path, map_location="cpu")
-    if isinstance(state, dict):
-        if "state_dict" in state and isinstance(state["state_dict"], dict):
-            return _strip_dataparallel_prefix(state["state_dict"])
-        tensor_dict = {k: v for k, v in state.items() if isinstance(v, torch.Tensor)}
-        if tensor_dict:
-            return _strip_dataparallel_prefix(tensor_dict)
-    raise RuntimeError(f"Unsupported checkpoint format: {model_path}")
 
 
 def _load_model(model_name: str) -> Tuple[Any, Dict[str, Any]]:
@@ -362,35 +84,26 @@ def _load_model(model_name: str) -> Tuple[Any, Dict[str, Any]]:
     if cached is not None and cached[0] == signature:
         return cached[1], cached[2]
 
-    sidecar = _resolve_sidecar(model_path)
-    checkpoint_metadata = _resolve_checkpoint_metadata(model_path, sidecar)
-    model_cfg = _load_model_config_from_checkpoint_metadata(model_path)
-    if model_cfg is None:
-        model_cfg = _load_model_config_from_sidecar(sidecar)
-
-    state_dict = _load_state_dict(model_path)
-    if model_cfg is None:
-        raise RuntimeError(
-            f"Checkpoint {model_path.name} is missing model_config metadata and sidecar "
-            "model config. Re-save the checkpoint with training metadata or provide "
-            "the matching *_state.pt sidecar."
-        )
-    model_cfg = ModelConfig(**normalize_model_config_payload(dict(model_cfg.__dict__)))
-    _validate_model_config_against_state(model_cfg, state_dict, model_path)
-
-    model = build_model(model_cfg)
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    model.eval()
-    model.to(torch.device("cpu"))
+    sidecar = ckpt_utils.resolve_sidecar_path(model_path)
+    bundle = ckpt_utils.load_model_from_checkpoint(
+        model_path=model_path,
+        sidecar_path=sidecar,
+        device="cpu",
+        strict=True,
+    )
+    model = bundle.model
 
     meta = {
-        "missing_keys": int(len(missing)),
-        "unexpected_keys": int(len(unexpected)),
+        "missing_keys": int(bundle.missing_keys),
+        "unexpected_keys": int(bundle.unexpected_keys),
         "checkpoint": str(model_path.name),
         "checkpoint_path": str(model_path),
-        "sidecar_path": str(sidecar) if sidecar is not None else None,
-        "model_config": dict(model_cfg.__dict__),
-        "checkpoint_metadata": checkpoint_metadata,
+        "sidecar_path": str(bundle.sidecar_path)
+        if bundle.sidecar_path is not None
+        else None,
+        "model_class": str(bundle.model_class),
+        "model_config": dict(bundle.model_config),
+        "checkpoint_metadata": dict(bundle.checkpoint_metadata),
     }
     _model_cache[model_name] = (signature, model, meta)
     return model, meta
@@ -400,15 +113,21 @@ def _load_tokenizer_for_model(meta: Dict[str, Any]) -> tuple[Any, Dict[str, Any]
     """Load tokenizer from known search paths with cache and checkpoint metadata."""
 
     global _tokenizer_cache
-    checkpoint_metadata = _coerce_mapping(meta.get("checkpoint_metadata"))
-    data_config = _extract_data_config(checkpoint_metadata)
-    tokenizer_path = _resolve_tokenizer_path(data_config)
+    checkpoint_metadata = ckpt_utils.coerce_mapping(meta.get("checkpoint_metadata"))
+    data_config = ckpt_utils.extract_data_config(checkpoint_metadata)
+    tokenizer_path = ckpt_utils.resolve_tokenizer_path(
+        data_config=data_config,
+        search_paths=TOKENIZER_SEARCH_PATHS,
+    )
     signature = _path_signature(tokenizer_path)
 
     if _tokenizer_cache is not None and _tokenizer_cache[0] == signature:
         return _tokenizer_cache[1], _tokenizer_cache[2]
 
-    tokenizer, tokenizer_meta = _load_tokenizer_from_path(tokenizer_path, data_config)
+    tokenizer, tokenizer_meta = ckpt_utils.load_tokenizer(
+        tokenizer_path=tokenizer_path,
+        data_config=data_config,
+    )
     tokenizer_meta.update(
         {
             "tokenizer_path": str(tokenizer_path),
@@ -455,15 +174,6 @@ def _compute_repetition_warning(tokens: list[int]) -> str | None:
     if ratio > 0.60:
         return f"Generated continuation has high repetition ({ratio * 100:.1f}% identical token share)."
     return None
-
-
-def _decode_and_write(
-    tokenizer: PianoTokenizer, tokens: list[int], out_path: Path
-) -> None:
-    """Decode generated tokens and write output MIDI to disk."""
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    tokenizer.decode(tokens, out_path)
 
 
 def _make_request_dir() -> Path:
@@ -534,7 +244,7 @@ def _build_local_generation_status() -> Dict[str, Any]:
     tokenizer_path = _resolve_existing_path(TOKENIZER_SEARCH_PATHS)
     tokenizer_kind = None
     if tokenizer_path is not None:
-        tokenizer_kind = _detect_tokenizer_kind(tokenizer_path, _extract_data_config({}))
+        tokenizer_kind = ckpt_utils.detect_tokenizer_kind(tokenizer_path, {})
 
     models = _list_models()
     ready = bool(models and tokenizer_path is not None)
@@ -632,7 +342,9 @@ def api_generate() -> Any:
         if not seed_tokens:
             return jsonify({"error": "Tokenizer produced no tokens for seed file"}), 400
 
-        data_cfg_payload = _extract_data_config(meta.get("checkpoint_metadata", {}))
+        data_cfg_payload = ckpt_utils.extract_data_config(
+            ckpt_utils.coerce_mapping(meta.get("checkpoint_metadata", {}))
+        )
         data_cfg = DataConfig(**data_cfg_payload)
 
         supports_time = bool(getattr(getattr(model, "config", None), "use_v2_architecture", False))

@@ -73,6 +73,9 @@ desktop.ini
 .env
 *.env
 
+# Local token-bearing helper scripts
+token_script.ps1
+
 # Weights and Biases
 wandb/
 

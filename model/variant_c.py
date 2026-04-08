@@ -250,6 +250,7 @@ class VariantCModel(nn.Module):
         seed_onset_times: Sequence[float] | torch.Tensor | None = None,
         step_seconds: float = 0.1,
         token_id_to_events: Any = None,
+        max_consecutive_zero_deltas: int = 8,
     ) -> List[int]:
         self.eval()
         device = next(self.parameters()).device
@@ -278,6 +279,8 @@ class VariantCModel(nn.Module):
         final_top1_probs: List[float] = []
         raw_top1_probs: List[float] = []
         candidate_counts: List[int] = []
+        zero_delta_streak = 0
+        max_zero_delta = max(0, int(max_consecutive_zero_deltas))
 
         for _ in range(int(max_new_tokens)):
             context_tokens = tokens[:, -self.max_sequence_length :]
@@ -297,6 +300,18 @@ class VariantCModel(nn.Module):
                 logits[:, -1, :],
                 next_slot,
             )
+            if (
+                next_slot == 0
+                and max_zero_delta > 0
+                and zero_delta_streak >= max_zero_delta
+                and masked_logits.shape[-1] > 1
+            ):
+                # Prevent pathological near-simultaneous note piles by forcing a
+                # non-zero delta token after too many consecutive zero-delta events.
+                valid_non_zero = bool(torch.isfinite(masked_logits[:, 1:]).any())
+                if valid_non_zero:
+                    masked_logits = masked_logits.clone()
+                    masked_logits[:, 0] = float("-inf")
             next_token, diagnostics = sample_next_token(
                 logits=masked_logits,
                 context_tokens=context_tokens,
@@ -324,6 +339,10 @@ class VariantCModel(nn.Module):
             tok = int(next_token.view(-1)[0].item())
             delta = float(max(1e-4, step_seconds))
             if slot == 0:
+                if tok == 0:
+                    zero_delta_streak += 1
+                else:
+                    zero_delta_streak = 0
                 delta = self._delta_from_token_events(
                     token_id=tok,
                     token_id_to_events=token_id_to_events,
