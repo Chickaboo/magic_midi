@@ -42,7 +42,7 @@ from training.scheduler import WarmupCosineScheduler
 
 
 VARIANT_E_40M_PROFILE: Dict[str, float] = {
-    "d_model": 768,
+    "d_model": 640,
     "n_layers": 13,
     "attention_every_n_layers": 2,
     "gdn_inner_ratio": 0.5,

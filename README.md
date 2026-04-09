@@ -398,7 +398,7 @@ This notebook replaces the retired split scripts:
 Unified ~40M profile targets:
 
 - Variant C: `d_model=512`, `n_layers=12`, `num_attention_heads=8`, `ffn_expansion=4` (~38.94M)
-- Variant E: `d_model=768`, `n_layers=13`, `attention_every_n_layers=2`, GDN inner ratio `0.5` (~38.92M)
+- Variant E: `d_model=640`, `n_layers=13`, `attention_every_n_layers=2`, GDN inner ratio `0.5` (~40M target)
 
 Recommended workflow for your larger pilot (100k pieces):
 
