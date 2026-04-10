@@ -167,6 +167,7 @@ class TrainConfig:
         generation_health_top_k: Top-k for health-check sampling.
         generation_health_repetition_penalty: Repetition penalty for health checks.
         generation_health_min_tokens_to_keep: Minimum candidate set size.
+        save_every_n_steps: Save latest checkpoint every N optimizer steps (0 disables).
         save_every_n_epochs: Tagged checkpoint cadence.
         keep_every_n_epochs: Milestone checkpoint cadence.
         max_checkpoints: Hard cap on `.safetensors` checkpoint files.
@@ -197,6 +198,7 @@ class TrainConfig:
     generation_health_top_k: int = 50
     generation_health_repetition_penalty: float = 1.1
     generation_health_min_tokens_to_keep: int = 3
+    save_every_n_steps: int = 0
     save_every_n_epochs: int = 10
     keep_every_n_epochs: int = 25
     max_checkpoints: int = 8

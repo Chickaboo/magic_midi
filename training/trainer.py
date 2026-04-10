@@ -248,6 +248,9 @@ class Trainer:
         self.log_every_n_steps = max(
             1, int(getattr(self.config, "_log_every_n_steps", 100))
         )
+        self.save_every_n_steps = max(
+            0, int(getattr(self.config, "save_every_n_steps", 0))
+        )
 
         self.checkpoint_dir = Path(self.config.checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -492,6 +495,22 @@ class Trainer:
 
                 lr = self.optimizer.param_groups[0]["lr"]
                 self.history["lr"].append(float(lr))
+
+                if (
+                    self.save_every_n_steps > 0
+                    and self.global_step % int(self.save_every_n_steps) == 0
+                ):
+                    latest_val = (
+                        float(self.history["val_loss"][-1])
+                        if self.history["val_loss"]
+                        else float("inf")
+                    )
+                    self.save_checkpoint(epoch=epoch, val_loss=latest_val)
+                    LOGGER.info(
+                        "Step checkpoint saved | epoch=%03d step=%06d",
+                        int(epoch),
+                        int(self.global_step),
+                    )
 
             running_loss += loss_value
             running_count += 1

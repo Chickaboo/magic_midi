@@ -7,8 +7,7 @@ from pathlib import Path
 import torch
 
 from config import DataConfig
-from data.tokenizer import PianoTokenizer
-from data.tokenizer_custom import CustomDeltaTokenizer
+from data.tokenizer import CustomDeltaTokenizer, PianoTokenizer
 from generation.generate import GenerationConfig, generate_continuation
 from utils import checkpoint_loading as ckpt_utils
 from utils.midi_utils import compare_pianorolls, render_midi_audio

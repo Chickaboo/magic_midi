@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Sequence, Tuple
 import numpy as np
 from miditok import Octuple, REMI, TokenizerConfig
 
+from data.tokenizer_custom import CustomDeltaTokenizer
+
 
 TIME_EVENT_TYPES = {
     "bar",
@@ -690,6 +692,64 @@ class PianoTokenizer:
     def _relative_diff(a: float, b: float) -> float:
         denom = max(abs(a), 1e-8)
         return abs(a - b) / denom
+
+
+def create_tokenizer(
+    strategy: str = "custom_delta",
+    **kwargs: Any,
+) -> Any:
+    """Create tokenizer instance from one stable strategy selector."""
+
+    normalized = str(strategy).strip().lower()
+    if normalized in {"custom_delta", "delta", "quad", "event_quad"}:
+        return CustomDeltaTokenizer(
+            default_velocity=int(kwargs.get("default_velocity", 88)),
+            include_special_tokens=bool(kwargs.get("include_special_tokens", False)),
+        )
+    if normalized in {"remi", "octuple"}:
+        return PianoTokenizer(strategy=normalized)
+    raise ValueError(
+        "Unsupported tokenizer strategy "
+        f"'{strategy}'. Expected one of: custom_delta, remi, octuple."
+    )
+
+
+def load_tokenizer(path: str | Path, strategy: str | None = None) -> Any:
+    """Load tokenizer from disk with automatic type detection."""
+
+    load_path = Path(path)
+    if not load_path.exists():
+        raise FileNotFoundError(f"Tokenizer file not found: {load_path}")
+
+    forced = str(strategy).strip().lower() if strategy is not None else ""
+    if forced:
+        if forced in {"custom_delta", "delta", "quad", "event_quad"}:
+            return CustomDeltaTokenizer.load(str(load_path))
+        if forced in {"remi", "octuple"}:
+            return PianoTokenizer.load(str(load_path))
+        raise ValueError(
+            "Unsupported tokenizer strategy "
+            f"'{strategy}'. Expected one of: custom_delta, remi, octuple."
+        )
+
+    try:
+        import json
+
+        payload = json.loads(load_path.read_text(encoding="utf-8"))
+        if str(payload.get("type", "")).strip() == "CustomDeltaTokenizer":
+            return CustomDeltaTokenizer.load(str(load_path))
+    except Exception:
+        pass
+
+    return PianoTokenizer.load(str(load_path))
+
+
+__all__ = [
+    "PianoTokenizer",
+    "CustomDeltaTokenizer",
+    "create_tokenizer",
+    "load_tokenizer",
+]
 
 
 def _import_pretty_midi() -> Any:

@@ -240,7 +240,7 @@ cd app
 ./run.sh     # or run.bat on Windows
 ```
 
-## A/B/C/D/E Architecture Ablation
+## A/B/C/D/E/F Architecture Ablation
 
 For your current Godzilla research track, use these architecture labels consistently:
 
@@ -249,6 +249,7 @@ For your current Godzilla research track, use these architecture labels consiste
 3. `variant_c`: pure attention Transformer baseline (control)
 4. `variant_d`: pure CfC recurrent baseline (no attention)
 5. `variant_e`: Gated Delta Net + sparse attention (no CfC)
+6. `variant_f`: event-hierarchical tri-path hybrid (harmonic + temporal + structural)
 
 Run ablations in comparable small-model mode (10M-15M range per variant):
 
@@ -258,7 +259,7 @@ python -m training.ablation_runner \
   --pretokenized_root processed/godzilla_tokenized \
   --skip_generation \
   --output_dir outputs/godzilla_ablation \
-  --variants a,b,c,d,e \
+  --variants a,b,c,d,e,f \
   --size_mode balanced_small \
   --epochs 3 \
   --batch_size 4
@@ -273,17 +274,18 @@ Notes:
 - `variant_b` and `variant_c` stay near ~12M as fixed anchors for comparison.
 - `variant_d` is the pure-CfC baseline (balanced profile targets ~12M for fair comparison).
 - `variant_e` is auto-tuned at runtime in balanced mode and uses sparse attention anchors (every 2 layers, always final layer) without any CfC blocks.
+- `variant_f` is auto-tuned at runtime in balanced mode and adds tri-path fusion with phrase memory under the same quad-event tokenizer contract.
 - On multi-GPU Kaggle runs, Trainer auto-disables DataParallel when real Variant-A GDN kernels are detected to avoid Triton replica autotuner crashes.
 
-To directly test the current champion (`variant_c`) against the new no-CfC GDN contender:
+To directly test the current champion (`variant_c`) against both GDN-family contenders (`variant_e`, `variant_f`):
 
 ```bash
 python -m training.ablation_runner \
   --pretokenized_manifest processed/godzilla_tokenized/metadata/manifest.json \
   --pretokenized_root processed/godzilla_tokenized \
   --skip_generation \
-  --output_dir outputs/godzilla_c_vs_e \
-  --variants c,e \
+  --output_dir outputs/godzilla_c_vs_ef \
+  --variants c,e,f \
   --size_mode balanced_small \
   --epochs 3 \
   --batch_size 4
@@ -300,6 +302,9 @@ Notes:
 Use the local tokenizer runner to produce resumable event-quad `.npz` packs and manifests.
 
 The tokenizer is frozen at spec version 1 and matches the exact event-quad tokenizer used by the 150M training runs and the 40M / 100k-piece sub-100M runs. Treat this as a one-time corpus pass: do not change token IDs, bin boundaries, or event size after tokenization starts.
+
+For code integrations, use the unified tokenizer module surface:
+- `from data.tokenizer import create_tokenizer, load_tokenizer`
 
 ```bash
 python scripts/tokenize_godzilla_local.py \
@@ -383,7 +388,7 @@ kaggle datasets version -p F:/tokenized/godzilla_full -m "update tokenized corpu
 
 Keep both `data/` and `metadata/` in that Kaggle dataset so manifest-relative `.npz` paths resolve correctly.
 
-## Variant C/E Sub-100M Quality Validation (Kaggle)
+## Variant C/E/F Sub-100M Quality Validation (Kaggle)
 
 Use the unified notebook for sub-100M architecture validation:
 
@@ -399,11 +404,14 @@ Unified ~40M profile targets:
 
 - Variant C: `d_model=512`, `n_layers=12`, `num_attention_heads=8`, `ffn_expansion=4` (~38.94M)
 - Variant E: `d_model=640`, `n_layers=13`, `attention_every_n_layers=2`, GDN inner ratio `0.5` (~40M target)
+- Variant F: `d_model=544`, `n_layers=9`, tri-path ratios `0.40/0.30/0.30`, `cross_stream_every_n_layers=2` (~40M target)
+
+These are target-budget profiles. Realized parameter counts can differ in fallback-kernel environments versus real-kernel CUDA runs.
 
 Recommended workflow for your larger pilot (100k pieces):
 
 1. Open `notebooks/01_t4_sub100m_unified_variant_ce.ipynb`.
-2. Set `VARIANT` to `"c"` or `"e"`.
+2. Set `VARIANT` to `"c"`, `"e"`, or `"f"`.
 3. Keep `MAX_PIECES = 100_000` (or adjust).
 4. Set `RUN_TRAINING = True`.
 5. Run all cells top-to-bottom.
@@ -413,15 +421,15 @@ The notebook keeps:
 - automatic NPZ manifest creation
 - checkpoint auto-resume (`AUTO_RESUME` + optional `RESUME_FROM_CHECKPOINT`)
 - generation controls and result JSON export
-- identical preprocessing/training pipeline for both variants to keep comparisons fair
+- identical preprocessing/training pipeline for all three variants to keep comparisons fair
 
 Optional CLI (same unified backend used by the notebook):
 
 ```bash
 python -m training.sub100m_unified \
-  --variant e \
+  --variant f \
   --npz_root /kaggle/input/<your-tokenized-dataset>/data \
-  --output_dir /kaggle/working/sub100m_e_100k \
+  --output_dir /kaggle/working/sub100m_f_100k \
   --max_pieces 100000 \
   --epochs 20 \
   --batch_size 1 \
@@ -576,7 +584,7 @@ Before long training runs, generate a readiness audit report:
 
 ```bash
 python tools/audit_ablation_readiness.py \
-  --variants a,b,c,d,e \
+  --variants a,b,c,d,e,f \
   --size_mode balanced_small \
   --pretokenized_manifest processed/godzilla_tokenized/metadata/manifest.json \
   --pretokenized_root processed/godzilla_tokenized \

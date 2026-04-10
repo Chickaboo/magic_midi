@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional
 import torch
 
 from config import DataConfig, TrainConfig
-from data.tokenizer_custom import CustomDeltaTokenizer
+from data.tokenizer import CustomDeltaTokenizer
 from model.variant_e import VariantEConfig, VariantEModel
 from training.ablation_runner import (
     _build_dataloaders,

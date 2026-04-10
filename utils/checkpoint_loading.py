@@ -10,14 +10,14 @@ from safetensors import safe_open as safetensors_safe_open
 from safetensors.torch import load_file as safetensors_load_file
 
 from config import ModelConfig
-from data.tokenizer import PianoTokenizer
-from data.tokenizer_custom import CustomDeltaTokenizer
+from data.tokenizer import CustomDeltaTokenizer, PianoTokenizer
 from model.factory import build_model
 from model.variant_a import VariantAConfig, VariantAModel
 from model.variant_b import VariantBConfig, VariantBModel
 from model.variant_c import VariantCConfig, VariantCModel
 from model.variant_d import VariantDConfig, VariantDModel
 from model.variant_e import VariantEConfig, VariantEModel
+from model.variant_f import VariantFConfig, VariantFModel
 from utils.config_compat import normalize_model_config_payload
 
 
@@ -218,6 +218,19 @@ def infer_model_architecture(model_config_payload: Dict[str, Any]) -> str:
         }
         & keys
     )
+    has_variant_f_markers = bool(
+        {
+            "event_size",
+            "harmonic_ratio",
+            "temporal_ratio",
+            "structural_num_heads",
+            "cross_stream_every_n_layers",
+        }
+        & keys
+    )
+
+    if has_variant_f_markers:
+        return "variant_f"
 
     if has_gdn and has_cfc:
         return "variant_a"
@@ -274,6 +287,11 @@ def _build_model_from_payload(
         allowed = set(VariantEConfig.__annotations__.keys())
         cfg = VariantEConfig(**_filter_payload(payload, allowed))
         return VariantEModel(cfg), cfg, arch
+
+    if arch == "variant_f":
+        allowed = set(VariantFConfig.__annotations__.keys())
+        cfg = VariantFConfig(**_filter_payload(payload, allowed))
+        return VariantFModel(cfg), cfg, arch
 
     normalized = normalize_model_config_payload(dict(payload))
     allowed = set(ModelConfig.__annotations__.keys())

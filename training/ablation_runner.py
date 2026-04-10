@@ -18,12 +18,13 @@ from torch.utils.data import DataLoader
 try:
     from config import DataConfig, TrainConfig
     from data.dataset import PianoDataset
-    from data.tokenizer_custom import CustomDeltaTokenizer
+    from data.tokenizer import CustomDeltaTokenizer
     from model.variant_a import VariantAConfig, VariantAModel
     from model.variant_b import VariantBConfig, VariantBModel
     from model.variant_c import VariantCConfig, VariantCModel
     from model.variant_d import VariantDConfig, VariantDModel
     from model.variant_e import VariantEConfig, VariantEModel
+    from model.variant_f import VariantFConfig, VariantFModel
     from training.trainer import Trainer
     from utils.logging_utils import get_project_logger
 except ModuleNotFoundError:
@@ -32,12 +33,13 @@ except ModuleNotFoundError:
         sys.path.insert(0, str(ROOT))
     from config import DataConfig, TrainConfig
     from data.dataset import PianoDataset
-    from data.tokenizer_custom import CustomDeltaTokenizer
+    from data.tokenizer import CustomDeltaTokenizer
     from model.variant_a import VariantAConfig, VariantAModel
     from model.variant_b import VariantBConfig, VariantBModel
     from model.variant_c import VariantCConfig, VariantCModel
     from model.variant_d import VariantDConfig, VariantDModel
     from model.variant_e import VariantEConfig, VariantEModel
+    from model.variant_f import VariantFConfig, VariantFModel
     from training.trainer import Trainer
     from utils.logging_utils import get_project_logger
 
@@ -50,6 +52,7 @@ ARCHITECTURE_LABELS: Dict[str, str] = {
     "variant_c": "pure_attention_transformer_baseline",
     "variant_d": "pure_cfc_recurrent_baseline",
     "variant_e": "gated_delta_sparse_attention_no_cfc",
+    "variant_f": "event_hierarchical_tri_path_hybrid",
 }
 
 BALANCED_SMALL_PROFILES: Dict[str, Dict[str, int]] = {
@@ -59,6 +62,7 @@ BALANCED_SMALL_PROFILES: Dict[str, Dict[str, int]] = {
     "variant_c": {"d_model": 480, "n_layers": 4},
     "variant_d": {"d_model": 608, "n_layers": 8},
     "variant_e": {"d_model": 544, "n_layers": 6},
+    "variant_f": {"d_model": 416, "n_layers": 6},
 }
 
 
@@ -713,6 +717,11 @@ def _parse_variants_arg(raw: str) -> List[str]:
         "gdn_no_cfc": "variant_e",
         "gdn_sparse_attention": "variant_e",
         "gdn_attention_lite": "variant_e",
+        "f": "variant_f",
+        "variant_f": "variant_f",
+        "event_hybrid": "variant_f",
+        "event_hierarchical": "variant_f",
+        "tri_path": "variant_f",
     }
 
     seen = set()
@@ -730,8 +739,8 @@ def _parse_variants_arg(raw: str) -> List[str]:
         seen.add(name)
         resolved.append(name)
 
-    if not resolved:
-        raise ValueError("No variants selected. Use --variants a,b,c,d,e (or subset).")
+        if not resolved:
+            raise ValueError("No variants selected. Use --variants a,b,c,d,e,f (or subset).")
     return resolved
 
 
@@ -829,7 +838,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--require_real_gdn",
         action="store_true",
-        help="Fail run if Variant A cannot use real flash-linear-attention GDN kernels.",
+        help="Fail run if selected GDN-based variants cannot use real flash-linear-attention GDN kernels.",
     )
     return parser.parse_args()
 
@@ -1054,6 +1063,29 @@ def main() -> None:
                     attention_every_n_layers=2,
                 )
             )
+        elif name == "variant_f":
+            model = VariantFModel(
+                VariantFConfig(
+                    vocab_size=tokenizer.vocab_size,
+                    d_model=d_model,
+                    n_layers=n_layers,
+                    max_sequence_length=data_cfg.max_sequence_length,
+                    event_size=int(getattr(tokenizer, "event_size", 4)),
+                    harmonic_ratio=0.40,
+                    temporal_ratio=0.30,
+                    gdn_inner_ratio=0.50,
+                    gdn_num_heads=4,
+                    temporal_cfc_backbone_units=max(128, int(d_model * 0.75)),
+                    temporal_cfc_backbone_layers=2,
+                    structural_num_heads=attn_heads,
+                    structural_gqa_groups=max(1, min(4, attn_heads)),
+                    cross_stream_every_n_layers=2,
+                    tokens_per_phrase=8,
+                    memory_size=64,
+                    theme_memory_heads=max(1, min(8, attn_heads)),
+                    use_continuous_time=True,
+                )
+            )
         else:
             raise ValueError(f"Unsupported variant {name}")
 
@@ -1064,6 +1096,14 @@ def main() -> None:
             "gdn_heads": int(gdn_heads),
             "gqa_groups": int(gqa_groups),
         }
+        if name == "variant_f":
+            shape_meta.update(
+                {
+                    "harmonic_ratio": 0.40,
+                    "temporal_ratio": 0.30,
+                    "cross_stream_every_n_layers": 2,
+                }
+            )
         return model, shape_meta
 
     if str(args.size_mode) == "balanced_small" and "variant_a" in selected_variants:
@@ -1205,7 +1245,7 @@ def main() -> None:
     for name in selected_variants:
         model, shape_meta = _build_variant(name)
         backend_status = _variant_backend_status(model)
-        if name in {"variant_a", "variant_e"} and bool(args.require_real_gdn):
+        if name in {"variant_a", "variant_e", "variant_f"} and bool(args.require_real_gdn):
             if backend_status["gdn_using_fallback"]:
                 raise RuntimeError(
                     "Selected GDN variant is using fallback GDN. Install flash-linear-attention or run without --require_real_gdn."

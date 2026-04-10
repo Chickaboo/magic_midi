@@ -1,7 +1,8 @@
 from .baseline import PianoBaselineModel
 from .hybrid import PianoHybridModel
 from .hybrid_v2 import IttyBittyPianoV2
-from .factory import build_model
+from .variant_f import VariantFConfig, VariantFModel
+from .factory import build_model, build_named_model
 from .mamba_block import MAMBA_AVAILABLE, MambaBlock
 from .cfc_block import CfCBlock
 from .ffn_block import FeedForwardBlock
@@ -19,7 +20,10 @@ __all__ = [
     "PianoBaselineModel",
     "PianoHybridModel",
     "IttyBittyPianoV2",
+    "VariantFConfig",
+    "VariantFModel",
     "build_model",
+    "build_named_model",
     "MAMBA_AVAILABLE",
     "MambaBlock",
     "CfCBlock",

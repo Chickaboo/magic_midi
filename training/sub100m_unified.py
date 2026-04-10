@@ -10,9 +10,10 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import numpy as np
 
 from config import DataConfig, TrainConfig
-from data.tokenizer_custom import CustomDeltaTokenizer
+from data.tokenizer import CustomDeltaTokenizer
 from model.variant_c import VariantCConfig, VariantCModel
 from model.variant_e import VariantEConfig, VariantEModel
+from model.variant_f import VariantFConfig, VariantFModel
 from training.ablation_runner import (
     _build_dataloaders,
     _load_pretokenized_manifest,
@@ -39,6 +40,21 @@ UNIFIED_40M_PROFILES: Dict[str, Dict[str, float]] = {
         "gdn_num_heads": 4,
         "gqa_num_heads": 8,
         "gqa_groups": 4,
+        "target_params": 40_000_000,
+    },
+    "f": {
+        "d_model": 544,
+        "n_layers": 9,
+        "harmonic_ratio": 0.40,
+        "temporal_ratio": 0.30,
+        "gdn_inner_ratio": 0.50,
+        "gdn_num_heads": 4,
+        "structural_num_heads": 8,
+        "structural_gqa_groups": 4,
+        "cross_stream_every_n_layers": 2,
+        "tokens_per_phrase": 8,
+        "memory_size": 64,
+        "theme_memory_heads": 8,
         "target_params": 40_000_000,
     },
 }
@@ -71,6 +87,7 @@ class UnifiedSub100mConfig:
     max_grad_norm: float = 1.0
     num_workers: int = 0
     log_every_n_steps: int = 20
+    save_every_n_steps: int = 0
     save_every_n_epochs: int = 5
     keep_every_n_epochs: int = 10
     max_checkpoints: int = 8
@@ -92,6 +109,7 @@ class UnifiedSub100mConfig:
 
     enable_data_parallel_c: bool = True
     enable_data_parallel_e: bool = True
+    enable_data_parallel_f: bool = False
     allow_gdn_data_parallel: bool = False
     allow_fallback_gdn: bool = False
 
@@ -164,8 +182,8 @@ def build_manifest_from_npz(npz_root: Path, manifest_path: Path) -> int:
 
 def _normalize_config(cfg: UnifiedSub100mConfig) -> UnifiedSub100mConfig:
     variant = str(cfg.variant).strip().lower()
-    if variant not in {"c", "e"}:
-        raise Sub100mConfigError("variant must be 'c' or 'e'")
+    if variant not in {"c", "e", "f"}:
+        raise Sub100mConfigError("variant must be 'c', 'e', or 'f'")
     cfg.variant = variant
 
     cfg.resume_mode = str(cfg.resume_mode).strip().lower()
@@ -185,6 +203,7 @@ def _normalize_config(cfg: UnifiedSub100mConfig) -> UnifiedSub100mConfig:
     cfg.grad_accumulation_steps = max(1, int(cfg.grad_accumulation_steps))
     cfg.max_pieces = max(0, int(cfg.max_pieces))
     cfg.num_workers = max(0, int(cfg.num_workers))
+    cfg.save_every_n_steps = max(0, int(cfg.save_every_n_steps))
     cfg.epochs = max(1, int(cfg.epochs))
 
     return cfg
@@ -229,7 +248,7 @@ def _build_variant_model(
     variant: str,
     vocab_size: int,
     max_sequence_length: int,
-) -> Tuple[Any, Dict[str, int]]:
+) -> Tuple[Any, Dict[str, Any]]:
     profile = dict(UNIFIED_40M_PROFILES[variant])
 
     if variant == "c":
@@ -251,6 +270,40 @@ def _build_variant_model(
             "n_layers": int(profile["n_layers"]),
             "num_attention_heads": int(heads),
             "ffn_expansion": int(profile["ffn_expansion"]),
+            "target_params": int(profile.get("target_params", 0)),
+        }
+        return model, shape
+
+    if variant == "f":
+        d_model = int(profile["d_model"])
+        model = VariantFModel(
+            VariantFConfig(
+                vocab_size=int(vocab_size),
+                d_model=d_model,
+                n_layers=int(profile["n_layers"]),
+                max_sequence_length=int(max_sequence_length),
+                event_size=4,
+                harmonic_ratio=float(profile["harmonic_ratio"]),
+                temporal_ratio=float(profile["temporal_ratio"]),
+                gdn_inner_ratio=float(profile["gdn_inner_ratio"]),
+                gdn_num_heads=int(profile["gdn_num_heads"]),
+                temporal_cfc_backbone_units=max(128, int(round(float(d_model) * 0.75))),
+                temporal_cfc_backbone_layers=2,
+                structural_num_heads=int(profile["structural_num_heads"]),
+                structural_gqa_groups=int(profile["structural_gqa_groups"]),
+                cross_stream_every_n_layers=int(profile["cross_stream_every_n_layers"]),
+                tokens_per_phrase=int(profile["tokens_per_phrase"]),
+                memory_size=int(profile["memory_size"]),
+                theme_memory_heads=int(profile["theme_memory_heads"]),
+                use_continuous_time=True,
+            )
+        )
+        shape = {
+            "d_model": int(d_model),
+            "n_layers": int(profile["n_layers"]),
+            "harmonic_ratio": float(profile["harmonic_ratio"]),
+            "temporal_ratio": float(profile["temporal_ratio"]),
+            "cross_stream_every_n_layers": int(profile["cross_stream_every_n_layers"]),
             "target_params": int(profile.get("target_params", 0)),
         }
         return model, shape
@@ -302,6 +355,7 @@ def _build_train_cfg(cfg: UnifiedSub100mConfig, checkpoint_dir: Path, warmup_ste
         max_epochs=int(cfg.epochs),
         warmup_steps=int(max(1, warmup_steps)),
         max_grad_norm=float(cfg.max_grad_norm),
+        save_every_n_steps=int(max(0, cfg.save_every_n_steps)),
         save_every_n_epochs=int(max(1, cfg.save_every_n_epochs)),
         keep_every_n_epochs=int(max(1, cfg.keep_every_n_epochs)),
         max_checkpoints=int(max(1, cfg.max_checkpoints)),
@@ -317,8 +371,11 @@ def _build_train_cfg(cfg: UnifiedSub100mConfig, checkpoint_dir: Path, warmup_ste
 
     if cfg.variant == "c":
         setattr(train_cfg, "_enable_data_parallel", bool(cfg.enable_data_parallel_c))
-    else:
+    elif cfg.variant == "e":
         setattr(train_cfg, "_enable_data_parallel", bool(cfg.enable_data_parallel_e))
+        setattr(train_cfg, "_allow_gdn_data_parallel", bool(cfg.allow_gdn_data_parallel))
+    else:
+        setattr(train_cfg, "_enable_data_parallel", bool(cfg.enable_data_parallel_f))
         setattr(train_cfg, "_allow_gdn_data_parallel", bool(cfg.allow_gdn_data_parallel))
 
     return train_cfg
@@ -452,10 +509,10 @@ def run_unified_sub100m(cfg: UnifiedSub100mConfig) -> Dict[str, Any]:
     params = int(sum(p.numel() for p in model.parameters()))
     backend_status = _variant_backend_status(model)
 
-    if cfg.variant == "e" and backend_status.get("gdn_using_fallback", False):
+    if cfg.variant in {"e", "f"} and backend_status.get("gdn_using_fallback", False):
         if not bool(cfg.allow_fallback_gdn):
             raise RuntimeError(
-                "Variant E is using fallback GDN. Install flash-linear-attention or set allow_fallback_gdn=True."
+                "Selected GDN-based variant is using fallback GDN. Install flash-linear-attention or set allow_fallback_gdn=True."
             )
 
     checkpoint_dir = output_dir / "checkpoints" / f"variant_{cfg.variant}_40m"
@@ -535,6 +592,7 @@ def run_unified_sub100m(cfg: UnifiedSub100mConfig) -> Dict[str, Any]:
             "warmup_steps": int(warmup_steps),
             "steps_per_epoch": int(steps_per_epoch),
             "total_steps": int(total_steps),
+            "save_every_n_steps": int(cfg.save_every_n_steps),
             "max_pieces": int(cfg.max_pieces),
             "resume_mode": str(cfg.resume_mode),
             "resume_from_checkpoint": str(resume_checkpoint.resolve())
@@ -557,9 +615,9 @@ def run_unified_sub100m(cfg: UnifiedSub100mConfig) -> Dict[str, Any]:
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Unified sub-100M runner for Variant C and Variant E (~40M profiles)."
+        description="Unified sub-100M runner for Variant C, Variant E, and Variant F (~40M profiles)."
     )
-    parser.add_argument("--variant", choices=["c", "e"], default="e")
+    parser.add_argument("--variant", choices=["c", "e", "f"], default="e")
     parser.add_argument("--output_dir", type=str, default="outputs/sub100m_unified_e_100k")
     parser.add_argument("--pretokenized_manifest", type=str, default="")
     parser.add_argument("--pretokenized_root", type=str, default="")
@@ -584,6 +642,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--log_every_n_steps", type=int, default=20)
+    parser.add_argument("--save_every_n_steps", type=int, default=0)
     parser.add_argument("--save_every_n_epochs", type=int, default=5)
     parser.add_argument("--keep_every_n_epochs", type=int, default=10)
     parser.add_argument("--max_checkpoints", type=int, default=8)
@@ -605,6 +664,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--enable_data_parallel_c", action="store_true")
     parser.add_argument("--enable_data_parallel_e", action="store_true")
+    parser.add_argument("--enable_data_parallel_f", action="store_true")
     parser.add_argument("--allow_gdn_data_parallel", action="store_true")
     parser.add_argument("--allow_fallback_gdn", action="store_true")
 
@@ -640,6 +700,7 @@ def main() -> None:
         max_grad_norm=float(args.max_grad_norm),
         num_workers=int(args.num_workers),
         log_every_n_steps=int(args.log_every_n_steps),
+        save_every_n_steps=int(args.save_every_n_steps),
         save_every_n_epochs=int(args.save_every_n_epochs),
         keep_every_n_epochs=int(args.keep_every_n_epochs),
         max_checkpoints=int(args.max_checkpoints),
@@ -658,6 +719,7 @@ def main() -> None:
         resume_mode=str(args.resume_mode),
         enable_data_parallel_c=bool(args.enable_data_parallel_c),
         enable_data_parallel_e=bool(args.enable_data_parallel_e),
+        enable_data_parallel_f=bool(args.enable_data_parallel_f),
         allow_gdn_data_parallel=bool(args.allow_gdn_data_parallel),
         allow_fallback_gdn=bool(args.allow_fallback_gdn),
         dry_run=bool(args.dry_run),

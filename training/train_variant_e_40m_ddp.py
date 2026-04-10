@@ -27,7 +27,7 @@ if str(ROOT) not in sys.path:
 
 from config import DataConfig, TrainConfig
 from data.dataset import PianoDataset
-from data.tokenizer_custom import CustomDeltaTokenizer
+from data.tokenizer import CustomDeltaTokenizer
 from model.variant_e import VariantEConfig, VariantEModel
 from training.ablation_runner import (
     NpzWindowDataset,
@@ -277,6 +277,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--log_every_n_steps", type=int, default=20)
+    parser.add_argument("--save_every_n_steps", type=int, default=0)
     parser.add_argument("--save_every_n_epochs", type=int, default=5)
 
     parser.add_argument("--seed_midi", type=str, default="")
@@ -510,6 +511,7 @@ def main() -> None:
             max_epochs=int(max(1, args.epochs)),
             warmup_steps=1,
             max_grad_norm=float(args.max_grad_norm),
+            save_every_n_steps=int(max(0, args.save_every_n_steps)),
             save_every_n_epochs=int(max(1, args.save_every_n_epochs)),
             keep_every_n_epochs=int(max(1, args.save_every_n_epochs)),
             max_checkpoints=8,
@@ -678,6 +680,32 @@ def main() -> None:
                     scheduler.step()
                     global_step += 1
                     history["lr"].append(float(optimizer.param_groups[0]["lr"]))
+
+                    if (
+                        _is_main_process(rank)
+                        and int(max(0, train_cfg.save_every_n_steps)) > 0
+                        and int(global_step) % int(max(1, train_cfg.save_every_n_steps)) == 0
+                    ):
+                        step_avg_loss = float(running_loss / max(1, running_count))
+                        _save_checkpoint(
+                            model=model,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            scaler=scaler,
+                            train_cfg=train_cfg,
+                            data_cfg=data_cfg,
+                            checkpoint_dir=checkpoint_dir,
+                            epoch=int(epoch),
+                            val_loss=float(step_avg_loss),
+                            history=history,
+                            best_val_loss=float(best_val_loss),
+                            global_step=int(global_step),
+                            best=False,
+                        )
+                        print(
+                            f"Step checkpoint saved: epoch={epoch:03d} "
+                            f"step={global_step:06d} loss~{step_avg_loss:.4f}"
+                        )
 
                     if _is_main_process(rank) and int(global_step) % int(max(1, args.log_every_n_steps)) == 0 and running_count > 0:
                         avg_running = float(running_loss / max(1, running_count))
@@ -849,6 +877,7 @@ def main() -> None:
                     "warmup_steps": int(train_cfg.warmup_steps),
                     "steps_per_epoch": int(steps_per_epoch),
                     "total_steps": int(total_steps),
+                    "save_every_n_steps": int(max(0, train_cfg.save_every_n_steps)),
                     "max_pieces": int(args.max_pieces),
                 },
                 "data": {

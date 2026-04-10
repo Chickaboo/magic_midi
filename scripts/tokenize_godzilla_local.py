@@ -19,12 +19,12 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 import numpy as np
 
 try:
-    from data.tokenizer_custom import CustomDeltaTokenizer
+    from data.tokenizer import CustomDeltaTokenizer
 except ModuleNotFoundError:
     ROOT = Path(__file__).resolve().parents[1]
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
-    from data.tokenizer_custom import CustomDeltaTokenizer
+    from data.tokenizer import CustomDeltaTokenizer
 
 
 def _import_symusic_score() -> Any:
