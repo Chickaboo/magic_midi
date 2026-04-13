@@ -5,6 +5,8 @@ import json
 import math
 import os
 import random
+import shutil
+import subprocess
 import sys
 from contextlib import nullcontext
 from dataclasses import asdict
@@ -251,6 +253,87 @@ def _load_checkpoint(
     return dict(state)
 
 
+def _snapshot_epoch_bundle(
+    *,
+    bundle_root: Path,
+    checkpoint_dir: Path,
+    data_cfg: DataConfig,
+    epoch: int,
+    global_step: int,
+    train_loss: float,
+    val_loss: float,
+    best_val_loss: float,
+) -> Path:
+    """Copy key checkpoint artifacts into one epoch-scoped folder."""
+
+    epoch_dir = bundle_root / f"epoch_{int(epoch):03d}"
+    epoch_dir.mkdir(parents=True, exist_ok=True)
+
+    copied_files: List[str] = []
+    for name in [
+        "latest.safetensors",
+        "latest_state.pt",
+        "best.safetensors",
+        "best_state.pt",
+    ]:
+        src = checkpoint_dir / name
+        if src.exists() and src.is_file():
+            dst = epoch_dir / name
+            shutil.copy2(src, dst)
+            copied_files.append(name)
+
+    tokenizer_path = Path(str(data_cfg.tokenizer_path))
+    if tokenizer_path.exists() and tokenizer_path.is_file():
+        dst = epoch_dir / tokenizer_path.name
+        shutil.copy2(tokenizer_path, dst)
+        copied_files.append(tokenizer_path.name)
+
+    manifest_path = Path(str(data_cfg.processed_path)) / "manifest.json"
+    if manifest_path.exists() and manifest_path.is_file():
+        dst = epoch_dir / "manifest.json"
+        shutil.copy2(manifest_path, dst)
+        copied_files.append("manifest.json")
+
+    summary = {
+        "epoch": int(epoch),
+        "global_step": int(global_step),
+        "train_loss": float(train_loss),
+        "val_loss": float(val_loss),
+        "best_val_loss": float(best_val_loss),
+        "checkpoint_dir": str(checkpoint_dir.resolve()),
+        "copied_files": copied_files,
+    }
+    (epoch_dir / "epoch_summary.json").write_text(
+        json.dumps(summary, indent=2),
+        encoding="utf-8",
+    )
+    return epoch_dir
+
+
+def _maybe_run_epoch_upload_command(
+    *,
+    template: str,
+    epoch: int,
+    epoch_dir: Path,
+    output_dir: Path,
+    checkpoint_dir: Path,
+) -> None:
+    """Run optional user-provided upload command template per epoch."""
+
+    raw = str(template).strip()
+    if not raw:
+        return
+
+    command = raw.format(
+        epoch=int(epoch),
+        epoch_dir=str(epoch_dir),
+        output_dir=str(output_dir),
+        checkpoint_dir=str(checkpoint_dir),
+    )
+    print(f"Epoch upload command: {command}")
+    subprocess.run(command, shell=True, check=True)
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Distributed DDP trainer for Variant E 40M profile on pretokenized NPZ data."
@@ -279,6 +362,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log_every_n_steps", type=int, default=20)
     parser.add_argument("--save_every_n_steps", type=int, default=0)
     parser.add_argument("--save_every_n_epochs", type=int, default=5)
+    parser.add_argument("--epoch_bundle_root", type=str, default="")
+    parser.add_argument("--epoch_upload_cmd_template", type=str, default="")
 
     parser.add_argument("--seed_midi", type=str, default="")
     parser.add_argument("--generation_max_new_tokens", type=int, default=8192)
@@ -340,9 +425,15 @@ def main() -> None:
 
         output_dir = Path(str(args.output_dir)).expanduser()
         checkpoint_dir = output_dir / "checkpoints" / "variant_e_40m_ddp"
+        epoch_bundle_root = (
+            Path(str(args.epoch_bundle_root)).expanduser()
+            if str(args.epoch_bundle_root).strip()
+            else output_dir / "epoch_exports"
+        )
         if _is_main_process(rank):
             output_dir.mkdir(parents=True, exist_ok=True)
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            epoch_bundle_root.mkdir(parents=True, exist_ok=True)
         if distributed:
             dist.barrier()
 
@@ -814,6 +905,29 @@ def main() -> None:
                     f"| val_loss={val_loss:.4f} | ppl={perplexity:.2f}"
                 )
 
+                epoch_dir = _snapshot_epoch_bundle(
+                    bundle_root=epoch_bundle_root,
+                    checkpoint_dir=checkpoint_dir,
+                    data_cfg=data_cfg,
+                    epoch=int(epoch),
+                    global_step=int(global_step),
+                    train_loss=float(train_loss),
+                    val_loss=float(val_loss),
+                    best_val_loss=float(best_val_loss),
+                )
+                print(f"Epoch bundle saved: {epoch_dir}")
+
+                try:
+                    _maybe_run_epoch_upload_command(
+                        template=str(args.epoch_upload_cmd_template),
+                        epoch=int(epoch),
+                        epoch_dir=epoch_dir,
+                        output_dir=output_dir,
+                        checkpoint_dir=checkpoint_dir,
+                    )
+                except Exception as exc:
+                    print(f"WARNING: epoch upload command failed at epoch {epoch:03d}: {exc}")
+
             if distributed:
                 dist.barrier()
 
@@ -878,6 +992,8 @@ def main() -> None:
                     "steps_per_epoch": int(steps_per_epoch),
                     "total_steps": int(total_steps),
                     "save_every_n_steps": int(max(0, train_cfg.save_every_n_steps)),
+                    "epoch_bundle_root": str(epoch_bundle_root.resolve()),
+                    "epoch_upload_cmd_enabled": bool(str(args.epoch_upload_cmd_template).strip()),
                     "max_pieces": int(args.max_pieces),
                 },
                 "data": {
