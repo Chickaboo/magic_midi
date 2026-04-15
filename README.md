@@ -203,7 +203,7 @@ Current local v2 `large_v2` measurement (fallback runtime): `102,884,834` params
 Active notebooks:
 
 - `notebooks/01_t4_sub100m_unified_variant_ce.ipynb`
-- `notebooks/03_colab_bluebird_generation.ipynb`
+- `notebooks/03_colab_midi_generation.ipynb`
 
 The unified sub-100M notebook can auto-build a fresh manifest from NPZ files when the dataset does not include `manifest.json`.
 
@@ -330,6 +330,16 @@ Performance notes:
 - Default output is uncompressed `.npz` for maximum throughput.
 - Use `--compress-output` only if you need smaller files and can tolerate slower tokenization.
 - If you already ran older versions against a `.tar/.tar.gz`, run once with `--start-over` to rebuild a consistent archive-order manifest.
+
+### MIDI Cut CLI
+
+Use the boundary-aware MIDI cutter to trim a file near a token budget without splitting a chord in the middle. It prefers staying at or under the budget by default:
+
+```bash
+python scripts/midi_cut_cli.py /path/to/midi_folder --recursive --token-limit 512
+```
+
+If you point it at a folder, it will prompt you to choose a file. The cutter groups simultaneous note onsets, prefers silence and bar-aligned endings, and writes a JSON report next to the cut MIDI. Use `--no-strict-limit` if you want to allow a small overshoot to preserve a cleaner musical boundary.
 
 Key outputs:
 - `processed/godzilla_tokenized/data/*.npz`

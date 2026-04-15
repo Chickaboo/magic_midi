@@ -43,12 +43,14 @@ UNIFIED_40M_PROFILES: Dict[str, Dict[str, float]] = {
         "target_params": 40_000_000,
     },
     "f": {
-        "d_model": 544,
-        "n_layers": 9,
+        "d_model": 832,
+        "n_layers": 10,
         "harmonic_ratio": 0.40,
         "temporal_ratio": 0.30,
         "gdn_inner_ratio": 0.50,
         "gdn_num_heads": 4,
+        "temporal_cfc_backbone_units": 624,
+        "temporal_cfc_backbone_layers": 2,
         "structural_num_heads": 8,
         "structural_gqa_groups": 4,
         "cross_stream_every_n_layers": 2,
@@ -112,6 +114,21 @@ class UnifiedSub100mConfig:
     enable_data_parallel_f: bool = False
     allow_gdn_data_parallel: bool = False
     allow_fallback_gdn: bool = False
+
+    # Variant-E architecture overrides for notebook-driven experiments.
+    e_d_model: int = 640
+    e_n_layers: int = 13
+    e_attention_every_n_layers: int = 2
+    e_full_attention: bool = False
+    e_gdn_inner_ratio: float = 0.5
+    e_gdn_num_heads: int = 4
+    e_gqa_num_heads: int = 8
+    e_gqa_groups: int = 4
+    e_dropout: float = 0.1
+    e_attention_dropout: float = 0.1
+    e_max_time_seconds: float = 1200.0
+
+    slot_aware_loss: bool = True
 
     dry_run: bool = False
 
@@ -206,6 +223,17 @@ def _normalize_config(cfg: UnifiedSub100mConfig) -> UnifiedSub100mConfig:
     cfg.save_every_n_steps = max(0, int(cfg.save_every_n_steps))
     cfg.epochs = max(1, int(cfg.epochs))
 
+    cfg.e_d_model = max(64, int(cfg.e_d_model))
+    cfg.e_n_layers = max(1, int(cfg.e_n_layers))
+    cfg.e_attention_every_n_layers = max(1, int(cfg.e_attention_every_n_layers))
+    cfg.e_gdn_inner_ratio = float(max(0.1, cfg.e_gdn_inner_ratio))
+    cfg.e_gdn_num_heads = max(1, int(cfg.e_gdn_num_heads))
+    cfg.e_gqa_num_heads = max(1, int(cfg.e_gqa_num_heads))
+    cfg.e_gqa_groups = max(1, int(cfg.e_gqa_groups))
+    cfg.e_dropout = float(max(0.0, cfg.e_dropout))
+    cfg.e_attention_dropout = float(max(0.0, cfg.e_attention_dropout))
+    cfg.e_max_time_seconds = float(max(1.0, cfg.e_max_time_seconds))
+
     return cfg
 
 
@@ -248,6 +276,7 @@ def _build_variant_model(
     variant: str,
     vocab_size: int,
     max_sequence_length: int,
+    cfg: UnifiedSub100mConfig,
 ) -> Tuple[Any, Dict[str, Any]]:
     profile = dict(UNIFIED_40M_PROFILES[variant])
 
@@ -276,6 +305,13 @@ def _build_variant_model(
 
     if variant == "f":
         d_model = int(profile["d_model"])
+        temporal_backbone_units = int(
+            profile.get(
+                "temporal_cfc_backbone_units",
+                max(128, int(round(float(d_model) * 0.75))),
+            )
+        )
+        temporal_backbone_layers = int(profile.get("temporal_cfc_backbone_layers", 2))
         model = VariantFModel(
             VariantFConfig(
                 vocab_size=int(vocab_size),
@@ -287,8 +323,8 @@ def _build_variant_model(
                 temporal_ratio=float(profile["temporal_ratio"]),
                 gdn_inner_ratio=float(profile["gdn_inner_ratio"]),
                 gdn_num_heads=int(profile["gdn_num_heads"]),
-                temporal_cfc_backbone_units=max(128, int(round(float(d_model) * 0.75))),
-                temporal_cfc_backbone_layers=2,
+                temporal_cfc_backbone_units=int(max(64, temporal_backbone_units)),
+                temporal_cfc_backbone_layers=int(max(1, temporal_backbone_layers)),
                 structural_num_heads=int(profile["structural_num_heads"]),
                 structural_gqa_groups=int(profile["structural_gqa_groups"]),
                 cross_stream_every_n_layers=int(profile["cross_stream_every_n_layers"]),
@@ -303,17 +339,45 @@ def _build_variant_model(
             "n_layers": int(profile["n_layers"]),
             "harmonic_ratio": float(profile["harmonic_ratio"]),
             "temporal_ratio": float(profile["temporal_ratio"]),
+            "temporal_cfc_backbone_units": int(max(64, temporal_backbone_units)),
+            "temporal_cfc_backbone_layers": int(max(1, temporal_backbone_layers)),
             "cross_stream_every_n_layers": int(profile["cross_stream_every_n_layers"]),
             "target_params": int(profile.get("target_params", 0)),
         }
         return model, shape
 
-    d_model = int(profile["d_model"])
-    gdn_inner_dim = max(128, int(round(float(d_model) * float(profile["gdn_inner_ratio"]))))
-    gdn_heads = _resolve_divisible_heads(gdn_inner_dim, int(profile["gdn_num_heads"]))
-    gqa_heads = _resolve_divisible_heads(d_model, int(profile["gqa_num_heads"]))
+    d_model = int(max(64, int(getattr(cfg, "e_d_model", profile["d_model"]))))
+    n_layers = int(max(1, int(getattr(cfg, "e_n_layers", profile["n_layers"]))))
+    attn_every_n = int(
+        max(
+            1,
+            int(
+                getattr(
+                    cfg,
+                    "e_attention_every_n_layers",
+                    profile["attention_every_n_layers"],
+                )
+            ),
+        )
+    )
+    gdn_inner_ratio = float(getattr(cfg, "e_gdn_inner_ratio", profile["gdn_inner_ratio"]))
+    gdn_inner_dim = max(128, int(round(float(d_model) * float(gdn_inner_ratio))))
+    gdn_heads = _resolve_divisible_heads(
+        gdn_inner_dim,
+        int(max(1, int(getattr(cfg, "e_gdn_num_heads", profile["gdn_num_heads"])))),
+    )
+    gqa_heads = _resolve_divisible_heads(
+        d_model,
+        int(max(1, int(getattr(cfg, "e_gqa_num_heads", profile["gqa_num_heads"])))),
+    )
 
-    gqa_groups = max(1, min(int(profile["gqa_groups"]), int(gqa_heads)))
+    gqa_groups = max(
+        1,
+        min(
+            int(max(1, int(getattr(cfg, "e_gqa_groups", profile["gqa_groups"])))),
+            int(gqa_heads),
+        ),
+    )
     while gqa_groups > 1 and (gqa_heads % gqa_groups) != 0:
         gqa_groups -= 1
 
@@ -321,19 +385,28 @@ def _build_variant_model(
         VariantEConfig(
             vocab_size=int(vocab_size),
             d_model=d_model,
-            n_layers=int(profile["n_layers"]),
+            n_layers=int(n_layers),
             max_sequence_length=int(max_sequence_length),
+            dropout=float(max(0.0, getattr(cfg, "e_dropout", 0.1))),
+            attention_dropout=float(max(0.0, getattr(cfg, "e_attention_dropout", 0.1))),
             gdn_inner_dim=int(gdn_inner_dim),
             gdn_num_heads=int(gdn_heads),
             gqa_num_heads=int(gqa_heads),
             gqa_groups=int(gqa_groups),
-            attention_every_n_layers=int(profile["attention_every_n_layers"]),
+            attention_every_n_layers=int(attn_every_n),
+            full_attention=bool(getattr(cfg, "e_full_attention", False)),
+            use_continuous_time=True,
+            max_time_seconds=float(max(1.0, float(getattr(cfg, "e_max_time_seconds", 1200.0)))),
         )
     )
     shape = {
         "d_model": int(d_model),
-        "n_layers": int(profile["n_layers"]),
-        "attention_every_n_layers": int(profile["attention_every_n_layers"]),
+        "n_layers": int(n_layers),
+        "attention_every_n_layers": int(attn_every_n),
+        "full_attention": bool(getattr(cfg, "e_full_attention", False)),
+        "dropout": float(max(0.0, getattr(cfg, "e_dropout", 0.1))),
+        "attention_dropout": float(max(0.0, getattr(cfg, "e_attention_dropout", 0.1))),
+        "max_time_seconds": float(max(1.0, float(getattr(cfg, "e_max_time_seconds", 1200.0)))),
         "gdn_inner_dim": int(gdn_inner_dim),
         "gdn_num_heads": int(gdn_heads),
         "gqa_num_heads": int(gqa_heads),
@@ -368,6 +441,8 @@ def _build_train_cfg(cfg: UnifiedSub100mConfig, checkpoint_dir: Path, warmup_ste
 
     setattr(train_cfg, "_force_num_workers", int(max(0, cfg.num_workers)))
     setattr(train_cfg, "_log_every_n_steps", int(max(1, cfg.log_every_n_steps)))
+    setattr(train_cfg, "_slot_aware_loss", bool(cfg.slot_aware_loss))
+    setattr(train_cfg, "_report_token_accuracy", True)
 
     if cfg.variant == "c":
         setattr(train_cfg, "_enable_data_parallel", bool(cfg.enable_data_parallel_c))
@@ -505,6 +580,7 @@ def run_unified_sub100m(cfg: UnifiedSub100mConfig) -> Dict[str, Any]:
         variant=cfg.variant,
         vocab_size=int(tokenizer.vocab_size),
         max_sequence_length=int(cfg.max_sequence_length),
+        cfg=cfg,
     )
     params = int(sum(p.numel() for p in model.parameters()))
     backend_status = _variant_backend_status(model)
@@ -593,6 +669,7 @@ def run_unified_sub100m(cfg: UnifiedSub100mConfig) -> Dict[str, Any]:
             "steps_per_epoch": int(steps_per_epoch),
             "total_steps": int(total_steps),
             "save_every_n_steps": int(cfg.save_every_n_steps),
+            "slot_aware_loss": bool(cfg.slot_aware_loss),
             "max_pieces": int(cfg.max_pieces),
             "resume_mode": str(cfg.resume_mode),
             "resume_from_checkpoint": str(resume_checkpoint.resolve())
@@ -668,6 +745,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow_gdn_data_parallel", action="store_true")
     parser.add_argument("--allow_fallback_gdn", action="store_true")
 
+    parser.add_argument("--e_d_model", type=int, default=640)
+    parser.add_argument("--e_n_layers", type=int, default=13)
+    parser.add_argument("--e_attention_every_n_layers", type=int, default=2)
+    parser.add_argument("--e_full_attention", action="store_true")
+    parser.add_argument("--e_gdn_inner_ratio", type=float, default=0.5)
+    parser.add_argument("--e_gdn_num_heads", type=int, default=4)
+    parser.add_argument("--e_gqa_num_heads", type=int, default=8)
+    parser.add_argument("--e_gqa_groups", type=int, default=4)
+    parser.add_argument("--e_dropout", type=float, default=0.1)
+    parser.add_argument("--e_attention_dropout", type=float, default=0.1)
+    parser.add_argument("--e_max_time_seconds", type=float, default=1200.0)
+    parser.add_argument("--disable_slot_aware_loss", action="store_true")
+
     parser.add_argument("--dry_run", action="store_true")
     return parser
 
@@ -722,6 +812,18 @@ def main() -> None:
         enable_data_parallel_f=bool(args.enable_data_parallel_f),
         allow_gdn_data_parallel=bool(args.allow_gdn_data_parallel),
         allow_fallback_gdn=bool(args.allow_fallback_gdn),
+        e_d_model=int(args.e_d_model),
+        e_n_layers=int(args.e_n_layers),
+        e_attention_every_n_layers=int(args.e_attention_every_n_layers),
+        e_full_attention=bool(args.e_full_attention),
+        e_gdn_inner_ratio=float(args.e_gdn_inner_ratio),
+        e_gdn_num_heads=int(args.e_gdn_num_heads),
+        e_gqa_num_heads=int(args.e_gqa_num_heads),
+        e_gqa_groups=int(args.e_gqa_groups),
+        e_dropout=float(args.e_dropout),
+        e_attention_dropout=float(args.e_attention_dropout),
+        e_max_time_seconds=float(args.e_max_time_seconds),
+        slot_aware_loss=not bool(args.disable_slot_aware_loss),
         dry_run=bool(args.dry_run),
     )
 

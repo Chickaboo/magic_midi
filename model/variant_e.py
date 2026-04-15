@@ -10,6 +10,7 @@ import torch.nn as nn
 from model.blocks.gdn_block import GatedDeltaNetBlock
 from model.blocks.gqa_block import GQABlock
 from model.sampling import sample_next_token
+from model.time_encoding import ContinuousTimeEncoding
 
 
 @dataclass
@@ -30,6 +31,11 @@ class VariantEConfig:
     gqa_num_heads: int = 8
     gqa_groups: int = 4
     attention_every_n_layers: int = 2
+    full_attention: bool = False
+
+    # Optional continuous-time conditioning.
+    use_continuous_time: bool = True
+    max_time_seconds: float = 1200.0
 
     # Trainer compatibility gate.
     use_v2_architecture: bool = True
@@ -97,12 +103,23 @@ class VariantEModel(nn.Module):
 
         self.token_embedding = nn.Embedding(self.vocab_size, self.d_model)
         self.position_embedding = nn.Embedding(self.max_sequence_length, self.d_model)
+        self.time_encoding = (
+            ContinuousTimeEncoding(
+                d_model=self.d_model,
+                max_time_seconds=float(max(1.0, cfg.max_time_seconds)),
+            )
+            if bool(cfg.use_continuous_time)
+            else None
+        )
         self.dropout = nn.Dropout(float(cfg.dropout))
 
         n_layers = int(cfg.n_layers)
         attn_stride = max(1, int(cfg.attention_every_n_layers))
+        use_full_attention = bool(getattr(cfg, "full_attention", False))
 
         def _use_attention(layer_index: int) -> bool:
+            if use_full_attention:
+                return True
             is_last = layer_index == (n_layers - 1)
             return is_last or ((layer_index + 1) % attn_stride == 0)
 
@@ -254,6 +271,8 @@ class VariantEModel(nn.Module):
         positions = positions.unsqueeze(0).expand(bsz, -1)
 
         x = self.token_embedding(token_ids) + self.position_embedding(positions)
+        if self.time_encoding is not None:
+            x = x + self.time_encoding(onset_times)
         x = self.dropout(x)
 
         for layer in self.layers:

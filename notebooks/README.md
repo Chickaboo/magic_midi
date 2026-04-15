@@ -14,9 +14,9 @@ This folder now contains the active, current notebooks for sub-100M quality vali
   - Locks to the 40M architecture profile and 100k-piece budget by default.
   - Adds explicit architecture preflight checks (event-size alignment, real GDN backend, parameter-budget sanity) before training.
   - Uses a dual-T4 DDP path for real-GDN multi-GPU runs (with single-process fallback when only one GPU is available).
-- 03_colab_bluebird_generation.ipynb
-  - Self-contained Google Colab GPU notebook for Bluebird continuation runs.
-  - Uses notebook-defined code, downloads only the private model files/tokenizer from Hugging Face, and uses shorter token budgets for faster turnaround.
+- 03_colab_midi_generation.ipynb
+  - Self-contained Google Colab GPU notebook for single-file or batch MIDI continuation runs.
+  - Uses notebook-defined code and downloads public model files/tokenizer from Hugging Face.
 
 ## Legacy notebooks
 

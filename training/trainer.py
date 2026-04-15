@@ -20,7 +20,13 @@ from torch.utils.data import DataLoader
 
 from config import DataConfig, TrainConfig
 from data.tokenizer import PianoTokenizer
-from training.losses import build_piece_boundary_mask, create_targets, next_token_loss
+from training.losses import (
+    build_piece_boundary_mask,
+    create_targets,
+    next_token_accuracy,
+    next_token_loss,
+    next_token_slot_accuracies,
+)
 from training.scheduler import WarmupCosineScheduler
 from utils.logging_utils import get_project_logger
 
@@ -266,6 +272,12 @@ class Trainer:
             "val_loss": [],
             "perplexity": [],
             "lr": [],
+            "val_raw_ce": [],
+            "val_token_acc": [],
+            "val_token_acc_delta": [],
+            "val_token_acc_pitch": [],
+            "val_token_acc_duration": [],
+            "val_token_acc_velocity": [],
             "gen_health_max_final_top1": [],
             "gen_health_max_raw_top1": [],
             "gen_health_min_candidates": [],
@@ -291,6 +303,12 @@ class Trainer:
                 bind_tokenizer(self.tokenizer)
             except Exception as exc:
                 warnings.warn(f"Failed to bind tokenizer to model: {exc}")
+
+        self.event_size = int(max(1, int(getattr(self.tokenizer, "event_size", 1))))
+        self.slot_aware_loss = bool(getattr(self.config, "_slot_aware_loss", False))
+        self.report_token_accuracy = bool(
+            getattr(self.config, "_report_token_accuracy", True)
+        )
 
         self._maybe_init_wandb()
 
@@ -458,6 +476,8 @@ class Trainer:
                     targets,
                     label_smoothing=self.config.label_smoothing,
                     piece_boundary_mask=boundary_mask,
+                    slot_aware=self.slot_aware_loss,
+                    event_size=self.event_size,
                 )
 
             loss_value = float(loss.item())
@@ -533,11 +553,23 @@ class Trainer:
                 running_count = 0
 
         train_loss = epoch_loss_sum / max(1, epoch_loss_count)
-        val_loss, perplexity = self.validate(epoch=epoch)
+        (
+            val_loss,
+            perplexity,
+            val_raw_ce,
+            val_token_acc,
+            slot_acc,
+        ) = self.validate(epoch=epoch)
 
         self.history["train_loss"].append(float(train_loss))
         self.history["val_loss"].append(float(val_loss))
         self.history["perplexity"].append(float(perplexity))
+        self.history["val_raw_ce"].append(float(val_raw_ce))
+        self.history["val_token_acc"].append(float(val_token_acc))
+        self.history["val_token_acc_delta"].append(float(slot_acc.get("delta", 0.0)))
+        self.history["val_token_acc_pitch"].append(float(slot_acc.get("pitch", 0.0)))
+        self.history["val_token_acc_duration"].append(float(slot_acc.get("duration", 0.0)))
+        self.history["val_token_acc_velocity"].append(float(slot_acc.get("velocity", 0.0)))
 
         self.save_checkpoint(epoch=epoch, val_loss=val_loss)
         if epoch % int(self.config.save_every_n_epochs) == 0:
@@ -576,19 +608,29 @@ class Trainer:
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "val_loss": val_loss,
+                "val_raw_ce": val_raw_ce,
+                "val_token_acc": val_token_acc,
                 "perplexity": perplexity,
                 "lr": self.optimizer.param_groups[0]["lr"],
             }
         )
 
     @torch.no_grad()
-    def validate(self, epoch: int = 0) -> Tuple[float, float]:
+    def validate(self, epoch: int = 0) -> Tuple[float, float, float, float, Dict[str, float]]:
         """Evaluate on validation set and run generation health checks."""
 
         self.model.eval()
 
         val_loss_sum = 0.0
         val_count = 0
+        val_raw_ce_sum = 0.0
+        val_token_acc_sum = 0.0
+        val_slot_acc_sum: Dict[str, float] = {
+            "delta": 0.0,
+            "pitch": 0.0,
+            "duration": 0.0,
+            "velocity": 0.0,
+        }
 
         for batch in self.val_loader:
             parsed = self._parse_batch(batch)
@@ -631,24 +673,73 @@ class Trainer:
                     targets,
                     label_smoothing=self.config.label_smoothing,
                     piece_boundary_mask=boundary_mask,
+                    slot_aware=self.slot_aware_loss,
+                    event_size=self.event_size,
+                )
+                raw_ce = next_token_loss(
+                    logits,
+                    targets,
+                    label_smoothing=0.0,
+                    piece_boundary_mask=boundary_mask,
+                    slot_aware=self.slot_aware_loss,
+                    event_size=self.event_size,
                 )
 
             val_loss_sum += float(loss.item())
+            val_raw_ce_sum += float(raw_ce.item())
             val_count += 1
+
+            if self.report_token_accuracy:
+                token_acc = next_token_accuracy(
+                    logits,
+                    targets,
+                    piece_boundary_mask=boundary_mask,
+                    slot_aware=self.slot_aware_loss,
+                    event_size=self.event_size,
+                )
+                slot_acc = next_token_slot_accuracies(
+                    logits,
+                    targets,
+                    piece_boundary_mask=boundary_mask,
+                    event_size=self.event_size,
+                    slot_aware=self.slot_aware_loss,
+                )
+                val_token_acc_sum += float(token_acc)
+                for key in val_slot_acc_sum:
+                    val_slot_acc_sum[key] += float(slot_acc.get(key, 0.0))
 
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
 
         val_loss = val_loss_sum / max(1, val_count)
+        val_raw_ce = val_raw_ce_sum / max(1, val_count)
+        val_token_acc = val_token_acc_sum / max(1, val_count)
+        val_slot_acc = {
+            key: float(total / max(1, val_count))
+            for key, total in val_slot_acc_sum.items()
+        }
         try:
             perplexity = float(math.exp(min(20.0, val_loss)))
         except OverflowError:
             perplexity = float("inf")
 
+        LOGGER.info(
+            "Validation epoch=%03d | smoothed_ce=%.4f | raw_ce=%.4f | token_acc=%.4f "
+            "(delta=%.4f pitch=%.4f duration=%.4f velocity=%.4f)",
+            int(epoch),
+            float(val_loss),
+            float(val_raw_ce),
+            float(val_token_acc),
+            float(val_slot_acc.get("delta", 0.0)),
+            float(val_slot_acc.get("pitch", 0.0)),
+            float(val_slot_acc.get("duration", 0.0)),
+            float(val_slot_acc.get("velocity", 0.0)),
+        )
+
         self._generate_validation_sample(epoch=epoch)
         if bool(getattr(self.config, "val_generation_check", True)):
             self._run_generation_health_check(epoch=epoch)
-        return val_loss, perplexity
+        return val_loss, perplexity, val_raw_ce, val_token_acc, val_slot_acc
 
     def _checkpoint_target_paths(
         self,

@@ -30,7 +30,7 @@ if str(ROOT) not in sys.path:
 from config import DataConfig, TrainConfig
 from data.dataset import PianoDataset
 from data.tokenizer import CustomDeltaTokenizer
-from model.variant_e import VariantEConfig, VariantEModel
+from model.variant_f import VariantFConfig, VariantFModel
 from training.ablation_runner import (
     NpzWindowDataset,
     _generate_one_continuation,
@@ -49,14 +49,21 @@ from training.losses import (
 from training.scheduler import WarmupCosineScheduler
 
 
-VARIANT_E_40M_PROFILE: Dict[str, float] = {
-    "d_model": 640,
-    "n_layers": 13,
-    "attention_every_n_layers": 2,
-    "gdn_inner_ratio": 0.5,
+VARIANT_F_40M_PROFILE: Dict[str, float] = {
+    "d_model": 832,
+    "n_layers": 10,
+    "harmonic_ratio": 0.40,
+    "temporal_ratio": 0.30,
+    "gdn_inner_ratio": 0.50,
     "gdn_num_heads": 4,
-    "gqa_num_heads": 8,
-    "gqa_groups": 4,
+    "temporal_cfc_backbone_units": 624,
+    "temporal_cfc_backbone_layers": 2,
+    "structural_num_heads": 8,
+    "structural_gqa_groups": 4,
+    "cross_stream_every_n_layers": 2,
+    "tokens_per_phrase": 8,
+    "memory_size": 64,
+    "theme_memory_heads": 8,
     "target_params": 40_000_000,
 }
 
@@ -82,6 +89,18 @@ def _resolve_divisible_heads(width: int, requested_heads: int) -> int:
     while heads > 1 and (int(width) % heads) != 0:
         heads -= 1
     return max(1, heads)
+
+
+def _resolve_rope_heads(width: int, requested_heads: int) -> int:
+    heads = _resolve_divisible_heads(width, requested_heads)
+    while heads > 1:
+        head_dim = int(width) // int(heads)
+        if head_dim % 2 == 0:
+            return int(heads)
+        heads -= 1
+        while heads > 1 and (int(width) % heads) != 0:
+            heads -= 1
+    return 1
 
 
 def _prepare_state_for_safetensors(
@@ -155,7 +174,7 @@ def _resolve_resume_checkpoint(
 
 def _save_checkpoint(
     *,
-    model: VariantEModel | DDP,
+    model: VariantFModel | DDP,
     optimizer: torch.optim.Optimizer,
     scheduler: WarmupCosineScheduler,
     scaler: torch.amp.GradScaler,
@@ -213,7 +232,7 @@ def _save_checkpoint(
 
 def _load_checkpoint(
     *,
-    model: VariantEModel | DDP,
+    model: VariantFModel | DDP,
     optimizer: torch.optim.Optimizer,
     scheduler: WarmupCosineScheduler,
     scaler: torch.amp.GradScaler,
@@ -342,11 +361,11 @@ def _maybe_run_epoch_upload_command(
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Distributed DDP trainer for Variant E 40M profile on pretokenized NPZ data."
+        description="Distributed DDP trainer for Variant F 40M profile on pretokenized NPZ data."
     )
     parser.add_argument("--pretokenized_manifest", type=str, required=True)
     parser.add_argument("--pretokenized_root", type=str, default="")
-    parser.add_argument("--output_dir", type=str, default="outputs/sub100m_unified_e_100k")
+    parser.add_argument("--output_dir", type=str, default="outputs/sub100m_unified_f_100k")
 
     parser.add_argument("--max_pieces", type=int, default=100000)
     parser.add_argument("--seed", type=int, default=42)
@@ -354,22 +373,44 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--continuation_length", type=int, default=1536)
     parser.add_argument("--max_sequence_length", type=int, default=2048)
 
-    parser.add_argument("--d_model", type=int, default=int(VARIANT_E_40M_PROFILE["d_model"]))
-    parser.add_argument("--n_layers", type=int, default=int(VARIANT_E_40M_PROFILE["n_layers"]))
-    parser.add_argument(
-        "--attention_every_n_layers",
-        type=int,
-        default=int(VARIANT_E_40M_PROFILE["attention_every_n_layers"]),
-    )
-    parser.add_argument("--full_attention", action="store_true")
+    parser.add_argument("--d_model", type=int, default=int(VARIANT_F_40M_PROFILE["d_model"]))
+    parser.add_argument("--n_layers", type=int, default=int(VARIANT_F_40M_PROFILE["n_layers"]))
+    parser.add_argument("--harmonic_ratio", type=float, default=float(VARIANT_F_40M_PROFILE["harmonic_ratio"]))
+    parser.add_argument("--temporal_ratio", type=float, default=float(VARIANT_F_40M_PROFILE["temporal_ratio"]))
     parser.add_argument(
         "--gdn_inner_ratio",
         type=float,
-        default=float(VARIANT_E_40M_PROFILE["gdn_inner_ratio"]),
+        default=float(VARIANT_F_40M_PROFILE["gdn_inner_ratio"]),
     )
-    parser.add_argument("--gdn_num_heads", type=int, default=int(VARIANT_E_40M_PROFILE["gdn_num_heads"]))
-    parser.add_argument("--gqa_num_heads", type=int, default=int(VARIANT_E_40M_PROFILE["gqa_num_heads"]))
-    parser.add_argument("--gqa_groups", type=int, default=int(VARIANT_E_40M_PROFILE["gqa_groups"]))
+    parser.add_argument("--gdn_num_heads", type=int, default=int(VARIANT_F_40M_PROFILE["gdn_num_heads"]))
+    parser.add_argument(
+        "--temporal_cfc_backbone_units",
+        type=int,
+        default=int(VARIANT_F_40M_PROFILE["temporal_cfc_backbone_units"]),
+    )
+    parser.add_argument(
+        "--temporal_cfc_backbone_layers",
+        type=int,
+        default=int(VARIANT_F_40M_PROFILE["temporal_cfc_backbone_layers"]),
+    )
+    parser.add_argument(
+        "--structural_num_heads",
+        type=int,
+        default=int(VARIANT_F_40M_PROFILE["structural_num_heads"]),
+    )
+    parser.add_argument(
+        "--structural_gqa_groups",
+        type=int,
+        default=int(VARIANT_F_40M_PROFILE["structural_gqa_groups"]),
+    )
+    parser.add_argument(
+        "--cross_stream_every_n_layers",
+        type=int,
+        default=int(VARIANT_F_40M_PROFILE["cross_stream_every_n_layers"]),
+    )
+    parser.add_argument("--tokens_per_phrase", type=int, default=int(VARIANT_F_40M_PROFILE["tokens_per_phrase"]))
+    parser.add_argument("--memory_size", type=int, default=int(VARIANT_F_40M_PROFILE["memory_size"]))
+    parser.add_argument("--theme_memory_heads", type=int, default=int(VARIANT_F_40M_PROFILE["theme_memory_heads"]))
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--attention_dropout", type=float, default=0.1)
     parser.add_argument("--max_time_seconds", type=float, default=1200.0)
@@ -408,6 +449,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.set_defaults(auto_resume=True)
 
     parser.add_argument("--allow_fallback_gdn", action="store_true")
+    parser.add_argument("--allow_fallback_cfc", action="store_true")
     parser.add_argument("--disable_slot_aware_loss", action="store_true")
     parser.add_argument("--use_amp", action="store_true")
     parser.set_defaults(use_amp=True)
@@ -451,7 +493,7 @@ def main() -> None:
             raise ValueError("max_sequence_length must equal seed_length + continuation_length")
 
         output_dir = Path(str(args.output_dir)).expanduser()
-        checkpoint_dir = output_dir / "checkpoints" / "variant_e_40m_ddp"
+        checkpoint_dir = output_dir / "checkpoints" / "variant_f_40m_ddp"
         epoch_bundle_root = (
             Path(str(args.epoch_bundle_root)).expanduser()
             if str(args.epoch_bundle_root).strip()
@@ -468,7 +510,7 @@ def main() -> None:
         event_size = int(getattr(tokenizer, "event_size", 1))
         if event_size != 4:
             raise RuntimeError(
-                f"Variant E DDP flow expects CustomDeltaTokenizer event_size=4, got {event_size}."
+                f"Variant F DDP flow expects CustomDeltaTokenizer event_size=4, got {event_size}."
             )
         if int(args.seed_length) % event_size != 0 or int(args.continuation_length) % event_size != 0:
             raise RuntimeError(
@@ -477,39 +519,52 @@ def main() -> None:
 
         d_model = int(max(64, int(args.d_model)))
         n_layers = int(max(1, int(args.n_layers)))
-        attention_every_n_layers = int(max(1, int(args.attention_every_n_layers)))
-        gdn_inner_dim = max(128, int(round(float(d_model) * float(args.gdn_inner_ratio))))
-        gdn_heads = _resolve_divisible_heads(gdn_inner_dim, int(max(1, int(args.gdn_num_heads))))
-        gqa_heads = _resolve_divisible_heads(d_model, int(max(1, int(args.gqa_num_heads))))
+        harmonic_ratio = float(max(0.1, min(0.8, float(args.harmonic_ratio))))
+        temporal_ratio = float(max(0.1, min(0.8, float(args.temporal_ratio))))
+        gdn_inner_ratio = float(max(0.1, float(args.gdn_inner_ratio)))
 
-        gqa_groups = max(1, min(int(max(1, int(args.gqa_groups))), int(gqa_heads)))
-        while gqa_groups > 1 and (gqa_heads % gqa_groups) != 0:
-            gqa_groups -= 1
+        structural_heads = _resolve_rope_heads(
+            width=int(max(64, int(round(float(d_model) * max(0.1, 1.0 - harmonic_ratio - temporal_ratio))))),
+            requested_heads=int(max(1, int(args.structural_num_heads))),
+        )
 
-        model = VariantEModel(
-            VariantEConfig(
+        model = VariantFModel(
+            VariantFConfig(
                 vocab_size=int(tokenizer.vocab_size),
                 d_model=int(d_model),
                 n_layers=int(n_layers),
                 max_sequence_length=int(args.max_sequence_length),
+                event_size=int(event_size),
                 dropout=float(max(0.0, args.dropout)),
                 attention_dropout=float(max(0.0, args.attention_dropout)),
-                gdn_inner_dim=int(gdn_inner_dim),
-                gdn_num_heads=int(gdn_heads),
-                gqa_num_heads=int(gqa_heads),
-                gqa_groups=int(gqa_groups),
-                attention_every_n_layers=int(attention_every_n_layers),
-                full_attention=bool(args.full_attention),
+                harmonic_ratio=float(harmonic_ratio),
+                temporal_ratio=float(temporal_ratio),
+                gdn_inner_ratio=float(gdn_inner_ratio),
+                gdn_num_heads=int(max(1, int(args.gdn_num_heads))),
+                temporal_cfc_backbone_units=int(max(64, int(args.temporal_cfc_backbone_units))),
+                temporal_cfc_backbone_layers=int(max(1, int(args.temporal_cfc_backbone_layers))),
+                structural_num_heads=int(max(1, int(structural_heads))),
+                structural_gqa_groups=int(max(1, int(args.structural_gqa_groups))),
+                cross_stream_every_n_layers=int(max(1, int(args.cross_stream_every_n_layers))),
+                tokens_per_phrase=int(max(1, int(args.tokens_per_phrase))),
+                memory_size=int(max(1, int(args.memory_size))),
+                theme_memory_heads=int(max(1, int(args.theme_memory_heads))),
                 use_continuous_time=True,
                 max_time_seconds=float(max(1.0, args.max_time_seconds)),
+                use_v2_architecture=True,
             )
         )
 
         backend_status = _variant_backend_status(model)
         if backend_status.get("gdn_using_fallback", False) and not bool(args.allow_fallback_gdn):
             raise RuntimeError(
-                "Variant E is using fallback GDN in this runtime. Install flash-linear-attention "
+                "Variant F is using fallback GDN in this runtime. Install flash-linear-attention "
                 "or pass --allow_fallback_gdn to continue."
+            )
+        if backend_status.get("cfc_using_fallback", False) and not bool(args.allow_fallback_cfc):
+            raise RuntimeError(
+                "Variant F is using fallback CfC in this runtime. Install ncps/CfC support "
+                "or pass --allow_fallback_cfc to continue."
             )
 
         model = model.to(device)
@@ -525,7 +580,7 @@ def main() -> None:
         params = int(
             sum(p.numel() for p in (model.module.parameters() if isinstance(model, DDP) else model.parameters()))
         )
-        _log(rank, f"Variant-E 40M DDP model params: {params:,} ({params / 1e6:.2f}M)")
+        _log(rank, f"Variant-F 40M DDP model params: {params:,} ({params / 1e6:.2f}M)")
         _log(rank, f"Backend status: {backend_status}")
 
         data_cfg = DataConfig(
@@ -1048,7 +1103,7 @@ def main() -> None:
             if not seed_midi_path.exists():
                 raise FileNotFoundError(f"seed_midi not found: {seed_midi_path.resolve()}")
 
-            out_path = output_dir / "generated" / "variant_e_40m_ddp.mid"
+            out_path = output_dir / "generated" / "variant_f_40m_ddp.mid"
             generation_meta = _generate_one_continuation(
                 model=core_model,
                 tokenizer=tokenizer,
@@ -1068,21 +1123,35 @@ def main() -> None:
             output_midi = str(out_path.resolve())
 
         if _is_main_process(rank):
+            core_model = model.module if isinstance(model, DDP) else model
+            first_harmonic = core_model.harmonic_layers[0] if len(core_model.harmonic_layers) > 0 else None
             result_payload = {
-                "profile": "variant_e_40m_ddp",
-                "target_params": int(VARIANT_E_40M_PROFILE["target_params"]),
+                "profile": "variant_f_40m_ddp",
+                "target_params": int(VARIANT_F_40M_PROFILE["target_params"]),
                 "model_profile": {
                     "d_model": int(d_model),
                     "n_layers": int(n_layers),
-                    "attention_every_n_layers": int(attention_every_n_layers),
-                    "full_attention": bool(args.full_attention),
+                    "event_size": int(event_size),
+                    "harmonic_ratio": float(harmonic_ratio),
+                    "temporal_ratio": float(temporal_ratio),
+                    "harmonic_dim": int(getattr(core_model, "harmonic_dim", 0)),
+                    "temporal_dim": int(getattr(core_model, "temporal_dim", 0)),
+                    "structural_dim": int(getattr(core_model, "structural_dim", 0)),
+                    "cross_stream_every_n_layers": int(max(1, int(args.cross_stream_every_n_layers))),
+                    "tokens_per_phrase": int(max(1, int(args.tokens_per_phrase))),
+                    "memory_size": int(max(1, int(args.memory_size))),
+                    "theme_memory_heads": int(max(1, int(args.theme_memory_heads))),
                     "dropout": float(args.dropout),
                     "attention_dropout": float(args.attention_dropout),
                     "max_time_seconds": float(args.max_time_seconds),
-                    "gdn_inner_dim": int(gdn_inner_dim),
-                    "gdn_num_heads": int(gdn_heads),
-                    "gqa_num_heads": int(gqa_heads),
-                    "gqa_groups": int(gqa_groups),
+                    "gdn_inner_ratio": float(gdn_inner_ratio),
+                    "gdn_inner_dim": int(getattr(first_harmonic, "inner_dim", 0)) if first_harmonic is not None else 0,
+                    "gdn_num_heads": int(getattr(first_harmonic, "num_heads", max(1, int(args.gdn_num_heads)))) if first_harmonic is not None else int(max(1, int(args.gdn_num_heads))),
+                    "temporal_cfc_backbone_units": int(max(64, int(args.temporal_cfc_backbone_units))),
+                    "temporal_cfc_backbone_layers": int(max(1, int(args.temporal_cfc_backbone_layers))),
+                    "structural_num_heads": int(max(1, int(args.structural_num_heads))),
+                    "structural_gqa_groups": int(max(1, int(args.structural_gqa_groups))),
+                    "use_v2_architecture": bool(getattr(core_model.config, "use_v2_architecture", False)),
                 },
                 "backend_status": backend_status,
                 "distributed": {
@@ -1104,6 +1173,8 @@ def main() -> None:
                     "slot_aware_loss": bool(slot_aware_loss),
                     "epoch_bundle_root": str(epoch_bundle_root.resolve()),
                     "epoch_upload_cmd_enabled": bool(str(args.epoch_upload_cmd_template).strip()),
+                    "allow_fallback_gdn": bool(args.allow_fallback_gdn),
+                    "allow_fallback_cfc": bool(args.allow_fallback_cfc),
                     "max_pieces": int(args.max_pieces),
                 },
                 "data": {
@@ -1113,7 +1184,7 @@ def main() -> None:
                     "source_manifest": str(manifest_path.resolve()),
                 },
                 "result": {
-                    "variant": "variant_e",
+                    "variant": "variant_f",
                     "params": int(params),
                     "train_loss": [float(v) for v in history.get("train_loss", [])],
                     "val_loss": [float(v) for v in history.get("val_loss", [])],
@@ -1137,7 +1208,7 @@ def main() -> None:
                 },
             }
 
-            result_path = output_dir / "variant_e_40m_ddp_result.json"
+            result_path = output_dir / "variant_f_40m_ddp_result.json"
             result_path.write_text(json.dumps(result_payload, indent=2), encoding="utf-8")
             print(f"DDP run complete. Result JSON: {result_path.resolve()}")
 
