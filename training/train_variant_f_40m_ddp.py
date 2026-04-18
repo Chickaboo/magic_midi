@@ -50,13 +50,13 @@ from training.scheduler import WarmupCosineScheduler
 
 
 VARIANT_F_40M_PROFILE: Dict[str, float] = {
-    "d_model": 832,
-    "n_layers": 10,
+    "d_model": 768,
+    "n_layers": 14,
     "harmonic_ratio": 0.40,
     "temporal_ratio": 0.30,
     "gdn_inner_ratio": 0.50,
     "gdn_num_heads": 4,
-    "temporal_cfc_backbone_units": 624,
+    "temporal_cfc_backbone_units": 576,
     "temporal_cfc_backbone_layers": 2,
     "structural_num_heads": 8,
     "structural_gqa_groups": 4,

@@ -137,7 +137,7 @@ class VariantFConfig:
 
 
 class VariantFModel(nn.Module):
-    """Event-hierarchical tri-path model (harmonic GDN + temporal CfC + structural attention)."""
+    """Event-hierarchical tri-path model with phrase-level temporal CfC."""
 
     def __init__(self, config: Optional[VariantFConfig] = None) -> None:
         super().__init__()
@@ -280,6 +280,13 @@ class VariantFModel(nn.Module):
             ]
         )
 
+        self.events_per_phrase = int(max(1, cfg.tokens_per_phrase))
+        self.temporal_phrase_summarizer = PhraseSummarizer(
+            d_model=self.d_model,
+            phrase_dim=self.temporal_dim,
+            tokens_per_phrase=self.events_per_phrase,
+        )
+
         self.ht_to_struct = nn.ModuleList(
             [
                 nn.Sequential(
@@ -323,7 +330,6 @@ class VariantFModel(nn.Module):
         )
 
         phrase_dim = int(cfg.phrase_dim or self.d_model)
-        self.events_per_phrase = int(max(1, cfg.tokens_per_phrase))
         self.phrase_summarizer = PhraseSummarizer(
             d_model=self.d_model,
             phrase_dim=phrase_dim,
@@ -523,6 +529,41 @@ class VariantFModel(nn.Module):
             deltas[:, 1:] = x[:, 1:] - x[:, :-1]
         return torch.clamp(deltas, min=1e-4)
 
+    def _phrase_onsets(self, onset_times: torch.Tensor) -> torch.Tensor:
+        """Reduce event-level onset times to one onset per phrase."""
+
+        if onset_times.ndim != 2:
+            raise ValueError(
+                f"onset_times must be rank-2, got {tuple(onset_times.shape)}"
+            )
+
+        batch_size, seq_len = onset_times.shape
+        pad_len = (
+            self.events_per_phrase - (int(seq_len) % self.events_per_phrase)
+        ) % self.events_per_phrase
+        if pad_len > 0:
+            if seq_len > 0:
+                onset_pad = onset_times[:, -1:].expand(-1, pad_len)
+            else:
+                onset_pad = onset_times.new_zeros((batch_size, pad_len))
+            onset_times = torch.cat([onset_times, onset_pad], dim=1)
+
+        return onset_times.view(batch_size, -1, self.events_per_phrase)[:, :, 0]
+
+    def _repeat_phrase_context(
+        self,
+        phrase_context: torch.Tensor,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """Broadcast phrase-level context back to the event sequence length."""
+
+        if phrase_context.ndim != 3:
+            raise ValueError(
+                f"phrase_context must be rank-3, got {tuple(phrase_context.shape)}"
+            )
+        expanded = phrase_context.repeat_interleave(self.events_per_phrase, dim=1)
+        return expanded[:, :seq_len, :]
+
     def _prepare_embeddings(
         self,
         token_ids: torch.Tensor,
@@ -629,21 +670,33 @@ class VariantFModel(nn.Module):
         )
 
         h = self.harmonic_in(event_latents)
-        t = self.temporal_in(event_latents)
         s = self.structural_in(event_latents)
 
-        timespans = self._timespan_deltas(event_onsets)
-        temporal_hidden: List[Optional[torch.Tensor]] = [None] * int(self.config.n_layers)
+        temporal_phrase_onsets = self._phrase_onsets(event_onsets)
+        temporal_phrase = self.temporal_phrase_summarizer(event_latents)
+        temporal_timespans = self._timespan_deltas(temporal_phrase_onsets)
+        temporal_hidden: List[Optional[torch.Tensor]] = [None] * int(
+            self.config.n_layers
+        )
+        for i in range(int(self.config.n_layers)):
+            temporal_phrase, temporal_hidden[i] = self.temporal_layers[i](
+                temporal_phrase,
+                timespans=temporal_timespans,
+                hidden=temporal_hidden[i],
+            )
+
+        temporal_context = self._repeat_phrase_context(
+            temporal_phrase,
+            seq_len=int(event_latents.shape[1]),
+        )
+
         cross_idx = 0
         event_offset = int(max(0, position_offset) // max(1, int(self.event_size)))
 
+        t = self.temporal_in(event_latents) + temporal_context
+
         for i in range(int(self.config.n_layers)):
             h = h + self.harmonic_layers[i](self.harmonic_norms[i](h))
-            t, temporal_hidden[i] = self.temporal_layers[i](
-                t,
-                timespans=timespans,
-                hidden=temporal_hidden[i],
-            )
             s = s + self.structural_layers[i](
                 self.structural_norms[i](s),
                 position_offset=event_offset,
