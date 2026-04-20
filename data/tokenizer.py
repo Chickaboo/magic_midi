@@ -698,24 +698,28 @@ def create_tokenizer(
     strategy: str = "custom_delta",
     **kwargs: Any,
 ) -> Any:
-    """Create tokenizer instance from one stable strategy selector."""
+    """Create tokenizer instance from the unified tokenizer selector."""
 
     normalized = str(strategy).strip().lower()
-    if normalized in {"custom_delta", "delta", "quad", "event_quad"}:
-        return CustomDeltaTokenizer(
-            default_velocity=int(kwargs.get("default_velocity", 88)),
-            include_special_tokens=bool(kwargs.get("include_special_tokens", False)),
+    if normalized not in {"custom_delta", "delta", "quad", "event_quad", "unified"}:
+        raise ValueError(
+            "Unsupported tokenizer strategy "
+            f"'{strategy}'. Only the unified CustomDeltaTokenizer is supported."
         )
-    if normalized in {"remi", "octuple"}:
-        return PianoTokenizer(strategy=normalized)
-    raise ValueError(
-        "Unsupported tokenizer strategy "
-        f"'{strategy}'. Expected one of: custom_delta, remi, octuple."
+
+    return CustomDeltaTokenizer(
+        default_velocity=int(kwargs.get("default_velocity", 88)),
+        include_special_tokens=bool(kwargs.get("include_special_tokens", False)),
+        include_structural_meta_tokens=bool(
+            kwargs.get("include_structural_meta_tokens", True)
+        ),
+        prepend_start_token=bool(kwargs.get("prepend_start_token", True)),
+        density_quartiles=kwargs.get("density_quartiles"),
     )
 
 
 def load_tokenizer(path: str | Path, strategy: str | None = None) -> Any:
-    """Load tokenizer from disk with automatic type detection."""
+    """Load unified tokenizer from disk."""
 
     load_path = Path(path)
     if not load_path.exists():
@@ -723,14 +727,12 @@ def load_tokenizer(path: str | Path, strategy: str | None = None) -> Any:
 
     forced = str(strategy).strip().lower() if strategy is not None else ""
     if forced:
-        if forced in {"custom_delta", "delta", "quad", "event_quad"}:
-            return CustomDeltaTokenizer.load(str(load_path))
-        if forced in {"remi", "octuple"}:
-            return PianoTokenizer.load(str(load_path))
-        raise ValueError(
-            "Unsupported tokenizer strategy "
-            f"'{strategy}'. Expected one of: custom_delta, remi, octuple."
-        )
+        if forced not in {"custom_delta", "delta", "quad", "event_quad", "unified"}:
+            raise ValueError(
+                "Unsupported tokenizer strategy "
+                f"'{strategy}'. Only the unified CustomDeltaTokenizer is supported."
+            )
+        return CustomDeltaTokenizer.load(str(load_path))
 
     try:
         import json
@@ -739,13 +741,16 @@ def load_tokenizer(path: str | Path, strategy: str | None = None) -> Any:
         if str(payload.get("type", "")).strip() == "CustomDeltaTokenizer":
             return CustomDeltaTokenizer.load(str(load_path))
     except Exception:
-        pass
+        raise ValueError(
+            "Failed to parse tokenizer payload. Expected a CustomDeltaTokenizer JSON file."
+        )
 
-    return PianoTokenizer.load(str(load_path))
+    raise ValueError(
+        "Unsupported tokenizer payload. Only CustomDeltaTokenizer is supported in this workspace."
+    )
 
 
 __all__ = [
-    "PianoTokenizer",
     "CustomDeltaTokenizer",
     "create_tokenizer",
     "load_tokenizer",

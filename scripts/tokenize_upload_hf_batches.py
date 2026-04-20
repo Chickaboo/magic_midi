@@ -98,6 +98,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-token-length", type=int, default=192, help="Tokenizer minimum token length filter.")
     parser.add_argument("--checkpoint-every", type=int, default=2000, help="Tokenizer checkpoint frequency.")
     parser.add_argument("--progress-every", type=int, default=500, help="Tokenizer progress print frequency.")
+    parser.add_argument(
+        "--positions-per-bar",
+        type=int,
+        default=31,
+        help="Deprecated compatibility flag forwarded to tokenizer script.",
+    )
+    parser.add_argument(
+        "--include-structural-prefix",
+        action="store_true",
+        help="Enable Density/Voices/Register prefix tokens in tokenizer output.",
+    )
     parser.add_argument("--compress-output", action="store_true", help="Write compressed .npz outputs.")
     parser.add_argument("--allow-mixed-instruments", action="store_true", help="Disable strict piano filter.")
     parser.add_argument("--private", action="store_true", help="Create dataset repo as private if it does not exist.")
@@ -437,6 +448,8 @@ def main() -> None:
     print(f"  end_index_exclusive: {end_index_exclusive:,}")
     print(f"  chunk_members: {int(args.chunk_members):,}")
     print(f"  output_shard_size: {int(args.output_shard_size):,}")
+    print(f"  positions_per_bar: {int(max(4, min(31, int(args.positions_per_bar))))}")
+    print(f"  include_structural_prefix: {bool(args.include_structural_prefix)}")
     print(f"  flash_root: {flash_root}")
     print(f"  repo_id: {args.repo_id}")
     print(f"  upload_prefix: {str(args.upload_prefix).strip('/')}")
@@ -495,9 +508,13 @@ def main() -> None:
             str(int(args.checkpoint_every)),
             "--progress-every",
             str(int(args.progress_every)),
+            "--positions-per-bar",
+            str(int(max(4, min(31, int(args.positions_per_bar))))),
         ]
         if not resume_chunk:
             tokenize_cmd.append("--start-over")
+        if bool(args.include_structural_prefix):
+            tokenize_cmd.append("--include-structural-prefix")
         if bool(args.compress_output):
             tokenize_cmd.append("--compress-output")
         if bool(args.allow_mixed_instruments):

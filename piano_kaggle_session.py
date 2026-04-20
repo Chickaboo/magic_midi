@@ -16,7 +16,7 @@ import torch
 
 from data.dataset import create_dataloaders
 from data.preprocess import MultiDatasetPreprocessor, preprocess_maestro
-from data.tokenizer import PianoTokenizer
+from data.tokenizer import CustomDeltaTokenizer
 from generation.generate import GenerationConfig, generate_continuation
 from kaggle_config import (
     find_adl_piano_root,
@@ -607,7 +607,7 @@ def run_kaggle_session(scale: str = "small", max_epochs: int = 2000) -> Dict[str
     else:
         LOGGER.info("Reusing tokenizer and processed cache from /kaggle/working.")
 
-    tokenizer = PianoTokenizer.load(data_cfg.tokenizer_path)
+    tokenizer = CustomDeltaTokenizer.load(data_cfg.tokenizer_path)
     model_cfg.vocab_size = tokenizer.vocab_size
     data_cfg.vocab_size = tokenizer.vocab_size
 

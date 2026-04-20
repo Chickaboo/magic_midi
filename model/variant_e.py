@@ -13,9 +13,53 @@ from model.sampling import sample_next_token
 from model.time_encoding import ContinuousTimeEncoding
 
 
+def _resolve_divisible_heads(
+    width: int,
+    requested_heads: int,
+    *,
+    require_even_head_dim: bool = False,
+) -> int:
+    w = int(max(1, width))
+    heads = max(1, min(int(requested_heads), w))
+    while heads > 1:
+        if (w % heads) == 0:
+            head_dim = w // heads
+            if not require_even_head_dim or (head_dim % 2 == 0):
+                return int(heads)
+        heads -= 1
+
+    if require_even_head_dim and (w % 2) != 0:
+        return 1
+    return 1
+
+
+def _resolve_hybrid_dims(d_model: int, gdn_ratio: float) -> Tuple[int, int]:
+    d = int(max(4, d_model))
+    ratio = float(min(0.9, max(0.1, gdn_ratio)))
+    gdn_dim = int(round(float(d) * ratio))
+    gdn_dim = max(1, min(d - 1, gdn_dim))
+    gqa_dim = int(d - gdn_dim)
+
+    if (gqa_dim % 2) != 0:
+        if gdn_dim > 1:
+            gdn_dim -= 1
+            gqa_dim += 1
+        else:
+            gdn_dim += 1
+            gqa_dim -= 1
+
+    gdn_dim = max(1, gdn_dim)
+    gqa_dim = max(2, gqa_dim)
+    if (gqa_dim % 2) != 0:
+        gqa_dim -= 1
+        gdn_dim += 1
+
+    return int(gdn_dim), int(gqa_dim)
+
+
 @dataclass
 class VariantEConfig:
-    vocab_size: int = 171
+    vocab_size: int = 374
     d_model: int = 512
     n_layers: int = 6
     max_sequence_length: int = 1024
@@ -25,11 +69,13 @@ class VariantEConfig:
     embedding_init_std: float = 0.02
     output_logit_scale: Optional[float] = None
 
-    # Gated Delta stack (no CfC) with sparse attention anchor layers.
+    # Parallel hybrid-head block (no CfC): split width into GDN + dense GQA paths.
+    gdn_path_ratio: float = 0.5
     gdn_inner_dim: int = 256
     gdn_num_heads: int = 4
     gqa_num_heads: int = 8
     gqa_groups: int = 4
+    # Kept for runner/checkpoint compatibility; Variant E beta always uses dense GQA.
     attention_every_n_layers: int = 2
     full_attention: bool = False
 
@@ -42,55 +88,79 @@ class VariantEConfig:
 
 
 class _VariantEBlock(nn.Module):
-    """One repeating Variant-E block: GDN -> GDN -> (optional) GQA."""
+    """Parallel hybrid-head block: GDN path + dense GQA path with fused output."""
 
-    def __init__(self, cfg: VariantEConfig, use_attention: bool) -> None:
+    def __init__(self, cfg: VariantEConfig) -> None:
         super().__init__()
         d = int(cfg.d_model)
 
-        self.norm_gdn1 = nn.LayerNorm(d)
-        self.gdn1 = GatedDeltaNetBlock(
+        self.gdn_dim, self.gqa_dim = _resolve_hybrid_dims(
             d_model=d,
-            inner_dim=int(cfg.gdn_inner_dim),
-            num_heads=int(cfg.gdn_num_heads),
+            gdn_ratio=float(cfg.gdn_path_ratio),
+        )
+
+        self.norm_in = nn.LayerNorm(d)
+        self.gdn_in_proj = nn.Linear(d, self.gdn_dim, bias=False)
+        self.gqa_in_proj = nn.Linear(d, self.gqa_dim, bias=False)
+
+        gdn_inner_dim = max(int(self.gdn_dim), int(cfg.gdn_inner_dim))
+        gdn_heads = _resolve_divisible_heads(
+            width=int(gdn_inner_dim),
+            requested_heads=int(cfg.gdn_num_heads),
+            require_even_head_dim=False,
+        )
+
+        self.norm_gdn = nn.LayerNorm(self.gdn_dim)
+        self.gdn = GatedDeltaNetBlock(
+            d_model=int(self.gdn_dim),
+            inner_dim=int(gdn_inner_dim),
+            num_heads=int(gdn_heads),
             dropout=float(cfg.dropout),
         )
 
-        self.norm_gdn2 = nn.LayerNorm(d)
-        self.gdn2 = GatedDeltaNetBlock(
-            d_model=d,
-            inner_dim=int(cfg.gdn_inner_dim),
-            num_heads=int(cfg.gdn_num_heads),
-            dropout=float(cfg.dropout),
+        gqa_heads = _resolve_divisible_heads(
+            width=int(self.gqa_dim),
+            requested_heads=int(cfg.gqa_num_heads),
+            require_even_head_dim=True,
+        )
+        gqa_groups = max(1, min(int(cfg.gqa_groups), int(gqa_heads)))
+        while gqa_groups > 1 and (gqa_heads % gqa_groups) != 0:
+            gqa_groups -= 1
+        kv_heads = max(1, int(gqa_heads) // int(gqa_groups))
+
+        self.norm_gqa = nn.LayerNorm(self.gqa_dim)
+        self.gqa = GQABlock(
+            d_model=int(self.gqa_dim),
+            num_heads=int(gqa_heads),
+            num_kv_heads=int(kv_heads),
+            dropout=float(cfg.attention_dropout),
         )
 
-        self.use_attention = bool(use_attention)
-        if self.use_attention:
-            kv_heads = max(1, int(cfg.gqa_num_heads) // max(1, int(cfg.gqa_groups)))
-            self.norm_gqa = nn.LayerNorm(d)
-            self.gqa = GQABlock(
-                d_model=d,
-                num_heads=int(cfg.gqa_num_heads),
-                num_kv_heads=kv_heads,
-                dropout=float(cfg.attention_dropout),
-            )
-        else:
-            self.norm_gqa = None
-            self.gqa = None
+        self.fuse = nn.Sequential(
+            nn.LayerNorm(int(self.gdn_dim + self.gqa_dim)),
+            nn.Linear(int(self.gdn_dim + self.gqa_dim), d, bias=False),
+            nn.GELU(),
+            nn.Dropout(float(cfg.dropout)),
+            nn.Linear(d, d, bias=False),
+        )
 
     def forward(self, x: torch.Tensor, position_offset: int) -> torch.Tensor:
-        x = x + self.gdn1(self.norm_gdn1(x))
-        x = x + self.gdn2(self.norm_gdn2(x))
+        h = self.norm_in(x)
 
-        if self.use_attention and self.gqa is not None and self.norm_gqa is not None:
-            x = x + self.gqa(
-                self.norm_gqa(x), position_offset=int(max(0, position_offset))
-            )
-        return x
+        gdn_state = self.gdn_in_proj(h)
+        gdn_state = gdn_state + self.gdn(self.norm_gdn(gdn_state))
+
+        gqa_state = self.gqa_in_proj(h)
+        gqa_state = gqa_state + self.gqa(
+            self.norm_gqa(gqa_state), position_offset=int(max(0, position_offset))
+        )
+
+        fused = self.fuse(torch.cat([gdn_state, gqa_state], dim=-1))
+        return x + fused
 
 
 class VariantEModel(nn.Module):
-    """Ablation Variant E model (GDN + sparse attention, no CfC)."""
+    """Variant E beta model with parallel GDN + dense GQA hybrid-head blocks."""
 
     def __init__(self, config: Optional[VariantEConfig] = None) -> None:
         super().__init__()
@@ -114,18 +184,7 @@ class VariantEModel(nn.Module):
         self.dropout = nn.Dropout(float(cfg.dropout))
 
         n_layers = int(cfg.n_layers)
-        attn_stride = max(1, int(cfg.attention_every_n_layers))
-        use_full_attention = bool(getattr(cfg, "full_attention", False))
-
-        def _use_attention(layer_index: int) -> bool:
-            if use_full_attention:
-                return True
-            is_last = layer_index == (n_layers - 1)
-            return is_last or ((layer_index + 1) % attn_stride == 0)
-
-        self.layers = nn.ModuleList(
-            [_VariantEBlock(cfg, use_attention=_use_attention(i)) for i in range(n_layers)]
-        )
+        self.layers = nn.ModuleList([_VariantEBlock(cfg) for _ in range(n_layers)])
 
         self.final_norm = nn.LayerNorm(self.d_model)
         self.lm_head = nn.Linear(self.d_model, self.vocab_size, bias=False)
@@ -190,13 +249,13 @@ class VariantEModel(nn.Module):
     @staticmethod
     def _allowed_ids_for_slot(slot: int, vocab_size: int) -> torch.Tensor:
         if slot == 0:
-            return torch.arange(0, 32, dtype=torch.long)
+            return torch.arange(0, 128, dtype=torch.long)
         if slot == 1:
-            return torch.arange(32, 120, dtype=torch.long)
+            return torch.arange(128, 216, dtype=torch.long)
         if slot == 2:
-            return torch.arange(120, 152, dtype=torch.long)
+            return torch.arange(216, 344, dtype=torch.long)
         if slot == 3:
-            return torch.arange(152, 168, dtype=torch.long)
+            return torch.arange(344, 360, dtype=torch.long)
         return torch.arange(0, vocab_size, dtype=torch.long)
 
     def _mask_logits_to_triplet_slot(
@@ -228,19 +287,17 @@ class VariantEModel(nn.Module):
             except Exception:
                 pass
 
-        if 0 <= int(token_id) <= 31:
-            bins = torch.cat(
-                [
-                    torch.tensor([0.0], dtype=torch.float32),
-                    torch.logspace(
-                        math.log10(1e-4),
-                        math.log10(2.0),
-                        steps=31,
-                        dtype=torch.float32,
-                    ),
-                ]
+        if 0 <= int(token_id) <= 127:
+            if int(token_id) == 0:
+                return 0.0
+            bins = torch.logspace(
+                math.log10(1e-4),
+                math.log10(8.0),
+                steps=127,
+                dtype=torch.float32,
             )
-            return float(max(1e-4, bins[int(token_id)].item()))
+            idx = max(0, min(126, int(token_id) - 1))
+            return float(max(1e-4, bins[idx].item()))
         return float(max(1e-4, default_step))
 
     def forward(

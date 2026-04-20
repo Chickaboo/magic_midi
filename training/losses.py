@@ -23,10 +23,10 @@ def _build_slot_allowed_mask(
     allowed = torch.zeros((seq_len, vocab_size), dtype=torch.bool, device=device)
 
     ranges = {
-        0: (0, 32),    # delta
-        1: (32, 120),  # pitch
-        2: (120, 152), # duration
-        3: (152, 168), # velocity
+        0: (0, 128),    # delta
+        1: (128, 216),  # pitch
+        2: (216, 344),  # duration
+        3: (344, 360),  # velocity
     }
     for slot, (start, end) in ranges.items():
         valid_start = max(0, int(start))

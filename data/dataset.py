@@ -210,7 +210,7 @@ class PianoDataset(Dataset):
     def _resolve_event_size(self) -> int:
         strategy = str(getattr(self.data_config, "tokenization_strategy", "")).lower()
         if strategy == "custom_delta":
-            return 4 if int(getattr(self.data_config, "vocab_size", 0)) >= 171 else 3
+            return 4
         return 1
 
     @staticmethod

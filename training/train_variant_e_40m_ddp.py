@@ -9,15 +9,13 @@ import shutil
 import subprocess
 import sys
 from contextlib import nullcontext
-from dataclasses import asdict
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 import numpy as np
 import torch
 import torch.distributed as dist
-from safetensors.torch import save_file as safetensors_save_file
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
@@ -46,6 +44,16 @@ from training.losses import (
     next_token_loss,
     next_token_slot_accuracies,
 )
+from training.ddp_common import (
+    _average_from_sums,
+    _is_main_process,
+    _load_checkpoint,
+    _log,
+    _rank_info,
+    _resolve_divisible_heads,
+    _resolve_resume_checkpoint,
+    _save_checkpoint,
+)
 from training.scheduler import WarmupCosineScheduler
 
 
@@ -59,204 +67,6 @@ VARIANT_E_40M_PROFILE: Dict[str, float] = {
     "gqa_groups": 4,
     "target_params": 40_000_000,
 }
-
-
-def _rank_info() -> Tuple[int, int, int]:
-    rank = int(os.environ.get("RANK", "0"))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    return rank, world_size, local_rank
-
-
-def _is_main_process(rank: int) -> bool:
-    return int(rank) == 0
-
-
-def _log(rank: int, message: str) -> None:
-    if _is_main_process(rank):
-        print(message)
-
-
-def _resolve_divisible_heads(width: int, requested_heads: int) -> int:
-    heads = max(1, min(int(requested_heads), int(width)))
-    while heads > 1 and (int(width) % heads) != 0:
-        heads -= 1
-    return max(1, heads)
-
-
-def _prepare_state_for_safetensors(
-    state_dict: Dict[str, torch.Tensor],
-) -> Dict[str, torch.Tensor]:
-    prepared: Dict[str, torch.Tensor] = {}
-    seen_ptrs: set[int] = set()
-    for key, tensor in state_dict.items():
-        ptr = int(tensor.untyped_storage().data_ptr())
-        if ptr in seen_ptrs:
-            prepared[key] = tensor.clone()
-        else:
-            prepared[key] = tensor
-            seen_ptrs.add(ptr)
-    return prepared
-
-
-def _distributed_sum(value: float, device: torch.device) -> float:
-    tensor = torch.tensor(float(value), dtype=torch.float64, device=device)
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    return float(tensor.item())
-
-
-def _average_from_sums(
-    *,
-    total_sum: float,
-    total_count: float,
-    device: torch.device,
-) -> float:
-    reduced_sum = _distributed_sum(float(total_sum), device=device)
-    reduced_count = _distributed_sum(float(total_count), device=device)
-    if float(reduced_count) <= 0.0:
-        return 0.0
-    return float(reduced_sum / reduced_count)
-
-
-def _resolve_resume_checkpoint(
-    *,
-    checkpoint_dir: Path,
-    auto_resume: bool,
-    resume_from_checkpoint: str,
-) -> Optional[Path]:
-    def _pick_from_dir(dir_path: Path) -> Optional[Path]:
-        candidates = [
-            dir_path / "latest_state.pt",
-            dir_path / "latest.safetensors",
-            dir_path / "best_state.pt",
-            dir_path / "best.safetensors",
-        ]
-        return next((p for p in candidates if p.exists()), None)
-
-    raw = str(resume_from_checkpoint).strip()
-    if raw:
-        candidate = Path(raw).expanduser()
-        if candidate.is_file():
-            return candidate
-        if candidate.is_dir():
-            found = _pick_from_dir(candidate)
-            if found is None:
-                raise FileNotFoundError(
-                    f"No checkpoint files found in directory {candidate.resolve()}"
-                )
-            return found
-        raise FileNotFoundError(f"resume checkpoint not found: {candidate.resolve()}")
-
-    if bool(auto_resume):
-        return _pick_from_dir(checkpoint_dir)
-    return None
-
-
-def _save_checkpoint(
-    *,
-    model: VariantEModel | DDP,
-    optimizer: torch.optim.Optimizer,
-    scheduler: WarmupCosineScheduler,
-    scaler: torch.amp.GradScaler,
-    train_cfg: TrainConfig,
-    data_cfg: DataConfig,
-    checkpoint_dir: Path,
-    epoch: int,
-    val_loss: float,
-    history: Dict[str, List[float]],
-    best_val_loss: float,
-    global_step: int,
-    best: bool,
-) -> None:
-    core_model = model.module if isinstance(model, DDP) else model
-
-    if best:
-        model_path = checkpoint_dir / "best.safetensors"
-        state_path = checkpoint_dir / "best_state.pt"
-    else:
-        model_path = checkpoint_dir / "latest.safetensors"
-        state_path = checkpoint_dir / "latest_state.pt"
-
-    model_state = {
-        key: value.detach().cpu().contiguous()
-        for key, value in core_model.state_dict().items()
-    }
-    safetensors_save_file(
-        _prepare_state_for_safetensors(model_state),
-        str(model_path),
-        metadata={
-            "epoch": str(int(epoch)),
-            "val_loss": f"{float(val_loss):.8f}",
-            "train_config": json.dumps(asdict(train_cfg)),
-            "data_config": json.dumps(asdict(data_cfg)),
-            "model_config": json.dumps(asdict(core_model.config)),
-        },
-    )
-
-    state = {
-        "epoch": int(epoch),
-        "val_loss": float(val_loss),
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict(),
-        "scaler": scaler.state_dict(),
-        "train_config": asdict(train_cfg),
-        "data_config": asdict(data_cfg),
-        "model_config": asdict(core_model.config),
-        "model_weights_path": str(model_path.name),
-        "history": history,
-        "best_val_loss": float(best_val_loss),
-        "global_step": int(global_step),
-    }
-    torch.save(state, state_path)
-
-
-def _load_checkpoint(
-    *,
-    model: VariantEModel | DDP,
-    optimizer: torch.optim.Optimizer,
-    scheduler: WarmupCosineScheduler,
-    scaler: torch.amp.GradScaler,
-    checkpoint_path: Path,
-    device: torch.device,
-) -> Dict[str, Any]:
-    core_model = model.module if isinstance(model, DDP) else model
-
-    if checkpoint_path.suffix != ".pt":
-        raise RuntimeError(
-            "For DDP resumes, use a .pt state checkpoint (latest_state.pt or best_state.pt)."
-        )
-
-    state = torch.load(checkpoint_path, map_location=device)
-    model_weights_path = str(state.get("model_weights_path", "")).strip()
-    candidates = []
-    if model_weights_path:
-        candidates.append(checkpoint_path.parent / model_weights_path)
-    candidates.extend(
-        [
-            checkpoint_path.parent / "latest.safetensors",
-            checkpoint_path.parent / "best.safetensors",
-        ]
-    )
-
-    model_path = next((p for p in candidates if p.exists()), None)
-    if model_path is None:
-        raise FileNotFoundError(
-            f"No model safetensors found next to {checkpoint_path.resolve()}"
-        )
-
-    from safetensors.torch import load_file as safetensors_load_file
-
-    core_model.load_state_dict(safetensors_load_file(str(model_path), device="cpu"))
-
-    if "optimizer" in state:
-        optimizer.load_state_dict(state["optimizer"])
-    if "scheduler" in state:
-        scheduler.load_state_dict(state["scheduler"])
-    if "scaler" in state and state["scaler"] is not None:
-        scaler.load_state_dict(state["scaler"])
-
-    return dict(state)
 
 
 def _snapshot_epoch_bundle(
@@ -654,9 +464,10 @@ def main() -> None:
             weight_decay=float(train_cfg.weight_decay),
         )
 
+        batches_per_epoch = int(len(train_loader))
         steps_per_epoch = max(
             1,
-            math.ceil(len(train_loader) / float(max(1, int(train_cfg.grad_accumulation_steps)))),
+            math.ceil(float(batches_per_epoch) / float(max(1, int(train_cfg.grad_accumulation_steps)))),
         )
         total_steps = max(1, int(steps_per_epoch) * int(train_cfg.max_epochs))
         warmup_steps = (
@@ -691,13 +502,18 @@ def main() -> None:
         }
         global_step = 0
         best_val_loss = float("inf")
+        resume_epoch = 0
+        resume_batch_in_epoch = 0
+        resume_epoch_complete = True
+        first_epoch = 1
+        first_epoch_skip_batches = 0
+        final_epoch = int(train_cfg.max_epochs)
 
         resume_checkpoint = _resolve_resume_checkpoint(
             checkpoint_dir=checkpoint_dir,
             auto_resume=bool(args.auto_resume),
             resume_from_checkpoint=str(args.resume_from_checkpoint),
         )
-        start_epoch = 0
         epochs_to_run = int(train_cfg.max_epochs)
 
         if resume_checkpoint is not None:
@@ -709,7 +525,7 @@ def main() -> None:
                 checkpoint_path=resume_checkpoint,
                 device=device,
             )
-            start_epoch = int(resumed_state.get("epoch", 0))
+            resume_epoch = int(resumed_state.get("epoch", 0))
             history_state = resumed_state.get("history")
             if isinstance(history_state, dict):
                 for key in history:
@@ -718,20 +534,48 @@ def main() -> None:
             global_step = int(resumed_state.get("global_step", 0))
             best_val_loss = float(resumed_state.get("best_val_loss", best_val_loss))
 
-            if str(args.resume_mode).strip().lower() == "remaining":
-                epochs_to_run = max(0, int(train_cfg.max_epochs) - int(start_epoch))
+            resume_state = resumed_state.get("resume_state")
+            if isinstance(resume_state, dict):
+                resume_epoch = int(resume_state.get("epoch", resume_epoch))
+                resume_batch_in_epoch = int(resume_state.get("batch_step_in_epoch", 0))
+                resume_epoch_complete = bool(resume_state.get("is_epoch_complete", True))
+
+            resume_batch_in_epoch = int(max(0, min(resume_batch_in_epoch, batches_per_epoch)))
+
+            if bool(resume_epoch_complete):
+                first_epoch = int(max(1, resume_epoch + 1))
+                first_epoch_skip_batches = 0
             else:
-                epochs_to_run = int(train_cfg.max_epochs)
+                first_epoch = int(max(1, resume_epoch))
+                first_epoch_skip_batches = int(resume_batch_in_epoch)
+
+            if str(args.resume_mode).strip().lower() == "remaining":
+                final_epoch = int(train_cfg.max_epochs)
+            else:
+                final_epoch = int(resume_epoch + int(train_cfg.max_epochs))
+                if not bool(resume_epoch_complete):
+                    final_epoch -= 1
+
+            final_epoch = int(max(first_epoch, final_epoch))
+            epochs_to_run = int(max(0, final_epoch - first_epoch + 1))
 
             _log(
                 rank,
                 "Resuming DDP run "
-                f"from {resume_checkpoint.resolve()} at epoch={start_epoch} "
-                f"mode={args.resume_mode} epochs_to_run={epochs_to_run}",
+                f"from {resume_checkpoint.resolve()} at epoch={resume_epoch} "
+                f"batch_in_epoch={resume_batch_in_epoch} "
+                f"epoch_complete={resume_epoch_complete} mode={args.resume_mode} "
+                f"first_epoch={first_epoch} final_epoch={final_epoch} "
+                f"epochs_to_run={epochs_to_run}",
             )
+        else:
+            first_epoch = 1
+            first_epoch_skip_batches = 0
+            final_epoch = int(train_cfg.max_epochs)
+            epochs_to_run = int(max(0, final_epoch - first_epoch + 1))
 
-        for local_epoch in range(1, int(epochs_to_run) + 1):
-            epoch = int(start_epoch + local_epoch)
+        epoch_iterable = list(range(int(first_epoch), int(final_epoch) + 1))
+        for epoch in epoch_iterable:
             if distributed and isinstance(train_sampler, DistributedSampler):
                 train_sampler.set_epoch(int(epoch))
 
@@ -742,8 +586,21 @@ def main() -> None:
             epoch_loss_count = 0
             running_loss = 0.0
             running_count = 0
+            skip_batches_this_epoch = (
+                int(first_epoch_skip_batches)
+                if int(epoch) == int(first_epoch) and int(first_epoch_skip_batches) > 0
+                else 0
+            )
+            if skip_batches_this_epoch > 0:
+                _log(
+                    rank,
+                    f"Resuming inside epoch {epoch:03d}: skipping {skip_batches_this_epoch}/{batches_per_epoch} batches already completed.",
+                )
 
             for step_idx, batch in enumerate(train_loader, start=1):
+                if int(step_idx) <= int(skip_batches_this_epoch):
+                    continue
+
                 seed = batch["seed"].to(device, non_blocking=True)
                 continuation = batch["continuation"].to(device, non_blocking=True)
                 input_ids = batch["token_ids"].to(device, non_blocking=True)
@@ -793,7 +650,7 @@ def main() -> None:
 
                 should_step = (
                     step_idx % int(max(1, train_cfg.grad_accumulation_steps)) == 0
-                    or step_idx == len(train_loader)
+                    or step_idx == int(batches_per_epoch)
                 )
                 if should_step:
                     if use_amp:
@@ -835,10 +692,17 @@ def main() -> None:
                             best_val_loss=float(best_val_loss),
                             global_step=int(global_step),
                             best=False,
+                            resume_state={
+                                "epoch": int(epoch),
+                                "batch_step_in_epoch": int(step_idx),
+                                "batches_per_epoch": int(batches_per_epoch),
+                                "is_epoch_complete": bool(int(step_idx) >= int(batches_per_epoch)),
+                            },
                         )
                         print(
                             f"Step checkpoint saved: epoch={epoch:03d} "
-                            f"step={global_step:06d} loss~{step_avg_loss:.4f}"
+                            f"step={global_step:06d} batch={int(step_idx):05d}/{int(batches_per_epoch):05d} "
+                            f"loss~{step_avg_loss:.4f}"
                         )
 
                     if _is_main_process(rank) and int(global_step) % int(max(1, args.log_every_n_steps)) == 0 and running_count > 0:
@@ -984,6 +848,12 @@ def main() -> None:
                     best_val_loss=float(best_val_loss),
                     global_step=int(global_step),
                     best=False,
+                    resume_state={
+                        "epoch": int(epoch),
+                        "batch_step_in_epoch": int(batches_per_epoch),
+                        "batches_per_epoch": int(batches_per_epoch),
+                        "is_epoch_complete": True,
+                    },
                 )
 
                 if float(val_loss) < float(best_val_loss):
@@ -1002,6 +872,12 @@ def main() -> None:
                         best_val_loss=float(best_val_loss),
                         global_step=int(global_step),
                         best=True,
+                        resume_state={
+                            "epoch": int(epoch),
+                            "batch_step_in_epoch": int(batches_per_epoch),
+                            "batches_per_epoch": int(batches_per_epoch),
+                            "is_epoch_complete": True,
+                        },
                     )
 
                 print(
@@ -1131,7 +1007,11 @@ def main() -> None:
                         "enabled": bool(resume_checkpoint is not None),
                         "checkpoint": str(resume_checkpoint.resolve()) if resume_checkpoint is not None else "",
                         "mode": str(args.resume_mode),
-                        "resumed_from_epoch": int(start_epoch),
+                        "resumed_from_epoch": int(resume_epoch),
+                        "resumed_from_batch_in_epoch": int(resume_batch_in_epoch),
+                        "resumed_epoch_complete": bool(resume_epoch_complete),
+                        "first_epoch_this_invocation": int(first_epoch),
+                        "final_epoch_this_invocation": int(final_epoch),
                         "epochs_ran_this_invocation": int(epochs_to_run),
                     },
                 },

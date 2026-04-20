@@ -10,7 +10,7 @@ from safetensors import safe_open as safetensors_safe_open
 from safetensors.torch import load_file as safetensors_load_file
 
 from config import ModelConfig
-from data.tokenizer import CustomDeltaTokenizer, PianoTokenizer
+from data.tokenizer import CustomDeltaTokenizer
 from model.factory import build_model
 from model.variant_a import VariantAConfig, VariantAModel
 from model.variant_b import VariantBConfig, VariantBModel
@@ -391,21 +391,28 @@ def load_model_from_checkpoint(
 
 
 def detect_tokenizer_kind(tokenizer_path: Path, data_config: Dict[str, Any]) -> str:
-    """Detect whether tokenizer path should be loaded as custom_delta or piano."""
+    """Validate and detect unified tokenizer kind (custom_delta only)."""
 
     strategy = str(data_config.get("tokenization_strategy", "")).strip().lower()
-    if strategy == "custom_delta":
-        return "custom_delta"
+    if strategy and strategy != "custom_delta":
+        raise ValueError(
+            "Unsupported checkpoint tokenization strategy "
+            f"'{strategy}'. Only custom_delta is supported."
+        )
 
     if tokenizer_path.suffix.lower() == ".json":
         try:
             payload = json.loads(tokenizer_path.read_text(encoding="utf-8"))
         except Exception:
             payload = {}
-        if str(payload.get("type", "")).strip() == "CustomDeltaTokenizer":
-            return "custom_delta"
+        payload_type = str(payload.get("type", "")).strip()
+        if payload_type and payload_type != "CustomDeltaTokenizer":
+            raise ValueError(
+                "Unsupported tokenizer payload type "
+                f"'{payload_type}'. Only CustomDeltaTokenizer is supported."
+            )
 
-    return "piano"
+    return "custom_delta"
 
 
 def resolve_tokenizer_path(
@@ -414,7 +421,6 @@ def resolve_tokenizer_path(
 ) -> Path:
     """Resolve tokenizer path from data_config metadata and fallback search paths."""
 
-    strategy = str(data_config.get("tokenization_strategy", "")).strip().lower()
     configured = str(data_config.get("tokenizer_path", "")).strip()
 
     candidates: list[Path] = []
@@ -423,14 +429,13 @@ def resolve_tokenizer_path(
         candidates.append(Path(configured))
 
     fallback_paths = [Path(path) for path in search_paths]
-    if strategy == "custom_delta":
-        custom_first = [
-            path for path in fallback_paths if path.name.lower() == "custom_tokenizer.json"
-        ]
-        others = [
-            path for path in fallback_paths if path.name.lower() != "custom_tokenizer.json"
-        ]
-        fallback_paths = custom_first + others
+    custom_first = [
+        path for path in fallback_paths if path.name.lower() == "custom_tokenizer.json"
+    ]
+    others = [
+        path for path in fallback_paths if path.name.lower() != "custom_tokenizer.json"
+    ]
+    fallback_paths = custom_first + others
 
     candidates.extend(fallback_paths)
 
@@ -458,10 +463,7 @@ def load_tokenizer(
     """Load tokenizer object with automatic class selection."""
 
     tokenizer_kind = detect_tokenizer_kind(tokenizer_path, data_config)
-    if tokenizer_kind == "custom_delta":
-        tokenizer = CustomDeltaTokenizer.load(str(tokenizer_path))
-    else:
-        tokenizer = PianoTokenizer.load(str(tokenizer_path))
+    tokenizer = CustomDeltaTokenizer.load(str(tokenizer_path))
 
     meta = {
         "tokenizer_path": str(tokenizer_path),

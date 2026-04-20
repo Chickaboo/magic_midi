@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 
 import torch
 
 from config import DataConfig
-from data.tokenizer import CustomDeltaTokenizer, PianoTokenizer
+from data.tokenizer import CustomDeltaTokenizer
 from generation.generate import GenerationConfig, generate_continuation
 from utils import checkpoint_loading as ckpt_utils
 from utils.midi_utils import compare_pianorolls, render_midi_audio
@@ -77,21 +76,13 @@ def _resolve_seed_path() -> Path:
     return candidates[0]
 
 
-def build_tokenizer_if_needed(data_cfg: DataConfig) -> PianoTokenizer | CustomDeltaTokenizer:
+def build_tokenizer_if_needed(data_cfg: DataConfig) -> CustomDeltaTokenizer:
     """Load existing tokenizer from app/tokenizer, with optional fallback training."""
 
     for tokenizer_path in TOKENIZER_PATHS:
         if tokenizer_path.exists():
             print(f"Loading tokenizer from {tokenizer_path}")
-            if str(getattr(data_cfg, "tokenization_strategy", "")).strip().lower() == "custom_delta":
-                return CustomDeltaTokenizer.load(str(tokenizer_path))
-            try:
-                payload = json.loads(tokenizer_path.read_text(encoding="utf-8"))
-            except Exception:
-                payload = {}
-            if str(payload.get("type", "")).strip() == "CustomDeltaTokenizer":
-                return CustomDeltaTokenizer.load(str(tokenizer_path))
-            return PianoTokenizer.load(str(tokenizer_path))
+            return CustomDeltaTokenizer.load(str(tokenizer_path))
 
     midi_paths = sorted(
         list(MAESTRO_ROOT.rglob("*.midi")) + list(MAESTRO_ROOT.rglob("*.mid")),
@@ -101,11 +92,11 @@ def build_tokenizer_if_needed(data_cfg: DataConfig) -> PianoTokenizer | CustomDe
         raise FileNotFoundError(f"No MIDI files found under {MAESTRO_ROOT}")
 
     print(f"Training tokenizer on {len(midi_paths)} MIDI files...")
-    tokenizer = PianoTokenizer()
-    tokenizer.train(midi_paths=midi_paths, vocab_size=2000)
+    tokenizer = CustomDeltaTokenizer(include_special_tokens=False)
+    tokenizer.train(midi_paths=midi_paths, vocab_size=tokenizer.vocab_size)
     TOKENIZER_PATHS[0].parent.mkdir(parents=True, exist_ok=True)
-    tokenizer.save(str(TOKENIZER_PATHS[-1]))
-    print(f"Saved tokenizer to {TOKENIZER_PATHS[-1]}")
+    tokenizer.save(str(TOKENIZER_PATHS[0]))
+    print(f"Saved tokenizer to {TOKENIZER_PATHS[0]}")
     return tokenizer
 
 
@@ -139,6 +130,10 @@ def main() -> None:
             search_paths=TOKENIZER_PATHS,
         )
         print(f"Loading tokenizer from {tokenizer_meta.get('tokenizer_path')}")
+        if not isinstance(tokenizer, CustomDeltaTokenizer):
+            raise RuntimeError(
+                "Unified tokenizer mode requires a CustomDeltaTokenizer checkpoint tokenizer."
+            )
     except FileNotFoundError:
         tokenizer = build_tokenizer_if_needed(data_cfg)
         tokenizer_meta = {

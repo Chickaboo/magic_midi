@@ -48,7 +48,6 @@ class _TemporalCfCLayer(nn.Module):
         dropout: float,
     ) -> None:
         super().__init__()
-        self.norm = nn.LayerNorm(int(d_model))
         self.core = CfCBlock(
             d_model=int(d_model),
             cfc_units=int(d_model),
@@ -67,26 +66,21 @@ class _TemporalCfCLayer(nn.Module):
         timespans: torch.Tensor,
         hidden: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        cfc_in = self.norm(x)
-        input_dtype = cfc_in.dtype
-
-        cfc_x = cfc_in.float() if cfc_in.dtype != torch.float32 else cfc_in
-        cfc_x = self.core.input_proj(cfc_x)
-
+        input_dtype = x.dtype
         if hidden is None:
-            hidden = cfc_x.new_zeros((cfc_x.shape[0], self.core.cfc_units))
+            hidden = x.new_zeros((x.shape[0], self.core.cfc_units))
 
-        ts = timespans.to(dtype=cfc_x.dtype)
-        cfc_out, new_hidden = self.core.call_core(cfc_x, hidden=hidden, timespans=ts)
+        cfc_out, new_hidden = self.core.forward(
+            x,
+            hidden=hidden,
+            timespans=timespans,
+        )
 
         if cfc_out.dtype != input_dtype:
             cfc_out = cfc_out.to(dtype=input_dtype)
         if isinstance(new_hidden, torch.Tensor) and new_hidden.dtype != input_dtype:
             new_hidden = new_hidden.to(dtype=input_dtype)
-
-        cfc_out = self.core.output_proj(cfc_out)
-        cfc_out = self.core.dropout(cfc_out)
-        return x + cfc_out, new_hidden
+        return cfc_out, new_hidden
 
 
 @dataclass

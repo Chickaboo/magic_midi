@@ -11,7 +11,7 @@ class DataConfig:
         tokenizer_path: Path to tokenizer JSON file.
         processed_path: Directory where tokenized arrays and manifest are saved.
         vocab_size: Target tokenizer vocabulary size.
-        tokenization_strategy: Tokenization backend ("remi" or "octuple").
+        tokenization_strategy: Unified tokenization backend ("custom_delta").
         seed_length: Prefix length fed to the model.
         continuation_length: Number of target tokens after the seed.
         stride: Sliding-window stride used by preprocessing helpers.
@@ -34,8 +34,8 @@ class DataConfig:
     maestro_path: str = "maestro-v3.0.0"
     tokenizer_path: str = "tokenizer.json"
     processed_path: str = "processed/"
-    vocab_size: int = 2000
-    tokenization_strategy: str = "remi"
+    vocab_size: int = 374
+    tokenization_strategy: str = "custom_delta"
     seed_length: int = 256
     continuation_length: int = 768
     stride: int = 128
@@ -106,7 +106,7 @@ class ModelConfig:
         debug: Enable extra runtime assertions.
     """
 
-    vocab_size: int = 2000
+    vocab_size: int = 374
     d_model: int = 256
     n_layers: int = 4
     d_state: int = 16

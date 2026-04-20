@@ -162,11 +162,20 @@ class EpisodicThemeMemory(nn.Module):
                 f"phrases must be (batch, num_phrases, phrase_dim), got {tuple(phrases.shape)}"
             )
 
+        normalized_phrases = self.pre_norm(phrases)
+        queries = self.query_proj(normalized_phrases)
         write_scores = self.write_gate(phrases)
         write_mask = (write_scores > 0.5).to(dtype=phrases.dtype)
         candidates = self._normalize_for_storage(phrases) * write_mask * write_scores
 
         if memory is None or memory.numel() == 0 or memory.shape[1] == 0:
+            memory_context, _ = self.memory_attention(
+                queries,
+                normalized_phrases,
+                normalized_phrases,
+            )
+            enhanced = self.norm(phrases + (memory_context * float(self.residual_scale)))
+
             initial = self._select_memory_candidates(
                 memory=phrases[:, :0, :],
                 candidates=candidates,
@@ -174,10 +183,8 @@ class EpisodicThemeMemory(nn.Module):
             )
             if initial.shape[1] == 0:
                 initial = self._normalize_for_storage(phrases[:, -1:, :])
-            return phrases, initial
+            return enhanced, initial
 
-        normalized_phrases = self.pre_norm(phrases)
-        queries = self.query_proj(normalized_phrases)
         memory_context, _ = self.memory_attention(queries, memory, memory)
         enhanced = self.norm(phrases + (memory_context * float(self.residual_scale)))
 

@@ -1,28 +1,20 @@
 # Active Notebooks
 
-This folder now contains the active, current notebooks for sub-100M quality validation runs.
+This folder contains current training and generation notebooks.
 
 ## Current notebooks
 
 - 01_t4_sub100m_unified_variant_ce.ipynb
-  - Unified Variant C / Variant E / Variant F sub-100M workflow.
-  - Backed by `training/sub100m_unified.py` for a single shared training core.
-  - Targets fair ~40M architecture comparisons between C, E, and F.
-  - Supports larger pilot subsets (default 100k pieces), auto-resume, and NPZ-manifest auto-build.
+  - Unified Variant C / Variant E / Variant F workflow for controlled sub-100M comparisons.
 - 02_kaggle_40m_gdn_variant_e_100k.ipynb
-  - Dedicated Kaggle workflow for strict Variant E (Gated Delta + sparse attention anchors).
-  - Locks to the 40M architecture profile and 100k-piece budget by default.
-  - Adds explicit architecture preflight checks (event-size alignment, real GDN backend, parameter-budget sanity) before training.
-  - Uses a dual-T4 DDP path for real-GDN multi-GPU runs (with single-process fallback when only one GPU is available).
+  - Dedicated 40M Variant E Kaggle baseline run.
 - 03_colab_midi_generation.ipynb
-  - Self-contained Google Colab GPU notebook for single-file or batch MIDI continuation runs.
-  - Uses notebook-defined code and downloads public model files/tokenizer from Hugging Face.
+  - Colab generation notebook for checkpoint inference workflows.
+- 05_kaggle_100m_variant_e_500k_barmeta.ipynb
+  - Primary 100M Variant E notebook for 500k-piece training on dual T4.
+  - Enforces strict dense backend checks and unified custom-delta tokenizer contract.
+  - Drives `training/train_variant_e_100m_ddp.py` with `event_size=4` / `vocab_size=374` settings.
 
 ## Legacy notebooks
 
-Older notebooks were archived to:
-
-- archive/legacy_2026-04-06/
-- archive/legacy_2026-04-04/
-
-You can still open those any time if you need historical references.
+Archived notebook snapshots are available under `archive/`.

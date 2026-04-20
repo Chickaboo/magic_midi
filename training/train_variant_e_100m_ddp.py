@@ -28,7 +28,7 @@ if str(ROOT) not in sys.path:
 from config import DataConfig, TrainConfig
 from data.dataset import PianoDataset
 from data.tokenizer import CustomDeltaTokenizer
-from model.variant_f import VariantFConfig, VariantFModel
+from model.variant_e import VariantEConfig, VariantEModel
 from training.ablation_runner import (
     NpzWindowDataset,
     _generate_one_continuation,
@@ -50,29 +50,22 @@ from training.ddp_common import (
     _load_checkpoint,
     _log,
     _rank_info,
+    _resolve_divisible_heads,
     _resolve_resume_checkpoint,
-    _resolve_rope_heads,
     _save_checkpoint,
 )
 from training.scheduler import WarmupCosineScheduler
 
 
-VARIANT_F_40M_PROFILE: Dict[str, float] = {
-    "d_model": 768,
+VARIANT_E_100M_PROFILE: Dict[str, float] = {
+    "d_model": 1024,
     "n_layers": 14,
-    "harmonic_ratio": 0.40,
-    "temporal_ratio": 0.30,
-    "gdn_inner_ratio": 0.50,
+    "attention_every_n_layers": 2,
+    "gdn_inner_ratio": 0.5,
     "gdn_num_heads": 4,
-    "temporal_cfc_backbone_units": 576,
-    "temporal_cfc_backbone_layers": 2,
-    "structural_num_heads": 8,
-    "structural_gqa_groups": 4,
-    "cross_stream_every_n_layers": 2,
-    "tokens_per_phrase": 8,
-    "memory_size": 64,
-    "theme_memory_heads": 8,
-    "target_params": 40_000_000,
+    "gqa_num_heads": 8,
+    "gqa_groups": 4,
+    "target_params": 100_000_000,
 }
 
 
@@ -159,56 +152,54 @@ def _maybe_run_epoch_upload_command(
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Distributed DDP trainer for Variant F 40M profile on pretokenized NPZ data."
+        description="Distributed DDP trainer for Variant E ~100M profile on pretokenized NPZ data."
     )
     parser.add_argument("--pretokenized_manifest", type=str, required=True)
     parser.add_argument("--pretokenized_root", type=str, default="")
-    parser.add_argument("--output_dir", type=str, default="outputs/sub100m_unified_f_100k")
+    parser.add_argument("--output_dir", type=str, default="outputs/variant_e_100m_500k")
 
-    parser.add_argument("--max_pieces", type=int, default=100000)
+    parser.add_argument("--max_pieces", type=int, default=500000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--seed_length", type=int, default=512)
     parser.add_argument("--continuation_length", type=int, default=1536)
     parser.add_argument("--max_sequence_length", type=int, default=2048)
+    parser.add_argument(
+        "--tokenization_strategy",
+        type=str,
+        default="custom_delta",
+        choices=["custom_delta"],
+        help="Unified tokenizer strategy (fixed to custom_delta).",
+    )
+    parser.add_argument(
+        "--event_size",
+        type=int,
+        default=4,
+        choices=[4],
+        help="Tokenizer event size (fixed to 4 for unified custom_delta).",
+    )
+    parser.add_argument(
+        "--vocab_size",
+        type=int,
+        default=374,
+        help="Tokenizer vocabulary size used to initialize embeddings (unified spec default).",
+    )
 
-    parser.add_argument("--d_model", type=int, default=int(VARIANT_F_40M_PROFILE["d_model"]))
-    parser.add_argument("--n_layers", type=int, default=int(VARIANT_F_40M_PROFILE["n_layers"]))
-    parser.add_argument("--harmonic_ratio", type=float, default=float(VARIANT_F_40M_PROFILE["harmonic_ratio"]))
-    parser.add_argument("--temporal_ratio", type=float, default=float(VARIANT_F_40M_PROFILE["temporal_ratio"]))
+    parser.add_argument("--d_model", type=int, default=int(VARIANT_E_100M_PROFILE["d_model"]))
+    parser.add_argument("--n_layers", type=int, default=int(VARIANT_E_100M_PROFILE["n_layers"]))
+    parser.add_argument(
+        "--attention_every_n_layers",
+        type=int,
+        default=int(VARIANT_E_100M_PROFILE["attention_every_n_layers"]),
+    )
+    parser.add_argument("--full_attention", action="store_true")
     parser.add_argument(
         "--gdn_inner_ratio",
         type=float,
-        default=float(VARIANT_F_40M_PROFILE["gdn_inner_ratio"]),
+        default=float(VARIANT_E_100M_PROFILE["gdn_inner_ratio"]),
     )
-    parser.add_argument("--gdn_num_heads", type=int, default=int(VARIANT_F_40M_PROFILE["gdn_num_heads"]))
-    parser.add_argument(
-        "--temporal_cfc_backbone_units",
-        type=int,
-        default=int(VARIANT_F_40M_PROFILE["temporal_cfc_backbone_units"]),
-    )
-    parser.add_argument(
-        "--temporal_cfc_backbone_layers",
-        type=int,
-        default=int(VARIANT_F_40M_PROFILE["temporal_cfc_backbone_layers"]),
-    )
-    parser.add_argument(
-        "--structural_num_heads",
-        type=int,
-        default=int(VARIANT_F_40M_PROFILE["structural_num_heads"]),
-    )
-    parser.add_argument(
-        "--structural_gqa_groups",
-        type=int,
-        default=int(VARIANT_F_40M_PROFILE["structural_gqa_groups"]),
-    )
-    parser.add_argument(
-        "--cross_stream_every_n_layers",
-        type=int,
-        default=int(VARIANT_F_40M_PROFILE["cross_stream_every_n_layers"]),
-    )
-    parser.add_argument("--tokens_per_phrase", type=int, default=int(VARIANT_F_40M_PROFILE["tokens_per_phrase"]))
-    parser.add_argument("--memory_size", type=int, default=int(VARIANT_F_40M_PROFILE["memory_size"]))
-    parser.add_argument("--theme_memory_heads", type=int, default=int(VARIANT_F_40M_PROFILE["theme_memory_heads"]))
+    parser.add_argument("--gdn_num_heads", type=int, default=int(VARIANT_E_100M_PROFILE["gdn_num_heads"]))
+    parser.add_argument("--gqa_num_heads", type=int, default=int(VARIANT_E_100M_PROFILE["gqa_num_heads"]))
+    parser.add_argument("--gqa_groups", type=int, default=int(VARIANT_E_100M_PROFILE["gqa_groups"]))
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--attention_dropout", type=float, default=0.1)
     parser.add_argument("--max_time_seconds", type=float, default=1200.0)
@@ -217,11 +208,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--grad_accumulation_steps", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=2e-4)
-    parser.add_argument("--warmup_ratio", type=float, default=0.1)
-    parser.add_argument("--warmup_steps", type=int, default=0)
+    parser.add_argument(
+        "--warmup_ratio",
+        type=float,
+        default=0.015,
+        help="Warmup fraction used when --warmup_steps=0 (recommended 0.01-0.02 for long 500k-piece runs).",
+    )
+    parser.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=0,
+        help="Absolute warmup steps override. If >0, this takes precedence over --warmup_ratio.",
+    )
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--label_smoothing", type=float, default=0.1)
+    parser.add_argument("--label_smoothing", type=float, default=0.05)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--log_every_n_steps", type=int, default=20)
@@ -247,7 +248,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.set_defaults(auto_resume=True)
 
     parser.add_argument("--allow_fallback_gdn", action="store_true")
-    parser.add_argument("--allow_fallback_cfc", action="store_true")
     parser.add_argument("--disable_slot_aware_loss", action="store_true")
     parser.add_argument("--use_amp", action="store_true")
     parser.set_defaults(use_amp=True)
@@ -291,7 +291,7 @@ def main() -> None:
             raise ValueError("max_sequence_length must equal seed_length + continuation_length")
 
         output_dir = Path(str(args.output_dir)).expanduser()
-        checkpoint_dir = output_dir / "checkpoints" / "variant_f_40m_ddp"
+        checkpoint_dir = output_dir / "checkpoints" / "variant_e_100m_ddp"
         epoch_bundle_root = (
             Path(str(args.epoch_bundle_root)).expanduser()
             if str(args.epoch_bundle_root).strip()
@@ -305,64 +305,69 @@ def main() -> None:
             dist.barrier()
 
         tokenizer = CustomDeltaTokenizer(include_special_tokens=False)
-        event_size = int(getattr(tokenizer, "event_size", 1))
-        if event_size != 4:
+        configured_vocab_size = int(max(1, int(args.vocab_size)))
+        configured_event_size = int(max(1, int(args.event_size)))
+        configured_strategy = str(args.tokenization_strategy).strip().lower()
+
+        vocab_size = int(tokenizer.vocab_size)
+        event_size = int(tokenizer.event_size)
+
+        if configured_strategy != "custom_delta":
             raise RuntimeError(
-                f"Variant F DDP flow expects CustomDeltaTokenizer event_size=4, got {event_size}."
+                "Only tokenization_strategy=custom_delta is supported by this trainer."
             )
-        if int(args.seed_length) % event_size != 0 or int(args.continuation_length) % event_size != 0:
+        if configured_event_size != event_size:
+            raise RuntimeError(
+                f"event_size mismatch: got {configured_event_size}, expected {event_size}."
+            )
+        if configured_vocab_size != vocab_size:
+            raise RuntimeError(
+                f"vocab_size mismatch: got {configured_vocab_size}, expected {vocab_size}."
+            )
+
+        if int(event_size) > 1 and (
+            int(args.seed_length) % int(event_size) != 0
+            or int(args.continuation_length) % int(event_size) != 0
+        ):
             raise RuntimeError(
                 "seed_length and continuation_length must be divisible by tokenizer event_size."
             )
 
         d_model = int(max(64, int(args.d_model)))
         n_layers = int(max(1, int(args.n_layers)))
-        harmonic_ratio = float(max(0.1, min(0.8, float(args.harmonic_ratio))))
-        temporal_ratio = float(max(0.1, min(0.8, float(args.temporal_ratio))))
-        gdn_inner_ratio = float(max(0.1, float(args.gdn_inner_ratio)))
+        attention_every_n_layers = int(max(1, int(args.attention_every_n_layers)))
+        gdn_inner_dim = max(128, int(round(float(d_model) * float(args.gdn_inner_ratio))))
+        gdn_heads = _resolve_divisible_heads(gdn_inner_dim, int(max(1, int(args.gdn_num_heads))))
+        gqa_heads = _resolve_divisible_heads(d_model, int(max(1, int(args.gqa_num_heads))))
 
-        structural_heads = _resolve_rope_heads(
-            width=int(max(64, int(round(float(d_model) * max(0.1, 1.0 - harmonic_ratio - temporal_ratio))))),
-            requested_heads=int(max(1, int(args.structural_num_heads))),
-        )
+        gqa_groups = max(1, min(int(max(1, int(args.gqa_groups))), int(gqa_heads)))
+        while gqa_groups > 1 and (gqa_heads % gqa_groups) != 0:
+            gqa_groups -= 1
 
-        model = VariantFModel(
-            VariantFConfig(
-                vocab_size=int(tokenizer.vocab_size),
+        model = VariantEModel(
+            VariantEConfig(
+                vocab_size=int(vocab_size),
                 d_model=int(d_model),
                 n_layers=int(n_layers),
                 max_sequence_length=int(args.max_sequence_length),
-                event_size=int(event_size),
                 dropout=float(max(0.0, args.dropout)),
                 attention_dropout=float(max(0.0, args.attention_dropout)),
-                harmonic_ratio=float(harmonic_ratio),
-                temporal_ratio=float(temporal_ratio),
-                gdn_inner_ratio=float(gdn_inner_ratio),
-                gdn_num_heads=int(max(1, int(args.gdn_num_heads))),
-                temporal_cfc_backbone_units=int(max(64, int(args.temporal_cfc_backbone_units))),
-                temporal_cfc_backbone_layers=int(max(1, int(args.temporal_cfc_backbone_layers))),
-                structural_num_heads=int(max(1, int(structural_heads))),
-                structural_gqa_groups=int(max(1, int(args.structural_gqa_groups))),
-                cross_stream_every_n_layers=int(max(1, int(args.cross_stream_every_n_layers))),
-                tokens_per_phrase=int(max(1, int(args.tokens_per_phrase))),
-                memory_size=int(max(1, int(args.memory_size))),
-                theme_memory_heads=int(max(1, int(args.theme_memory_heads))),
+                gdn_inner_dim=int(gdn_inner_dim),
+                gdn_num_heads=int(gdn_heads),
+                gqa_num_heads=int(gqa_heads),
+                gqa_groups=int(gqa_groups),
+                attention_every_n_layers=int(attention_every_n_layers),
+                full_attention=bool(args.full_attention),
                 use_continuous_time=True,
                 max_time_seconds=float(max(1.0, args.max_time_seconds)),
-                use_v2_architecture=True,
             )
         )
 
         backend_status = _variant_backend_status(model)
         if backend_status.get("gdn_using_fallback", False) and not bool(args.allow_fallback_gdn):
             raise RuntimeError(
-                "Variant F is using fallback GDN in this runtime. Install flash-linear-attention "
+                "Variant E is using fallback GDN in this runtime. Install flash-linear-attention "
                 "or pass --allow_fallback_gdn to continue."
-            )
-        if backend_status.get("cfc_using_fallback", False) and not bool(args.allow_fallback_cfc):
-            raise RuntimeError(
-                "Variant F is using fallback CfC in this runtime. Install ncps/CfC support "
-                "or pass --allow_fallback_cfc to continue."
             )
 
         model = model.to(device)
@@ -378,13 +383,13 @@ def main() -> None:
         params = int(
             sum(p.numel() for p in (model.module.parameters() if isinstance(model, DDP) else model.parameters()))
         )
-        _log(rank, f"Variant-F 40M DDP model params: {params:,} ({params / 1e6:.2f}M)")
+        _log(rank, f"Variant-E 100M DDP model params: {params:,} ({params / 1e6:.2f}M)")
         _log(rank, f"Backend status: {backend_status}")
 
         data_cfg = DataConfig(
             tokenizer_path=str(output_dir / "custom_tokenizer.json"),
             processed_path=str(output_dir / "processed_pretokenized"),
-            vocab_size=int(tokenizer.vocab_size),
+            vocab_size=int(vocab_size),
             tokenization_strategy="custom_delta",
             seed_length=int(args.seed_length),
             continuation_length=int(args.continuation_length),
@@ -501,22 +506,32 @@ def main() -> None:
             use_amp=bool(args.use_amp),
         )
 
-        optimizer = AdamW(
-            model.parameters(),
-            lr=float(train_cfg.learning_rate),
-            weight_decay=float(train_cfg.weight_decay),
-        )
+        adamw_kwargs: Dict[str, Any] = {
+            "lr": float(train_cfg.learning_rate),
+            "weight_decay": float(train_cfg.weight_decay),
+        }
+        if device.type == "cuda":
+            adamw_kwargs["fused"] = True
+        try:
+            optimizer = AdamW(model.parameters(), **adamw_kwargs)
+        except TypeError:
+            adamw_kwargs.pop("fused", None)
+            optimizer = AdamW(model.parameters(), **adamw_kwargs)
 
+        batches_per_epoch = int(len(train_loader))
         steps_per_epoch = max(
             1,
-            math.ceil(len(train_loader) / float(max(1, int(train_cfg.grad_accumulation_steps)))),
+            math.ceil(float(batches_per_epoch) / float(max(1, int(train_cfg.grad_accumulation_steps)))),
         )
         total_steps = max(1, int(steps_per_epoch) * int(train_cfg.max_epochs))
-        warmup_steps = (
-            int(max(1, int(args.warmup_steps)))
-            if int(args.warmup_steps) > 0
-            else int(max(1, round(float(args.warmup_ratio) * float(total_steps))))
-        )
+        warmup_ratio = float(min(0.20, max(0.0, float(args.warmup_ratio))))
+        if int(args.warmup_steps) > 0:
+            warmup_steps = int(max(1, int(args.warmup_steps)))
+        else:
+            warmup_steps = int(max(1, int(float(total_steps) * warmup_ratio)))
+            if int(total_steps) >= 2000:
+                warmup_steps = int(max(100, warmup_steps))
+        warmup_steps = int(min(warmup_steps, max(1, int(total_steps) - 1)))
         train_cfg.warmup_steps = int(warmup_steps)
 
         scheduler = WarmupCosineScheduler(
@@ -526,31 +541,53 @@ def main() -> None:
             min_lr_ratio=float(train_cfg.min_lr_ratio),
         )
 
+        _log(
+            rank,
+            "Scheduler setup: "
+            f"steps_per_epoch={int(steps_per_epoch)} total_steps={int(total_steps)} "
+            f"warmup_steps={int(train_cfg.warmup_steps)} warmup_ratio={float(warmup_ratio):.4f}",
+        )
+
         use_amp = bool(train_cfg.use_amp) and device.type == "cuda"
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-        slot_aware_loss = not bool(args.disable_slot_aware_loss)
+        slot_aware_loss = bool(event_size == 4 and not bool(args.disable_slot_aware_loss))
+        if int(event_size) != 4 and not bool(args.disable_slot_aware_loss):
+            _log(
+                rank,
+                f"Slot-aware loss disabled automatically for event_size={event_size}.",
+            )
+
+        slot_metric_names = (
+            ["delta", "pitch", "duration", "velocity"]
+            if int(event_size) == 4
+            else [f"slot_{i}" for i in range(int(event_size))]
+        )
 
         history: Dict[str, List[float]] = {
             "train_loss": [],
             "val_loss": [],
             "val_raw_ce": [],
             "val_token_acc": [],
-            "val_token_acc_delta": [],
-            "val_token_acc_pitch": [],
-            "val_token_acc_duration": [],
-            "val_token_acc_velocity": [],
             "perplexity": [],
             "lr": [],
         }
+        for slot_name in slot_metric_names:
+            history[f"val_token_acc_{slot_name}"] = []
+
         global_step = 0
         best_val_loss = float("inf")
+        resume_epoch = 0
+        resume_batch_in_epoch = 0
+        resume_epoch_complete = True
+        first_epoch = 1
+        first_epoch_skip_batches = 0
+        final_epoch = int(train_cfg.max_epochs)
 
         resume_checkpoint = _resolve_resume_checkpoint(
             checkpoint_dir=checkpoint_dir,
             auto_resume=bool(args.auto_resume),
             resume_from_checkpoint=str(args.resume_from_checkpoint),
         )
-        start_epoch = 0
         epochs_to_run = int(train_cfg.max_epochs)
 
         if resume_checkpoint is not None:
@@ -562,7 +599,7 @@ def main() -> None:
                 checkpoint_path=resume_checkpoint,
                 device=device,
             )
-            start_epoch = int(resumed_state.get("epoch", 0))
+            resume_epoch = int(resumed_state.get("epoch", 0))
             history_state = resumed_state.get("history")
             if isinstance(history_state, dict):
                 for key in history:
@@ -571,20 +608,48 @@ def main() -> None:
             global_step = int(resumed_state.get("global_step", 0))
             best_val_loss = float(resumed_state.get("best_val_loss", best_val_loss))
 
-            if str(args.resume_mode).strip().lower() == "remaining":
-                epochs_to_run = max(0, int(train_cfg.max_epochs) - int(start_epoch))
+            resume_state = resumed_state.get("resume_state")
+            if isinstance(resume_state, dict):
+                resume_epoch = int(resume_state.get("epoch", resume_epoch))
+                resume_batch_in_epoch = int(resume_state.get("batch_step_in_epoch", 0))
+                resume_epoch_complete = bool(resume_state.get("is_epoch_complete", True))
+
+            resume_batch_in_epoch = int(max(0, min(resume_batch_in_epoch, batches_per_epoch)))
+
+            if bool(resume_epoch_complete):
+                first_epoch = int(max(1, resume_epoch + 1))
+                first_epoch_skip_batches = 0
             else:
-                epochs_to_run = int(train_cfg.max_epochs)
+                first_epoch = int(max(1, resume_epoch))
+                first_epoch_skip_batches = int(resume_batch_in_epoch)
+
+            if str(args.resume_mode).strip().lower() == "remaining":
+                final_epoch = int(train_cfg.max_epochs)
+            else:
+                final_epoch = int(resume_epoch + int(train_cfg.max_epochs))
+                if not bool(resume_epoch_complete):
+                    final_epoch -= 1
+
+            final_epoch = int(max(first_epoch, final_epoch))
+            epochs_to_run = int(max(0, final_epoch - first_epoch + 1))
 
             _log(
                 rank,
                 "Resuming DDP run "
-                f"from {resume_checkpoint.resolve()} at epoch={start_epoch} "
-                f"mode={args.resume_mode} epochs_to_run={epochs_to_run}",
+                f"from {resume_checkpoint.resolve()} at epoch={resume_epoch} "
+                f"batch_in_epoch={resume_batch_in_epoch} "
+                f"epoch_complete={resume_epoch_complete} mode={args.resume_mode} "
+                f"first_epoch={first_epoch} final_epoch={final_epoch} "
+                f"epochs_to_run={epochs_to_run}",
             )
+        else:
+            first_epoch = 1
+            first_epoch_skip_batches = 0
+            final_epoch = int(train_cfg.max_epochs)
+            epochs_to_run = int(max(0, final_epoch - first_epoch + 1))
 
-        for local_epoch in range(1, int(epochs_to_run) + 1):
-            epoch = int(start_epoch + local_epoch)
+        epoch_iterable = list(range(int(first_epoch), int(final_epoch) + 1))
+        for epoch_run_idx, epoch in enumerate(epoch_iterable, start=1):
             if distributed and isinstance(train_sampler, DistributedSampler):
                 train_sampler.set_epoch(int(epoch))
 
@@ -595,8 +660,21 @@ def main() -> None:
             epoch_loss_count = 0
             running_loss = 0.0
             running_count = 0
+            skip_batches_this_epoch = (
+                int(first_epoch_skip_batches)
+                if int(epoch) == int(first_epoch) and int(first_epoch_skip_batches) > 0
+                else 0
+            )
+            if skip_batches_this_epoch > 0:
+                _log(
+                    rank,
+                    f"Resuming inside epoch {epoch:03d}: skipping {skip_batches_this_epoch}/{batches_per_epoch} batches already completed.",
+                )
 
             for step_idx, batch in enumerate(train_loader, start=1):
+                if int(step_idx) <= int(skip_batches_this_epoch):
+                    continue
+
                 seed = batch["seed"].to(device, non_blocking=True)
                 continuation = batch["continuation"].to(device, non_blocking=True)
                 input_ids = batch["token_ids"].to(device, non_blocking=True)
@@ -646,7 +724,7 @@ def main() -> None:
 
                 should_step = (
                     step_idx % int(max(1, train_cfg.grad_accumulation_steps)) == 0
-                    or step_idx == len(train_loader)
+                    or step_idx == int(batches_per_epoch)
                 )
                 if should_step:
                     if use_amp:
@@ -688,10 +766,17 @@ def main() -> None:
                             best_val_loss=float(best_val_loss),
                             global_step=int(global_step),
                             best=False,
+                            resume_state={
+                                "epoch": int(epoch),
+                                "batch_step_in_epoch": int(step_idx),
+                                "batches_per_epoch": int(batches_per_epoch),
+                                "is_epoch_complete": bool(int(step_idx) >= int(batches_per_epoch)),
+                            },
                         )
                         print(
                             f"Step checkpoint saved: epoch={epoch:03d} "
-                            f"step={global_step:06d} loss~{step_avg_loss:.4f}"
+                            f"step={global_step:06d} batch={int(step_idx):05d}/{int(batches_per_epoch):05d} "
+                            f"loss~{step_avg_loss:.4f}"
                         )
 
                     if _is_main_process(rank) and int(global_step) % int(max(1, args.log_every_n_steps)) == 0 and running_count > 0:
@@ -715,12 +800,7 @@ def main() -> None:
             val_loss_count = 0
             val_raw_ce_sum = 0.0
             val_token_acc_sum = 0.0
-            val_slot_acc_sum: Dict[str, float] = {
-                "delta": 0.0,
-                "pitch": 0.0,
-                "duration": 0.0,
-                "velocity": 0.0,
-            }
+            val_slot_acc_sum: Dict[str, float] = {k: 0.0 for k in slot_metric_names}
             with torch.no_grad():
                 for batch in val_loader:
                     seed = batch["seed"].to(device, non_blocking=True)
@@ -817,10 +897,10 @@ def main() -> None:
                 history["val_loss"].append(float(val_loss))
                 history["val_raw_ce"].append(float(val_raw_ce))
                 history["val_token_acc"].append(float(val_token_acc))
-                history["val_token_acc_delta"].append(float(val_slot_acc.get("delta", 0.0)))
-                history["val_token_acc_pitch"].append(float(val_slot_acc.get("pitch", 0.0)))
-                history["val_token_acc_duration"].append(float(val_slot_acc.get("duration", 0.0)))
-                history["val_token_acc_velocity"].append(float(val_slot_acc.get("velocity", 0.0)))
+                for slot_name in slot_metric_names:
+                    history[f"val_token_acc_{slot_name}"].append(
+                        float(val_slot_acc.get(slot_name, 0.0))
+                    )
                 history["perplexity"].append(float(perplexity))
 
                 _save_checkpoint(
@@ -837,6 +917,12 @@ def main() -> None:
                     best_val_loss=float(best_val_loss),
                     global_step=int(global_step),
                     best=False,
+                    resume_state={
+                        "epoch": int(epoch),
+                        "batch_step_in_epoch": int(batches_per_epoch),
+                        "batches_per_epoch": int(batches_per_epoch),
+                        "is_epoch_complete": True,
+                    },
                 )
 
                 if float(val_loss) < float(best_val_loss):
@@ -855,6 +941,12 @@ def main() -> None:
                         best_val_loss=float(best_val_loss),
                         global_step=int(global_step),
                         best=True,
+                        resume_state={
+                            "epoch": int(epoch),
+                            "batch_step_in_epoch": int(batches_per_epoch),
+                            "batches_per_epoch": int(batches_per_epoch),
+                            "is_epoch_complete": True,
+                        },
                     )
 
                 print(
@@ -863,28 +955,37 @@ def main() -> None:
                     f"| acc={val_token_acc:.4f} | ppl={perplexity:.2f}"
                 )
 
-                epoch_dir = _snapshot_epoch_bundle(
-                    bundle_root=epoch_bundle_root,
-                    checkpoint_dir=checkpoint_dir,
-                    data_cfg=data_cfg,
-                    epoch=int(epoch),
-                    global_step=int(global_step),
-                    train_loss=float(train_loss),
-                    val_loss=float(val_loss),
-                    best_val_loss=float(best_val_loss),
-                )
-                print(f"Epoch bundle saved: {epoch_dir}")
-
-                try:
-                    _maybe_run_epoch_upload_command(
-                        template=str(args.epoch_upload_cmd_template),
-                        epoch=int(epoch),
-                        epoch_dir=epoch_dir,
-                        output_dir=output_dir,
-                        checkpoint_dir=checkpoint_dir,
+                is_last_epoch_this_run = int(epoch_run_idx) == int(epochs_to_run)
+                should_export_epoch_bundle = (
+                    int(train_cfg.save_every_n_epochs) > 0
+                    and (
+                        int(epoch) % int(train_cfg.save_every_n_epochs) == 0
+                        or bool(is_last_epoch_this_run)
                     )
-                except Exception as exc:
-                    print(f"WARNING: epoch upload command failed at epoch {epoch:03d}: {exc}")
+                )
+                if should_export_epoch_bundle:
+                    epoch_dir = _snapshot_epoch_bundle(
+                        bundle_root=epoch_bundle_root,
+                        checkpoint_dir=checkpoint_dir,
+                        data_cfg=data_cfg,
+                        epoch=int(epoch),
+                        global_step=int(global_step),
+                        train_loss=float(train_loss),
+                        val_loss=float(val_loss),
+                        best_val_loss=float(best_val_loss),
+                    )
+                    print(f"Epoch bundle saved: {epoch_dir}")
+
+                    try:
+                        _maybe_run_epoch_upload_command(
+                            template=str(args.epoch_upload_cmd_template),
+                            epoch=int(epoch),
+                            epoch_dir=epoch_dir,
+                            output_dir=output_dir,
+                            checkpoint_dir=checkpoint_dir,
+                        )
+                    except Exception as exc:
+                        print(f"WARNING: epoch upload command failed at epoch {epoch:03d}: {exc}")
 
             if distributed:
                 dist.barrier()
@@ -895,13 +996,19 @@ def main() -> None:
         }
         output_midi = ""
 
-        if _is_main_process(rank) and str(args.seed_midi).strip():
+        if _is_main_process(rank) and str(args.seed_midi).strip() and int(event_size) != 4:
+            generation_meta = {
+                "skipped": True,
+                "reason": f"Generation helper currently supports quad event_size=4 only (got {event_size}).",
+            }
+
+        if _is_main_process(rank) and str(args.seed_midi).strip() and int(event_size) == 4:
             core_model = model.module if isinstance(model, DDP) else model
             seed_midi_path = Path(str(args.seed_midi)).expanduser()
             if not seed_midi_path.exists():
                 raise FileNotFoundError(f"seed_midi not found: {seed_midi_path.resolve()}")
 
-            out_path = output_dir / "generated" / "variant_f_40m_ddp.mid"
+            out_path = output_dir / "generated" / "variant_e_100m_ddp.mid"
             generation_meta = _generate_one_continuation(
                 model=core_model,
                 tokenizer=tokenizer,
@@ -921,35 +1028,24 @@ def main() -> None:
             output_midi = str(out_path.resolve())
 
         if _is_main_process(rank):
-            core_model = model.module if isinstance(model, DDP) else model
-            first_harmonic = core_model.harmonic_layers[0] if len(core_model.harmonic_layers) > 0 else None
             result_payload = {
-                "profile": "variant_f_40m_ddp",
-                "target_params": int(VARIANT_F_40M_PROFILE["target_params"]),
+                "profile": "variant_e_100m_ddp",
+                "target_params": int(VARIANT_E_100M_PROFILE["target_params"]),
                 "model_profile": {
                     "d_model": int(d_model),
                     "n_layers": int(n_layers),
-                    "event_size": int(event_size),
-                    "harmonic_ratio": float(harmonic_ratio),
-                    "temporal_ratio": float(temporal_ratio),
-                    "harmonic_dim": int(getattr(core_model, "harmonic_dim", 0)),
-                    "temporal_dim": int(getattr(core_model, "temporal_dim", 0)),
-                    "structural_dim": int(getattr(core_model, "structural_dim", 0)),
-                    "cross_stream_every_n_layers": int(max(1, int(args.cross_stream_every_n_layers))),
-                    "tokens_per_phrase": int(max(1, int(args.tokens_per_phrase))),
-                    "memory_size": int(max(1, int(args.memory_size))),
-                    "theme_memory_heads": int(max(1, int(args.theme_memory_heads))),
+                    "attention_every_n_layers": int(attention_every_n_layers),
+                    "full_attention": bool(args.full_attention),
                     "dropout": float(args.dropout),
                     "attention_dropout": float(args.attention_dropout),
                     "max_time_seconds": float(args.max_time_seconds),
-                    "gdn_inner_ratio": float(gdn_inner_ratio),
-                    "gdn_inner_dim": int(getattr(first_harmonic, "inner_dim", 0)) if first_harmonic is not None else 0,
-                    "gdn_num_heads": int(getattr(first_harmonic, "num_heads", max(1, int(args.gdn_num_heads)))) if first_harmonic is not None else int(max(1, int(args.gdn_num_heads))),
-                    "temporal_cfc_backbone_units": int(max(64, int(args.temporal_cfc_backbone_units))),
-                    "temporal_cfc_backbone_layers": int(max(1, int(args.temporal_cfc_backbone_layers))),
-                    "structural_num_heads": int(max(1, int(args.structural_num_heads))),
-                    "structural_gqa_groups": int(max(1, int(args.structural_gqa_groups))),
-                    "use_v2_architecture": bool(getattr(core_model.config, "use_v2_architecture", False)),
+                    "event_size": int(event_size),
+                    "vocab_size": int(vocab_size),
+                    "tokenization_strategy": str(data_cfg.tokenization_strategy),
+                    "gdn_inner_dim": int(gdn_inner_dim),
+                    "gdn_num_heads": int(gdn_heads),
+                    "gqa_num_heads": int(gqa_heads),
+                    "gqa_groups": int(gqa_groups),
                 },
                 "backend_status": backend_status,
                 "distributed": {
@@ -971,8 +1067,6 @@ def main() -> None:
                     "slot_aware_loss": bool(slot_aware_loss),
                     "epoch_bundle_root": str(epoch_bundle_root.resolve()),
                     "epoch_upload_cmd_enabled": bool(str(args.epoch_upload_cmd_template).strip()),
-                    "allow_fallback_gdn": bool(args.allow_fallback_gdn),
-                    "allow_fallback_cfc": bool(args.allow_fallback_cfc),
                     "max_pieces": int(args.max_pieces),
                 },
                 "data": {
@@ -982,16 +1076,16 @@ def main() -> None:
                     "source_manifest": str(manifest_path.resolve()),
                 },
                 "result": {
-                    "variant": "variant_f",
+                    "variant": "variant_e",
                     "params": int(params),
                     "train_loss": [float(v) for v in history.get("train_loss", [])],
                     "val_loss": [float(v) for v in history.get("val_loss", [])],
                     "val_raw_ce": [float(v) for v in history.get("val_raw_ce", [])],
                     "val_token_acc": [float(v) for v in history.get("val_token_acc", [])],
-                    "val_token_acc_delta": [float(v) for v in history.get("val_token_acc_delta", [])],
-                    "val_token_acc_pitch": [float(v) for v in history.get("val_token_acc_pitch", [])],
-                    "val_token_acc_duration": [float(v) for v in history.get("val_token_acc_duration", [])],
-                    "val_token_acc_velocity": [float(v) for v in history.get("val_token_acc_velocity", [])],
+                    "val_token_acc_by_slot": {
+                        slot_name: [float(v) for v in history.get(f"val_token_acc_{slot_name}", [])]
+                        for slot_name in slot_metric_names
+                    },
                     "perplexity": [float(v) for v in history.get("perplexity", [])],
                     "checkpoint_dir": str(checkpoint_dir.resolve()),
                     "output_midi": output_midi,
@@ -1000,13 +1094,17 @@ def main() -> None:
                         "enabled": bool(resume_checkpoint is not None),
                         "checkpoint": str(resume_checkpoint.resolve()) if resume_checkpoint is not None else "",
                         "mode": str(args.resume_mode),
-                        "resumed_from_epoch": int(start_epoch),
+                        "resumed_from_epoch": int(resume_epoch),
+                        "resumed_from_batch_in_epoch": int(resume_batch_in_epoch),
+                        "resumed_epoch_complete": bool(resume_epoch_complete),
+                        "first_epoch_this_invocation": int(first_epoch),
+                        "final_epoch_this_invocation": int(final_epoch),
                         "epochs_ran_this_invocation": int(epochs_to_run),
                     },
                 },
             }
 
-            result_path = output_dir / "variant_f_40m_ddp_result.json"
+            result_path = output_dir / "variant_e_100m_ddp_result.json"
             result_path.write_text(json.dumps(result_payload, indent=2), encoding="utf-8")
             print(f"DDP run complete. Result JSON: {result_path.resolve()}")
 

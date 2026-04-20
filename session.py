@@ -16,7 +16,7 @@ import torch
 from config import DataConfig
 from data.dataset import create_dataloaders
 from data.preprocess import MultiDatasetPreprocessor, preprocess_maestro
-from data.tokenizer import PianoTokenizer
+from data.tokenizer import CustomDeltaTokenizer
 from drive_sync import DriveSync
 from model.factory import build_model
 from scale_config import get_preset
@@ -505,7 +505,7 @@ def run_session(
             "Low optimizer steps/epoch (<15). Consider lower batch size or lower gradient accumulation."
         )
 
-    tokenizer = PianoTokenizer.load(data_cfg.tokenizer_path)
+    tokenizer = CustomDeltaTokenizer.load(data_cfg.tokenizer_path)
     model_cfg.vocab_size = tokenizer.vocab_size
     data_cfg.vocab_size = tokenizer.vocab_size
 

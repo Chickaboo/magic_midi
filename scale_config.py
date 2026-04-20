@@ -62,7 +62,7 @@ SCALE_PRESETS: Dict[str, Dict[str, Any]] = {
         ),
         "data": DataConfig(
             max_pieces=None,
-            tokenization_strategy="remi",
+            tokenization_strategy="custom_delta",
             seed_length=256,
             continuation_length=768,
             max_sequence_length=1024,
@@ -119,7 +119,7 @@ SCALE_PRESETS: Dict[str, Dict[str, Any]] = {
         ),
         "data": DataConfig(
             max_pieces=None,
-            tokenization_strategy="octuple",
+            tokenization_strategy="custom_delta",
             seed_length=256,
             continuation_length=768,
             max_sequence_length=1024,
@@ -181,7 +181,7 @@ SCALE_PRESETS: Dict[str, Dict[str, Any]] = {
         ),
         "data": DataConfig(
             max_pieces=None,
-            tokenization_strategy="octuple",
+            tokenization_strategy="custom_delta",
             seed_length=256,
             continuation_length=768,
             max_sequence_length=1024,
@@ -200,7 +200,7 @@ SCALE_PRESETS: Dict[str, Dict[str, Any]] = {
         "description": "~100M params - official v2 dual-stream architecture",
         "params": "~100M",
         "model": ModelConfig(
-            vocab_size=2000,
+            vocab_size=374,
             d_model=1152,
             n_layers=17,
             d_state=16,
@@ -261,7 +261,7 @@ SCALE_PRESETS: Dict[str, Dict[str, Any]] = {
         ),
         "data": DataConfig(
             max_pieces=None,
-            tokenization_strategy="remi",
+            tokenization_strategy="custom_delta",
             seed_length=256,
             continuation_length=768,
             max_sequence_length=1024,

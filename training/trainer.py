@@ -19,7 +19,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 from config import DataConfig, TrainConfig
-from data.tokenizer import PianoTokenizer
+from data.tokenizer import CustomDeltaTokenizer
 from training.losses import (
     build_piece_boundary_mask,
     create_targets,
@@ -187,7 +187,7 @@ class Trainer:
         val_loader: DataLoader,
         config: TrainConfig,
         data_config: Optional[DataConfig] = None,
-        tokenizer: Optional[PianoTokenizer] = None,
+        tokenizer: Optional[CustomDeltaTokenizer] = None,
     ) -> None:
         self.model = model
         self.train_loader = train_loader
@@ -293,7 +293,7 @@ class Trainer:
             tok_path = Path(self.data_config.tokenizer_path)
             if tok_path.exists():
                 try:
-                    self.tokenizer = PianoTokenizer.load(str(tok_path))
+                    self.tokenizer = CustomDeltaTokenizer.load(str(tok_path))
                 except Exception as exc:
                     warnings.warn(f"Failed to load tokenizer at {tok_path}: {exc}")
 

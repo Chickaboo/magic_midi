@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Sequence
 import torch
 
 from config import DataConfig
-from data.tokenizer import PianoTokenizer
+from data.tokenizer import CustomDeltaTokenizer
 from utils.midi_utils import midi_duration
 
 
@@ -215,7 +215,7 @@ def _generate_batched_sequences(
 
 def generate_continuation(
     model: Any,
-    tokenizer: PianoTokenizer,
+    tokenizer: CustomDeltaTokenizer,
     seed_midi_path: str | Path,
     output_path: str | Path,
     config: DataConfig,
@@ -413,7 +413,7 @@ def generate_continuation(
 
 def batch_generate(
     model: Any,
-    tokenizer: PianoTokenizer,
+    tokenizer: CustomDeltaTokenizer,
     seed_dir: str | Path,
     output_dir: str | Path,
     config: DataConfig,

@@ -151,6 +151,7 @@ class CfCBlock(nn.Module):
         self,
         x: torch.Tensor,
         hidden: Optional[Any] = None,
+        timespans: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Any]:
         """Run one residual CfC block and return updated hidden state."""
 
@@ -171,7 +172,7 @@ class CfCBlock(nn.Module):
             hidden = x.new_zeros((x.shape[0], self.cfc_units))
 
         x_cfc = x.float() if x.dtype != torch.float32 else x
-        y, new_hidden = self.call_core(x_cfc, hidden=hidden)
+        y, new_hidden = self.call_core(x_cfc, hidden=hidden, timespans=timespans)
 
         if y.dtype != input_dtype:
             y = y.to(dtype=input_dtype)

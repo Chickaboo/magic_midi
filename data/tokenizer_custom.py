@@ -4,7 +4,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -23,56 +23,99 @@ def _import_pretty_midi() -> Any:
 @dataclass(frozen=True)
 class _TokenSpec:
     delta_start: int = 0
-    delta_end: int = 31
-    pitch_start: int = 32
-    pitch_end: int = 119
-    duration_start: int = 120
-    duration_end: int = 151
-    velocity_start: int = 152
-    velocity_end: int = 167
-    pad_id: int = 168
-    bos_id: int = 169
-    eos_id: int = 170
+    delta_end: int = 127
+    pitch_start: int = 128
+    pitch_end: int = 215
+    duration_start: int = 216
+    duration_end: int = 343
+    velocity_start: int = 344
+    velocity_end: int = 359
+    pad_id: int = 360
+    bos_id: int = 361
+    eos_id: int = 362
+    density_start: int = 363
+    density_end: int = 366
+    voices_start: int = 367
+    voices_end: int = 370
+    register_start: int = 371
+    register_end: int = 373
     event_size: int = 4
 
     @property
     def vocab_size(self) -> int:
-        return 171
+        return int(self.register_end + 1)
 
 
 class CustomDeltaTokenizer:
-    """Frozen quad tokenizer for solo piano: [delta_onset, pitch, duration, velocity_bin]."""
+    """Unified frozen quad tokenizer for solo piano with structural meta-prefix context."""
 
     def __init__(
         self,
         *,
         default_velocity: int = 88,
         include_special_tokens: bool = False,
+        include_structural_meta_tokens: bool = True,
+        prepend_start_token: bool = True,
+        density_quartiles: Optional[Tuple[float, float, float]] = None,
     ) -> None:
         self.spec = _TokenSpec()
         self.default_velocity = int(max(1, min(127, default_velocity)))
         self.include_special_tokens = bool(include_special_tokens)
+        self.include_structural_meta_tokens = bool(include_structural_meta_tokens)
+        self.prepend_start_token = bool(prepend_start_token)
 
-        # Delta onset bins: 0..2.0 seconds with log spacing.
-        # Bin 0 is exact zero. Remaining 31 bins are log-spaced > 0.
-        self._delta_bins = np.concatenate(
-            [
-                np.asarray([0.0], dtype=np.float64),
-                np.logspace(math.log10(1e-4), math.log10(2.0), num=31),
-            ],
-            axis=0,
-        )
+        self._density_labels = ("v_low", "low", "med", "high")
+        self._voices_labels = ("mono", "poly_small", "poly_med", "poly_large")
+        self._register_labels = ("bass", "mid", "treble")
+        self._density_quartiles = self._sanitize_density_quartiles(density_quartiles)
 
-        # Duration bins: 0.05..4.0 seconds with log spacing.
-        self._duration_bins = np.logspace(
-            math.log10(0.05),
-            math.log10(4.0),
-            num=32,
+        self._density_token_to_label: Dict[int, str] = {
+            int(self.spec.density_start + i): label
+            for i, label in enumerate(self._density_labels)
+        }
+        self._voices_token_to_label: Dict[int, str] = {
+            int(self.spec.voices_start + i): label
+            for i, label in enumerate(self._voices_labels)
+        }
+        self._register_token_to_label: Dict[int, str] = {
+            int(self.spec.register_start + i): label
+            for i, label in enumerate(self._register_labels)
+        }
+
+        # High-resolution timing bins with floor-style quantization.
+        # Delta has one exact-zero bin plus 127 positive bins.
+        self._delta_min_positive_seconds = 1e-4
+        self._delta_max_seconds = 8.0
+        self._duration_min_seconds = 1.0 / 64.0
+        self._duration_max_seconds = 8.0
+
+        self._delta_positive_bin_count = int(self.spec.delta_end - self.spec.delta_start)
+        self._duration_bin_count = int(self.spec.duration_end - self.spec.duration_start + 1)
+        self._velocity_bin_count = int(self.spec.velocity_end - self.spec.velocity_start + 1)
+
+        self._delta_edges = np.logspace(
+            math.log10(self._delta_min_positive_seconds),
+            math.log10(self._delta_max_seconds),
+            num=self._delta_positive_bin_count + 1,
         ).astype(np.float64)
+        self._duration_edges = np.logspace(
+            math.log10(self._duration_min_seconds),
+            math.log10(self._duration_max_seconds),
+            num=self._duration_bin_count + 1,
+        ).astype(np.float64)
+
+        self._delta_bins = self._bin_representatives_from_edges(
+            edges=self._delta_edges,
+            include_zero=True,
+        )
+        self._duration_bins = self._bin_representatives_from_edges(
+            edges=self._duration_edges,
+            include_zero=False,
+        )
 
     @property
     def vocab_size(self) -> int:
-        """Return total vocabulary size (fixed at 171)."""
+        """Return total vocabulary size for the current frozen tokenizer spec."""
 
         return self.spec.vocab_size
 
@@ -94,8 +137,29 @@ class CustomDeltaTokenizer:
     def eos_id(self) -> int:
         return self.spec.eos_id
 
+    @property
+    def density_quartiles(self) -> Tuple[float, float, float]:
+        return self._density_quartiles
+
+    @staticmethod
+    def _sanitize_density_quartiles(
+        quartiles: Optional[Tuple[float, float, float]],
+    ) -> Tuple[float, float, float]:
+        if quartiles is None:
+            values = [1.0, 2.5, 5.0]
+        else:
+            raw = [float(v) for v in quartiles]
+            if len(raw) != 3:
+                raise ValueError("density_quartiles must contain exactly three values")
+            values = sorted(max(1e-4, float(v)) for v in raw)
+
+        q1 = float(values[0])
+        q2 = float(max(values[1], q1 + 1e-4))
+        q3 = float(max(values[2], q2 + 1e-4))
+        return (q1, q2, q3)
+
     def train(self, midi_paths: List[Path], vocab_size: int | None = None) -> None:
-        """No-op for compatibility; tokenizer is deterministic and fixed-vocab."""
+        """Calibrate unsupervised density quartiles while keeping fixed vocab."""
 
         if not midi_paths:
             raise ValueError("No MIDI files provided.")
@@ -105,6 +169,25 @@ class CustomDeltaTokenizer:
                 f"got vocab_size={int(vocab_size)}"
             )
 
+        densities: List[float] = []
+        for midi_path in midi_paths:
+            try:
+                events = self._note_events(Path(midi_path))
+            except Exception:
+                continue
+            density = self._estimate_piece_density(events)
+            if density > 0.0:
+                densities.append(float(density))
+
+        if len(densities) >= 8:
+            q1, q2, q3 = np.quantile(
+                np.asarray(densities, dtype=np.float64),
+                [0.25, 0.5, 0.75],
+            ).tolist()
+            self._density_quartiles = self._sanitize_density_quartiles(
+                (float(q1), float(q2), float(q3))
+            )
+
     def save(self, path: str) -> None:
         """Persist tokenizer config to disk."""
 
@@ -112,21 +195,56 @@ class CustomDeltaTokenizer:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "type": "CustomDeltaTokenizer",
-            "version": 1,
-            "spec_version": 1,
+            "version": 3,
+            "spec_version": 3,
             "frozen": True,
             "vocab_size": int(self.vocab_size),
             "default_velocity": int(self.default_velocity),
             "event_size": int(self.event_size),
             "include_special_tokens": bool(self.include_special_tokens),
+            "include_structural_meta_tokens": bool(self.include_structural_meta_tokens),
+            "prepend_start_token": bool(self.prepend_start_token),
+            "quantization": {
+                "delta": {
+                    "bins": int(self.spec.delta_end - self.spec.delta_start + 1),
+                    "scheme": "logspace_floor",
+                    "zero_bin": True,
+                    "min_positive_seconds": float(self._delta_min_positive_seconds),
+                    "max_seconds": float(self._delta_max_seconds),
+                },
+                "duration": {
+                    "bins": int(self.spec.duration_end - self.spec.duration_start + 1),
+                    "scheme": "logspace_floor",
+                    "min_seconds": float(self._duration_min_seconds),
+                    "max_seconds": float(self._duration_max_seconds),
+                },
+                "velocity": {
+                    "bins": int(self._velocity_bin_count),
+                    "scheme": "uniform_floor",
+                    "midi_range": [0, 127],
+                },
+            },
+            "density_quartiles": [
+                float(self._density_quartiles[0]),
+                float(self._density_quartiles[1]),
+                float(self._density_quartiles[2]),
+            ],
             "token_ids": {
                 "delta": [self.spec.delta_start, self.spec.delta_end],
                 "pitch": [self.spec.pitch_start, self.spec.pitch_end],
                 "duration": [self.spec.duration_start, self.spec.duration_end],
                 "velocity": [self.spec.velocity_start, self.spec.velocity_end],
+                "density": [self.spec.density_start, self.spec.density_end],
+                "voices": [self.spec.voices_start, self.spec.voices_end],
+                "register": [self.spec.register_start, self.spec.register_end],
                 "pad": self.spec.pad_id,
                 "bos": self.spec.bos_id,
                 "eos": self.spec.eos_id,
+            },
+            "token_labels": {
+                "density": list(self._density_labels),
+                "voices": list(self._voices_labels),
+                "register": list(self._register_labels),
             },
         }
         out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -135,17 +253,26 @@ class CustomDeltaTokenizer:
         self,
         events: Iterable[Tuple[float, int, float, int]],
     ) -> Tuple[List[int], List[float], List[float]]:
+        event_list = list(events)
         token_ids: List[int] = []
         onset_times: List[float] = []
         durations: List[float] = []
         prev_onset = 0.0
 
-        if self.include_special_tokens:
+        if self.include_structural_meta_tokens:
+            density_tok, voices_tok, register_tok = self._derive_structural_meta_tokens(
+                event_list
+            )
+            token_ids.extend([density_tok, voices_tok, register_tok])
+            onset_times.extend([0.0, 0.0, 0.0])
+            durations.extend([1e-4, 1e-4, 1e-4])
+
+        if self.prepend_start_token or self.include_special_tokens:
             token_ids.append(self.spec.bos_id)
             onset_times.append(0.0)
             durations.append(1e-4)
 
-        for onset, pitch, duration, velocity in events:
+        for onset, pitch, duration, velocity in event_list:
             delta = float(max(0.0, onset - prev_onset))
             prev_onset = onset
 
@@ -190,9 +317,151 @@ class CustomDeltaTokenizer:
                 "Unsupported tokenizer payload. Expected type='CustomDeltaTokenizer'."
             )
 
+        token_ids = payload.get("token_ids")
+        token_ids = token_ids if isinstance(token_ids, dict) else {}
+        legacy_no_meta = (
+            int(payload.get("vocab_size", 0)) <= 171
+            and "density" not in token_ids
+            and "voices" not in token_ids
+            and "register" not in token_ids
+        )
+
+        include_structural_default = not legacy_no_meta
+        prepend_start_default = (
+            bool(payload.get("include_special_tokens", False))
+            if legacy_no_meta
+            else True
+        )
+
+        quartiles_payload = payload.get("density_quartiles")
+        quartiles: Optional[Tuple[float, float, float]] = None
+        if isinstance(quartiles_payload, (list, tuple)) and len(quartiles_payload) == 3:
+            quartiles = (
+                float(quartiles_payload[0]),
+                float(quartiles_payload[1]),
+                float(quartiles_payload[2]),
+            )
+
         return cls(
             default_velocity=int(payload.get("default_velocity", 88)),
             include_special_tokens=bool(payload.get("include_special_tokens", False)),
+            include_structural_meta_tokens=bool(
+                payload.get(
+                    "include_structural_meta_tokens",
+                    include_structural_default,
+                )
+            ),
+            prepend_start_token=bool(
+                payload.get("prepend_start_token", prepend_start_default)
+            ),
+            density_quartiles=quartiles,
+        )
+
+    @staticmethod
+    def _estimate_piece_density(events: Sequence[Tuple[float, int, float, int]]) -> float:
+        if not events:
+            return 0.0
+
+        starts = [float(ev[0]) for ev in events]
+        ends = [float(ev[0] + max(1e-4, float(ev[2]))) for ev in events]
+        span = float(max(1e-3, max(ends) - min(starts)))
+        return float(len(events) / span)
+
+    @staticmethod
+    def _estimate_polyphony(
+        events: Sequence[Tuple[float, int, float, int]],
+    ) -> Tuple[float, float]:
+        if not events:
+            return (1.0, 1.0)
+
+        boundaries: List[Tuple[float, int]] = []
+        for onset, _pitch, duration, _velocity in events:
+            start = float(max(0.0, onset))
+            end = float(max(start + 1e-4, start + float(duration)))
+            boundaries.append((start, +1))
+            boundaries.append((end, -1))
+
+        boundaries.sort(key=lambda item: (item[0], -item[1]))
+        active = 0
+        max_active = 0
+        weighted_active = 0.0
+        total_time = 0.0
+        last_t = float(boundaries[0][0])
+
+        for t, delta in boundaries:
+            t_f = float(t)
+            dt = float(max(0.0, t_f - last_t))
+            if dt > 0.0:
+                weighted_active += float(max(0, active)) * dt
+                total_time += dt
+            active += int(delta)
+            max_active = max(max_active, active)
+            last_t = t_f
+
+        mean_active = (
+            float(weighted_active / total_time) if total_time > 0.0 else float(max_active)
+        )
+        return (float(mean_active), float(max(1, max_active)))
+
+    def _density_token(self, density: float) -> int:
+        q1, q2, q3 = self._density_quartiles
+        if float(density) <= q1:
+            idx = 0
+        elif float(density) <= q2:
+            idx = 1
+        elif float(density) <= q3:
+            idx = 2
+        else:
+            idx = 3
+        return int(self.spec.density_start + idx)
+
+    def _voices_token(
+        self,
+        mean_polyphony: float,
+        peak_polyphony: float,
+    ) -> int:
+        mean_v = float(max(1.0, mean_polyphony))
+        peak_v = float(max(1.0, peak_polyphony))
+        if peak_v <= 1.05 and mean_v < 1.20:
+            idx = 0
+        elif mean_v < 2.00 and peak_v <= 3.00:
+            idx = 1
+        elif mean_v < 3.50 and peak_v <= 6.00:
+            idx = 2
+        else:
+            idx = 3
+        return int(self.spec.voices_start + idx)
+
+    def _register_token(self, median_pitch: float) -> int:
+        pitch = float(median_pitch)
+        if pitch < 48.0:
+            idx = 0
+        elif pitch <= 72.0:
+            idx = 1
+        else:
+            idx = 2
+        return int(self.spec.register_start + idx)
+
+    def _derive_structural_meta_tokens(
+        self,
+        events: Sequence[Tuple[float, int, float, int]],
+    ) -> Tuple[int, int, int]:
+        if not events:
+            return (
+                int(self.spec.density_start),
+                int(self.spec.voices_start),
+                int(self.spec.register_start + 1),
+            )
+
+        density = self._estimate_piece_density(events)
+        mean_polyphony, peak_polyphony = self._estimate_polyphony(events)
+        pitches = np.asarray([float(ev[1]) for ev in events], dtype=np.float64)
+        median_pitch = float(np.median(pitches)) if int(pitches.size) > 0 else 60.0
+
+        return (
+            int(self._density_token(density)),
+            int(self._voices_token(mean_polyphony, peak_polyphony)),
+            int(self._register_token(median_pitch)),
         )
 
     def _note_events(self, midi_path: Path) -> List[Tuple[float, int, float, int]]:
@@ -217,18 +486,36 @@ class CustomDeltaTokenizer:
         return events
 
     @staticmethod
-    def _nearest_bin(value: float, bins: np.ndarray) -> int:
-        idx = int(np.argmin(np.abs(bins - float(value))))
-        return idx
+    def _bin_representatives_from_edges(
+        edges: np.ndarray,
+        *,
+        include_zero: bool,
+    ) -> np.ndarray:
+        centers = np.sqrt(edges[:-1] * edges[1:])
+        if include_zero:
+            return np.concatenate(
+                [np.asarray([0.0], dtype=np.float64), centers.astype(np.float64)],
+                axis=0,
+            )
+        return centers.astype(np.float64)
 
     def _quantize_delta(self, delta_seconds: float) -> int:
-        clamped = float(max(0.0, min(2.0, delta_seconds)))
-        idx = self._nearest_bin(clamped, self._delta_bins)
+        clamped = float(max(0.0, min(self._delta_max_seconds, float(delta_seconds))))
+        if clamped <= 0.0:
+            idx = 0
+        else:
+            positive = float(max(self._delta_min_positive_seconds, clamped))
+            pos_idx = int(np.searchsorted(self._delta_edges, positive, side="right") - 1)
+            pos_idx = max(0, min(self._delta_positive_bin_count - 1, pos_idx))
+            idx = 1 + int(pos_idx)
         return int(self.spec.delta_start + idx)
 
     def _quantize_duration(self, duration_seconds: float) -> int:
-        clamped = float(max(0.05, min(4.0, duration_seconds)))
-        idx = self._nearest_bin(clamped, self._duration_bins)
+        clamped = float(
+            max(self._duration_min_seconds, min(self._duration_max_seconds, float(duration_seconds)))
+        )
+        idx = int(np.searchsorted(self._duration_edges, clamped, side="right") - 1)
+        idx = max(0, min(self._duration_bin_count - 1, idx))
         return int(self.spec.duration_start + idx)
 
     def _quantize_pitch(self, pitch: int) -> int:
@@ -237,18 +524,19 @@ class CustomDeltaTokenizer:
 
     def _quantize_velocity(self, velocity: int) -> int:
         vel = int(max(0, min(127, int(velocity))))
-        bin_idx = int(round((float(vel) / 127.0) * 15.0))
-        bin_idx = max(0, min(15, bin_idx))
+        # Floor-style quantization keeps bucket boundaries stable across runs.
+        bin_idx = int((float(vel) / 128.0) * float(self._velocity_bin_count))
+        bin_idx = max(0, min(self._velocity_bin_count - 1, bin_idx))
         return int(self.spec.velocity_start + bin_idx)
 
     def _dequantize_delta(self, token_id: int) -> float:
         idx = int(token_id) - self.spec.delta_start
-        idx = max(0, min(31, idx))
+        idx = max(0, min(int(self._delta_bins.shape[0]) - 1, idx))
         return float(self._delta_bins[idx])
 
     def _dequantize_duration(self, token_id: int) -> float:
         idx = int(token_id) - self.spec.duration_start
-        idx = max(0, min(31, idx))
+        idx = max(0, min(int(self._duration_bins.shape[0]) - 1, idx))
         return float(self._duration_bins[idx])
 
     def _dequantize_pitch(self, token_id: int) -> int:
@@ -258,8 +546,9 @@ class CustomDeltaTokenizer:
 
     def _dequantize_velocity(self, token_id: int) -> int:
         idx = int(token_id) - self.spec.velocity_start
-        idx = max(0, min(15, idx))
-        return int(round((float(idx) / 15.0) * 127.0))
+        idx = max(0, min(self._velocity_bin_count - 1, idx))
+        center = (float(idx) + 0.5) * (128.0 / float(self._velocity_bin_count))
+        return int(max(0, min(127, int(center))))
 
     def _encode_events(
         self,
@@ -307,9 +596,24 @@ class CustomDeltaTokenizer:
     def _is_velocity(self, token_id: int) -> bool:
         return self.spec.velocity_start <= int(token_id) <= self.spec.velocity_end
 
+    def _is_density(self, token_id: int) -> bool:
+        return self.spec.density_start <= int(token_id) <= self.spec.density_end
+
+    def _is_voices(self, token_id: int) -> bool:
+        return self.spec.voices_start <= int(token_id) <= self.spec.voices_end
+
+    def _is_register(self, token_id: int) -> bool:
+        return self.spec.register_start <= int(token_id) <= self.spec.register_end
+
+    def _is_meta(self, token_id: int) -> bool:
+        token = int(token_id)
+        return self._is_density(token) or self._is_voices(token) or self._is_register(
+            token
+        )
+
     def _is_special(self, token_id: int) -> bool:
         token = int(token_id)
-        return token in {self.spec.pad_id, self.spec.bos_id, self.spec.eos_id}
+        return token in {self.spec.pad_id, self.spec.bos_id, self.spec.eos_id} or self._is_meta(token)
 
     def decode_token_id_events(self, token_id: int) -> List[str]:
         """Decode token ID into semantic label(s) for compatibility hooks."""
@@ -323,6 +627,12 @@ class CustomDeltaTokenizer:
             return [f"Duration_{self._dequantize_duration(token):.6f}"]
         if self._is_velocity(token):
             return [f"Velocity_{self._dequantize_velocity(token)}"]
+        if self._is_density(token):
+            return [f"Density_{self._density_token_to_label.get(token, 'v_low')}"]
+        if self._is_voices(token):
+            return [f"Voices_{self._voices_token_to_label.get(token, 'mono')}"]
+        if self._is_register(token):
+            return [f"Register_{self._register_token_to_label.get(token, 'mid')}"]
         if token == self.spec.pad_id:
             return ["PAD_None"]
         if token == self.spec.bos_id:

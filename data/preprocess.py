@@ -18,13 +18,21 @@ from utils.logging_utils import get_project_logger
 
 try:
     from config import DataConfig
-    from data.tokenizer import PianoTokenizer
+    from data.tokenizer import (
+        CustomDeltaTokenizer,
+        create_tokenizer,
+        load_tokenizer,
+    )
 except ModuleNotFoundError:
     ROOT = Path(__file__).resolve().parents[1]
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
     from config import DataConfig
-    from data.tokenizer import PianoTokenizer
+    from data.tokenizer import (
+        CustomDeltaTokenizer,
+        create_tokenizer,
+        load_tokenizer,
+    )
 
 
 LOGGER = get_project_logger()
@@ -625,22 +633,67 @@ class MultiDatasetPreprocessor:
             print(f"  {name:<10}: ~{probs[name] * 100.0:5.1f}%")
         return probs
 
-    def _fit_or_load_tokenizer(self, all_midi_paths: List[Path]) -> PianoTokenizer:
+    def _fit_or_load_tokenizer(self, all_midi_paths: List[Path]) -> CustomDeltaTokenizer:
         tokenizer_path = Path(self.config.tokenizer_path)
+        strategy = str(getattr(self.config, "tokenization_strategy", "custom_delta")).lower()
         if tokenizer_path.exists():
             LOGGER.info("Loading tokenizer from %s", tokenizer_path.resolve())
-            return PianoTokenizer.load(str(tokenizer_path))
+            tokenizer = load_tokenizer(
+                tokenizer_path,
+                strategy=strategy,
+            )
 
-        strategy = str(getattr(self.config, "tokenization_strategy", "remi")).lower()
+            # Auto-upgrade legacy custom-delta payloads that lack structural meta-prefix.
+            if (
+                strategy in {"custom_delta", "delta", "quad", "event_quad"}
+                and isinstance(tokenizer, CustomDeltaTokenizer)
+                and not bool(getattr(tokenizer, "include_structural_meta_tokens", False))
+            ):
+                LOGGER.info(
+                    "Loaded legacy CustomDeltaTokenizer without structural meta-prefix; upgrading and recalibrating quartiles."
+                )
+                tokenizer = CustomDeltaTokenizer(
+                    default_velocity=int(getattr(tokenizer, "default_velocity", 88)),
+                    include_special_tokens=bool(
+                        getattr(tokenizer, "include_special_tokens", False)
+                    ),
+                    include_structural_meta_tokens=True,
+                    prepend_start_token=True,
+                    density_quartiles=getattr(tokenizer, "density_quartiles", None),
+                )
+                tokenizer.train(
+                    midi_paths=all_midi_paths,
+                    vocab_size=self.config.vocab_size,
+                )
+                tokenizer.save(str(tokenizer_path))
+
+            if isinstance(tokenizer, CustomDeltaTokenizer):
+                q1, q2, q3 = tokenizer.density_quartiles
+                LOGGER.info(
+                    "CustomDeltaTokenizer quartiles (notes/sec): q25=%.3f q50=%.3f q75=%.3f",
+                    q1,
+                    q2,
+                    q3,
+                )
+            return tokenizer
+
         LOGGER.info(
-            "Tokenizer not found. Training %s+BPE tokenizer on %d files.",
+            "Tokenizer not found. Training %s tokenizer on %d files.",
             strategy.upper(),
             len(all_midi_paths),
         )
-        tokenizer = PianoTokenizer(strategy=strategy)
+        tokenizer = create_tokenizer(strategy=strategy)
         tokenizer.train(midi_paths=all_midi_paths, vocab_size=self.config.vocab_size)
         tokenizer.save(str(tokenizer_path))
         LOGGER.info("Saved tokenizer to %s", tokenizer_path.resolve())
+        if isinstance(tokenizer, CustomDeltaTokenizer):
+            q1, q2, q3 = tokenizer.density_quartiles
+            LOGGER.info(
+                "CustomDeltaTokenizer quartiles (notes/sec): q25=%.3f q50=%.3f q75=%.3f",
+                q1,
+                q2,
+                q3,
+            )
         return tokenizer
 
     def _dataset_weights(self) -> Dict[str, float]:

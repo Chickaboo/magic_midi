@@ -19,7 +19,7 @@ from safetensors.torch import load_file as safetensors_load_file
 from config import ModelConfig
 from data.dataset import create_dataloaders
 from data.preprocess import MultiDatasetPreprocessor
-from data.tokenizer import PianoTokenizer
+from data.tokenizer import CustomDeltaTokenizer
 from model.attention_block import ALiBiPositionBias, MusicAttentionBlock
 from model.factory import build_model
 from model.hybrid import PianoHybridModel
@@ -169,7 +169,7 @@ def _build_test_config(use_cfc: bool) -> ModelConfig:
     """Create compact test config with optional CfC blocks."""
 
     return ModelConfig(
-        vocab_size=2000,
+        vocab_size=374,
         d_model=192,
         n_layers=4,
         d_state=16,
@@ -772,22 +772,12 @@ def _write_silence_gap_phrases_midi(path: Path) -> None:
 
 
 def _assert_tokenizer_time_feature_invariants(
-    tokenizer: PianoTokenizer,
+    tokenizer: CustomDeltaTokenizer,
     midi_path: Path,
     dataset_name: str,
     case_name: str,
 ) -> None:
-    """Assert onset/duration invariants and BPE-group onset preservation."""
-
-    import pretty_midi
-
-    midi = pretty_midi.PrettyMIDI(str(midi_path))
-    raw = tokenizer._encode_raw(midi_path, encode_ids=False)
-    seq = tokenizer._coerce_tok_sequence(raw)
-    events = list(getattr(seq, "events", []) or [])
-    event_onsets, _event_durations = tokenizer._extract_event_time_features(
-        midi, events
-    )
+    """Assert unified custom-delta onset/duration and event-group invariants."""
 
     token_ids, onset_times, durations = tokenizer.encode_with_time_features(midi_path)
     assert len(token_ids) > 0, f"No tokens for {dataset_name}/{case_name}."
@@ -805,33 +795,32 @@ def _assert_tokenizer_time_feature_invariants(
         f"Durations contain non-positive values for {dataset_name}/{case_name}."
     )
 
-    group_lengths = tokenizer._bpe_group_lengths_from_ids(token_ids)
-    assert group_lengths is not None, (
-        f"BPE group inference unavailable for {dataset_name}/{case_name}."
+    prefix_tokens = 0
+    if bool(getattr(tokenizer, "include_structural_meta_tokens", False)):
+        prefix_tokens += 3
+    if bool(getattr(tokenizer, "prepend_start_token", False)) or bool(
+        getattr(tokenizer, "include_special_tokens", False)
+    ):
+        prefix_tokens += 1
+
+    suffix_tokens = 1 if bool(getattr(tokenizer, "include_special_tokens", False)) else 0
+    event_token_count = len(token_ids) - prefix_tokens - suffix_tokens
+    assert event_token_count >= 0, (
+        f"Invalid token segmentation for {dataset_name}/{case_name}."
     )
-    assert len(group_lengths) == len(token_ids), (
-        f"BPE group length mismatch for {dataset_name}/{case_name}."
+    assert event_token_count % int(tokenizer.event_size) == 0, (
+        f"Event token count is not divisible by event_size for {dataset_name}/{case_name}."
     )
 
-    compressed_groups = 0
-    cursor = 0
-    for idx, group_len in enumerate(group_lengths):
-        safe_len = max(1, int(group_len))
-        event_idx = min(max(0, cursor), max(0, len(event_onsets) - 1))
-        expected = float(event_onsets[event_idx])
-        observed = float(onset_times[idx])
-        assert abs(observed - expected) <= 1e-6, (
-            "BPE first-token onset mismatch for "
-            f"{dataset_name}/{case_name} at group {idx}: "
-            f"expected={expected:.6f}, observed={observed:.6f}"
+    for start in range(prefix_tokens, prefix_tokens + event_token_count, int(tokenizer.event_size)):
+        event_onsets = onset_arr[start : start + int(tokenizer.event_size)]
+        event_durations = dur_arr[start : start + int(tokenizer.event_size)]
+        assert np.allclose(event_onsets, event_onsets[0], atol=1e-6), (
+            f"Event onset alignment mismatch for {dataset_name}/{case_name} at token {start}."
         )
-        if safe_len > 1:
-            compressed_groups += 1
-        cursor += safe_len
-
-    assert compressed_groups > 0, (
-        f"No BPE compression groups detected for {dataset_name}/{case_name}."
-    )
+        assert np.allclose(event_durations, event_durations[0], atol=1e-6), (
+            f"Event duration alignment mismatch for {dataset_name}/{case_name} at token {start}."
+        )
 
 
 def test_tokenizer_time_feature_invariants() -> None:
@@ -860,10 +849,10 @@ def test_tokenizer_time_feature_invariants() -> None:
                 build_case(path)
                 midi_paths.append((case_name, path))
 
-            tokenizer = PianoTokenizer(strategy="remi")
+            tokenizer = CustomDeltaTokenizer(include_special_tokens=False)
             tokenizer.train(
                 midi_paths=[path for _case, path in midi_paths],
-                vocab_size=800,
+                vocab_size=tokenizer.vocab_size,
             )
 
             for case_name, midi_path in midi_paths:

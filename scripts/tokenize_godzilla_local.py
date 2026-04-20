@@ -157,10 +157,26 @@ class SourceIndex:
 
 
 class SymusicEventTokenizer(CustomDeltaTokenizer):
-    """Symusic parser adapter over the frozen CustomDeltaTokenizer event-quad spec."""
+    """Symusic parser adapter for the unified CustomDeltaTokenizer event stream."""
 
-    def __init__(self) -> None:
-        super().__init__(default_velocity=88, include_special_tokens=False)
+    def __init__(
+        self,
+        *,
+        positions_per_bar: int = 31,
+        include_structural_prefix: bool = False,
+        include_start_token: bool = True,
+    ) -> None:
+        super().__init__(
+            default_velocity=88,
+            include_special_tokens=False,
+            include_structural_meta_tokens=bool(include_structural_prefix),
+            prepend_start_token=bool(include_start_token),
+        )
+        _ = int(positions_per_bar)
+
+    @property
+    def event_size(self) -> int:
+        return int(self.spec.event_size)
 
     def parse_events(
         self,
@@ -194,8 +210,17 @@ class SymusicEventTokenizer(CustomDeltaTokenizer):
                 velocity = int(max(0, min(127, int(note.velocity))))
                 events.append((onset, pitch, duration, velocity))
 
+        if not events:
+            return None
+
         events.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
         return events
+
+    def encode_events(
+        self,
+        events: Sequence[Tuple[float, int, float, int]],
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return super().encode_events(events)
 
 def build_source_index(source: Path) -> SourceIndex:
     source_resolved = str(source.resolve())
@@ -272,12 +297,36 @@ def load_or_create_source_index(
 
 
 _WORKER_TOKENIZER: Optional["SymusicEventTokenizer"] = None
+_WORKER_TOKENIZER_SETTINGS: Dict[str, Any] = {
+    "include_structural_prefix": False,
+}
+
+
+def _configure_worker_tokenizer(
+    *,
+    positions_per_bar: int,
+    include_structural_prefix: bool,
+) -> None:
+    global _WORKER_TOKENIZER
+    global _WORKER_TOKENIZER_SETTINGS
+
+    _ = int(positions_per_bar)
+    normalized_structural = bool(include_structural_prefix)
+    if bool(_WORKER_TOKENIZER_SETTINGS.get("include_structural_prefix", False)) != normalized_structural:
+        _WORKER_TOKENIZER = None
+    _WORKER_TOKENIZER_SETTINGS = {
+        "include_structural_prefix": bool(normalized_structural),
+    }
 
 
 def _get_worker_tokenizer() -> "SymusicEventTokenizer":
     global _WORKER_TOKENIZER
     if _WORKER_TOKENIZER is None:
-        _WORKER_TOKENIZER = SymusicEventTokenizer()
+        _WORKER_TOKENIZER = SymusicEventTokenizer(
+            include_structural_prefix=bool(
+                _WORKER_TOKENIZER_SETTINGS["include_structural_prefix"]
+            ),
+        )
     return _WORKER_TOKENIZER
 
 
@@ -345,6 +394,8 @@ def _worker_tokenize_and_write(
     member_name: str,
     midi_bytes: Optional[bytes],
     strict_piano: bool,
+    positions_per_bar: int,
+    include_structural_prefix: bool,
     min_token_length: int,
     output_root: str,
     output_shard_size: int,
@@ -366,6 +417,10 @@ def _worker_tokenize_and_write(
             "error": "empty-midi-bytes",
         }
 
+    _configure_worker_tokenizer(
+        positions_per_bar=int(positions_per_bar),
+        include_structural_prefix=bool(include_structural_prefix),
+    )
     tokenizer = _get_worker_tokenizer()
     events = tokenizer.parse_events(midi_bytes=midi_bytes, strict_piano=bool(strict_piano))
     if not events:
@@ -426,6 +481,8 @@ def _worker_tokenize_from_path(payload: Tuple[Any, ...]) -> Dict[str, Any]:
         source_root,
         member_name,
         strict_piano,
+        positions_per_bar,
+        include_structural_prefix,
         min_token_length,
         output_root,
         output_shard_size,
@@ -442,6 +499,8 @@ def _worker_tokenize_from_path(payload: Tuple[Any, ...]) -> Dict[str, Any]:
             member_name=str(member_name),
             midi_bytes=None,
             strict_piano=bool(strict_piano),
+            positions_per_bar=int(positions_per_bar),
+            include_structural_prefix=bool(include_structural_prefix),
             min_token_length=int(min_token_length),
             output_root=str(output_root),
             output_shard_size=int(output_shard_size),
@@ -454,6 +513,8 @@ def _worker_tokenize_from_path(payload: Tuple[Any, ...]) -> Dict[str, Any]:
         member_name=str(member_name),
         midi_bytes=midi_bytes,
         strict_piano=bool(strict_piano),
+        positions_per_bar=int(positions_per_bar),
+        include_structural_prefix=bool(include_structural_prefix),
         min_token_length=int(min_token_length),
         output_root=str(output_root),
         output_shard_size=int(output_shard_size),
@@ -467,6 +528,8 @@ def _worker_tokenize_from_bytes(payload: Tuple[Any, ...]) -> Dict[str, Any]:
         member_name,
         midi_bytes,
         strict_piano,
+        positions_per_bar,
+        include_structural_prefix,
         min_token_length,
         output_root,
         output_shard_size,
@@ -478,6 +541,8 @@ def _worker_tokenize_from_bytes(payload: Tuple[Any, ...]) -> Dict[str, Any]:
         member_name=str(member_name),
         midi_bytes=midi_bytes,
         strict_piano=bool(strict_piano),
+        positions_per_bar=int(positions_per_bar),
+        include_structural_prefix=bool(include_structural_prefix),
         min_token_length=int(min_token_length),
         output_root=str(output_root),
         output_shard_size=int(output_shard_size),
@@ -507,7 +572,7 @@ def read_midi_bytes_from_tar(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Tokenize Godzilla MIDI locally into event-quad .npz packs with resumable checkpoints."
+            "Tokenize MIDI into unified custom-delta event quads with resumable checkpoints."
         )
     )
     parser.add_argument(
@@ -527,6 +592,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=192,
         help="Skip tokenized pieces shorter than this many tokens.",
+    )
+    parser.add_argument(
+        "--positions-per-bar",
+        type=int,
+        default=31,
+        help="Deprecated compatibility flag (ignored by unified tokenizer).",
+    )
+    parser.add_argument(
+        "--include-structural-prefix",
+        action="store_true",
+        help="Prepend Density/Voices/Register structural context tokens before START.",
     )
     parser.add_argument(
         "--checkpoint-every",
@@ -729,8 +805,13 @@ def main() -> None:
         )
 
     strict_piano = bool(args.strict_piano)
+    positions_per_bar = int(max(4, min(31, int(args.positions_per_bar))))
+    include_structural_prefix = bool(args.include_structural_prefix)
 
-    tokenizer_meta = SymusicEventTokenizer()
+    tokenizer_meta = SymusicEventTokenizer(
+        positions_per_bar=int(positions_per_bar),
+        include_structural_prefix=bool(include_structural_prefix),
+    )
     min_token_length = int(max(4, args.min_token_length))
     checkpoint_every = int(max(1, args.checkpoint_every))
     progress_every = int(max(1, args.progress_every))
@@ -754,11 +835,23 @@ def main() -> None:
     parallel_mode = bool(workers > 1 and max_files == 0 and stop_after_seconds == 0)
 
     tokenizer_info = {
-        "name": "CustomDeltaTokenizer",
-        "version": 1,
+        "name": "CustomDeltaTokenizerUnified",
+        "version": 3,
         "frozen": True,
         "event_size": int(tokenizer_meta.event_size),
         "vocab_size": int(tokenizer_meta.vocab_size),
+        "timing_mode": "delta_onset_seconds",
+        "token_ranges": {
+            "delta": [int(tokenizer_meta.spec.delta_start), int(tokenizer_meta.spec.delta_end)],
+            "pitch": [int(tokenizer_meta.spec.pitch_start), int(tokenizer_meta.spec.pitch_end)],
+            "duration": [int(tokenizer_meta.spec.duration_start), int(tokenizer_meta.spec.duration_end)],
+            "velocity": [int(tokenizer_meta.spec.velocity_start), int(tokenizer_meta.spec.velocity_end)],
+            "density": [int(tokenizer_meta.spec.density_start), int(tokenizer_meta.spec.density_end)],
+            "voices": [int(tokenizer_meta.spec.voices_start), int(tokenizer_meta.spec.voices_end)],
+            "register": [int(tokenizer_meta.spec.register_start), int(tokenizer_meta.spec.register_end)],
+        },
+        "include_structural_prefix": bool(include_structural_prefix),
+        "positions_per_bar_compat": int(positions_per_bar),
     }
 
     print("Tokenization session")
@@ -771,7 +864,17 @@ def main() -> None:
     print(f"  accepted_so_far: {accepted:,}")
     print(f"  skipped_so_far: {skipped:,}")
     print(f"  strict_piano: {strict_piano}")
-    print("  tokenizer: CustomDeltaTokenizer v1 (frozen)")
+    print("  tokenizer: CustomDeltaTokenizerUnified v3")
+    print(
+        "  token_ranges: "
+        f"delta={tokenizer_meta.spec.delta_start}-{tokenizer_meta.spec.delta_end}, "
+        f"pitch={tokenizer_meta.spec.pitch_start}-{tokenizer_meta.spec.pitch_end}, "
+        f"duration={tokenizer_meta.spec.duration_start}-{tokenizer_meta.spec.duration_end}, "
+        f"velocity={tokenizer_meta.spec.velocity_start}-{tokenizer_meta.spec.velocity_end}"
+    )
+    print(f"  include_structural_prefix: {include_structural_prefix}")
+    if int(positions_per_bar) != 31:
+        print("  note: --positions-per-bar is deprecated and ignored by unified tokenizer.")
     print(f"  workers: {workers} ({'parallel' if parallel_mode else 'single-process'})")
     print(f"  output_compression: {'on' if use_compression else 'off'}")
     print(f"  output_shard_size: {output_shard_size:,}")
@@ -888,6 +991,8 @@ def main() -> None:
                             str(source),
                             str(member_name),
                             bool(strict_piano),
+                            int(positions_per_bar),
+                            bool(include_structural_prefix),
                             int(min_token_length),
                             str(output_root),
                             int(output_shard_size),
@@ -930,6 +1035,8 @@ def main() -> None:
                             str(member_name),
                             midi_bytes,
                             bool(strict_piano),
+                            int(positions_per_bar),
+                            bool(include_structural_prefix),
                             int(min_token_length),
                             str(output_root),
                             int(output_shard_size),
