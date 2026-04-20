@@ -11,7 +11,7 @@ import sys
 from contextlib import nullcontext
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -79,6 +79,7 @@ def _snapshot_epoch_bundle(
     train_loss: float,
     val_loss: float,
     best_val_loss: float,
+    include_best_artifacts: bool = False,
 ) -> Path:
     """Copy key checkpoint artifacts into one epoch-scoped folder."""
 
@@ -86,12 +87,11 @@ def _snapshot_epoch_bundle(
     epoch_dir.mkdir(parents=True, exist_ok=True)
 
     copied_files: List[str] = []
-    for name in [
-        "latest.safetensors",
-        "latest_state.pt",
-        "best.safetensors",
-        "best_state.pt",
-    ]:
+    checkpoint_names: List[str] = ["latest.safetensors", "latest_state.pt"]
+    if bool(include_best_artifacts):
+        checkpoint_names.extend(["best.safetensors", "best_state.pt"])
+
+    for name in checkpoint_names:
         src = checkpoint_dir / name
         if src.exists() and src.is_file():
             dst = epoch_dir / name
@@ -124,6 +124,65 @@ def _snapshot_epoch_bundle(
         encoding="utf-8",
     )
     return epoch_dir
+
+
+def _dir_size_bytes(path: Path) -> int:
+    total = 0
+    if not path.exists():
+        return 0
+
+    for item in path.rglob("*"):
+        if not item.is_file():
+            continue
+        try:
+            total += int(item.stat().st_size)
+        except OSError:
+            continue
+    return int(total)
+
+
+def _prune_epoch_bundles(
+    *,
+    bundle_root: Path,
+    max_keep: int,
+    max_total_bytes: int,
+    protected_dir: Path,
+) -> Tuple[List[Tuple[str, int]], int, int]:
+    """Prune oldest epoch bundles by count and total-size budget."""
+
+    if not bundle_root.exists():
+        return [], 0, 0
+
+    epoch_dirs = [
+        p for p in bundle_root.iterdir() if p.is_dir() and p.name.startswith("epoch_")
+    ]
+    epoch_dirs.sort(key=lambda p: p.name)
+
+    size_map: Dict[Path, int] = {p: _dir_size_bytes(p) for p in epoch_dirs}
+    total_bytes = int(sum(size_map.values()))
+    removed: List[Tuple[str, int]] = []
+    protected = protected_dir.resolve()
+
+    while epoch_dirs:
+        over_count = int(max_keep) > 0 and len(epoch_dirs) > int(max_keep)
+        over_bytes = int(max_total_bytes) > 0 and total_bytes > int(max_total_bytes)
+        if not (over_count or over_bytes):
+            break
+
+        candidate = next(
+            (p for p in epoch_dirs if p.resolve() != protected),
+            None,
+        )
+        if candidate is None:
+            break
+
+        removed_bytes = int(size_map.get(candidate, 0))
+        shutil.rmtree(candidate, ignore_errors=True)
+        removed.append((candidate.name, removed_bytes))
+        epoch_dirs.remove(candidate)
+        total_bytes = max(0, int(total_bytes - removed_bytes))
+
+    return removed, int(len(epoch_dirs)), int(total_bytes)
 
 
 def _maybe_run_epoch_upload_command(
@@ -226,9 +285,31 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--log_every_n_steps", type=int, default=20)
-    parser.add_argument("--save_every_n_steps", type=int, default=0)
+    parser.add_argument(
+        "--save_every_n_steps",
+        type=int,
+        default=500,
+        help="Save latest checkpoint every N optimizer steps (set 0 to disable mid-epoch saves).",
+    )
     parser.add_argument("--save_every_n_epochs", type=int, default=5)
     parser.add_argument("--epoch_bundle_root", type=str, default="")
+    parser.add_argument(
+        "--epoch_bundle_include_best",
+        action="store_true",
+        help="Include best.* checkpoint files in each epoch export bundle (uses more storage).",
+    )
+    parser.add_argument(
+        "--max_epoch_bundles",
+        type=int,
+        default=2,
+        help="Keep at most this many epoch bundle folders (<=0 disables count-based pruning).",
+    )
+    parser.add_argument(
+        "--max_epoch_bundle_total_gb",
+        type=float,
+        default=12.0,
+        help="Approximate total size cap for epoch bundles in GB (<=0 disables size-based pruning).",
+    )
     parser.add_argument("--epoch_upload_cmd_template", type=str, default="")
 
     parser.add_argument("--seed_midi", type=str, default="")
@@ -249,6 +330,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--allow_fallback_gdn", action="store_true")
     parser.add_argument("--disable_slot_aware_loss", action="store_true")
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Use deterministic kernels and strict reproducibility mode (slower).",
+    )
     parser.add_argument("--use_amp", action="store_true")
     parser.set_defaults(use_amp=True)
     return parser
@@ -273,17 +359,26 @@ def main() -> None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     try:
-        if torch.cuda.is_available():
-            torch.backends.cudnn.benchmark = True
+        if bool(args.deterministic):
+            _set_global_seed(int(args.seed) + int(rank))
+            _log(rank, "Deterministic mode enabled (may reduce throughput).")
+        else:
+            random.seed(int(args.seed) + int(rank))
+            np.random.seed(int(args.seed) + int(rank))
+            torch.manual_seed(int(args.seed) + int(rank))
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(int(args.seed) + int(rank))
+                torch.backends.cudnn.benchmark = True
+                torch.backends.cudnn.deterministic = False
+            try:
+                torch.use_deterministic_algorithms(False)
+            except Exception:
+                pass
+
         try:
             torch.set_float32_matmul_precision("high")
         except Exception:
             pass
-
-        _set_global_seed(int(args.seed))
-        random.seed(int(args.seed) + int(rank))
-        np.random.seed(int(args.seed) + int(rank))
-        torch.manual_seed(int(args.seed) + int(rank))
 
         if int(args.seed_length) <= 0 or int(args.continuation_length) <= 0:
             raise ValueError("seed_length and continuation_length must be > 0")
@@ -297,10 +392,20 @@ def main() -> None:
             if str(args.epoch_bundle_root).strip()
             else output_dir / "epoch_exports"
         )
+        epoch_bundle_max_keep = int(max(0, int(args.max_epoch_bundles)))
+        epoch_bundle_total_gb = float(max(0.0, float(args.max_epoch_bundle_total_gb)))
+        epoch_bundle_max_total_bytes = int(round(epoch_bundle_total_gb * (1024**3)))
         if _is_main_process(rank):
             output_dir.mkdir(parents=True, exist_ok=True)
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
             epoch_bundle_root.mkdir(parents=True, exist_ok=True)
+            _log(
+                rank,
+                "Epoch bundle retention: "
+                f"max_keep={epoch_bundle_max_keep if epoch_bundle_max_keep > 0 else 'disabled'} "
+                f"max_total_gb={epoch_bundle_total_gb if epoch_bundle_total_gb > 0 else 'disabled'} "
+                f"include_best={bool(args.epoch_bundle_include_best)}",
+            )
         if distributed:
             dist.barrier()
 
@@ -505,6 +610,13 @@ def main() -> None:
             val_generation_check=False,
             use_amp=bool(args.use_amp),
         )
+
+        if int(train_cfg.save_every_n_steps) <= 0:
+            _log(
+                rank,
+                "WARNING: save_every_n_steps=0 disables mid-epoch checkpoints; "
+                "interruption recovery will be epoch-boundary only.",
+            )
 
         adamw_kwargs: Dict[str, Any] = {
             "lr": float(train_cfg.learning_rate),
@@ -973,6 +1085,7 @@ def main() -> None:
                         train_loss=float(train_loss),
                         val_loss=float(val_loss),
                         best_val_loss=float(best_val_loss),
+                        include_best_artifacts=bool(args.epoch_bundle_include_best),
                     )
                     print(f"Epoch bundle saved: {epoch_dir}")
 
@@ -986,6 +1099,24 @@ def main() -> None:
                         )
                     except Exception as exc:
                         print(f"WARNING: epoch upload command failed at epoch {epoch:03d}: {exc}")
+
+                    removed_bundles, remaining_count, remaining_bytes = _prune_epoch_bundles(
+                        bundle_root=epoch_bundle_root,
+                        max_keep=int(epoch_bundle_max_keep),
+                        max_total_bytes=int(epoch_bundle_max_total_bytes),
+                        protected_dir=epoch_dir,
+                    )
+                    if removed_bundles:
+                        removed_bytes = int(sum(size for _, size in removed_bundles))
+                        removed_gb = float(removed_bytes) / float(1024**3)
+                        remaining_gb = float(remaining_bytes) / float(1024**3)
+                        names = ", ".join(name for name, _ in removed_bundles)
+                        print(
+                            "Pruned epoch bundles: "
+                            f"{len(removed_bundles)} removed ({removed_gb:.2f} GB) -> "
+                            f"remaining={remaining_count} ({remaining_gb:.2f} GB). "
+                            f"Removed: {names}"
+                        )
 
             if distributed:
                 dist.barrier()
@@ -1066,6 +1197,9 @@ def main() -> None:
                     "save_every_n_steps": int(max(0, train_cfg.save_every_n_steps)),
                     "slot_aware_loss": bool(slot_aware_loss),
                     "epoch_bundle_root": str(epoch_bundle_root.resolve()),
+                    "epoch_bundle_include_best": bool(args.epoch_bundle_include_best),
+                    "max_epoch_bundles": int(epoch_bundle_max_keep),
+                    "max_epoch_bundle_total_gb": float(epoch_bundle_total_gb),
                     "epoch_upload_cmd_enabled": bool(str(args.epoch_upload_cmd_template).strip()),
                     "max_pieces": int(args.max_pieces),
                 },

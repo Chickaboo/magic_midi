@@ -90,13 +90,24 @@ def _resolve_resume_checkpoint(
     resume_from_checkpoint: str,
 ) -> Optional[Path]:
     def _pick_from_dir(dir_path: Path) -> Optional[Path]:
-        candidates = [
+        state_candidates = [
             dir_path / "latest_state.pt",
-            dir_path / "latest.safetensors",
             dir_path / "best_state.pt",
+        ]
+        found_state = next((p for p in state_candidates if p.exists()), None)
+        if found_state is not None:
+            return found_state
+
+        weight_candidates = [
+            dir_path / "latest.safetensors",
             dir_path / "best.safetensors",
         ]
-        return next((p for p in candidates if p.exists()), None)
+        if any(p.exists() for p in weight_candidates):
+            raise FileNotFoundError(
+                "Found safetensors checkpoint(s) without matching .pt state checkpoint in "
+                f"{dir_path.resolve()}. Resume requires latest_state.pt or best_state.pt."
+            )
+        return None
 
     raw = str(resume_from_checkpoint).strip()
     if raw:
@@ -142,6 +153,38 @@ def _save_checkpoint(
     best: bool,
     resume_state: Optional[Dict[str, Any]] = None,
 ) -> None:
+    def _atomic_replace(src: Path, dst: Path) -> None:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(str(src), str(dst))
+
+    def _atomic_safetensors_save(
+        tensor_state: Dict[str, torch.Tensor],
+        destination: Path,
+        metadata: Dict[str, str],
+    ) -> None:
+        tmp = destination.parent / f".{destination.name}.tmp"
+        try:
+            safetensors_save_file(tensor_state, str(tmp), metadata=metadata)
+            _atomic_replace(tmp, destination)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+
+    def _atomic_torch_save(payload: Dict[str, Any], destination: Path) -> None:
+        tmp = destination.parent / f".{destination.name}.tmp"
+        try:
+            torch.save(payload, tmp)
+            _atomic_replace(tmp, destination)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+
     core_model = model.module if isinstance(model, DDP) else model
 
     if best:
@@ -159,10 +202,10 @@ def _save_checkpoint(
         key: value.detach().cpu().contiguous()
         for key, value in core_model.state_dict().items()
     }
-    safetensors_save_file(
+    _atomic_safetensors_save(
         _prepare_state_for_safetensors(model_state),
-        str(model_path),
-        metadata={
+        model_path,
+        {
             "epoch": str(int(epoch)),
             "val_loss": f"{float(val_loss):.8f}",
             "train_config": json.dumps(train_config),
@@ -186,7 +229,7 @@ def _save_checkpoint(
         "global_step": int(global_step),
         "resume_state": dict(resume_state or {}),
     }
-    torch.save(state, state_path)
+    _atomic_torch_save(state, state_path)
 
 
 def _load_checkpoint(

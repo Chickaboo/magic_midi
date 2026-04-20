@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler, get_worker_info
 
 from config import DataConfig, TrainConfig
 from utils.logging_utils import get_project_logger
@@ -78,6 +78,7 @@ class PianoDataset(Dataset):
         self.manifest = list(manifest)
         self.data_config = data_config
         self.rng = random.Random(seed)
+        self._rng_worker_seed: Optional[int] = None
         self.event_size = self._resolve_event_size()
         self.min_required = (
             self.data_config.seed_length + self.data_config.continuation_length
@@ -128,6 +129,8 @@ class PianoDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """Sample one random training window from a piece."""
+
+        self._sync_worker_rng()
 
         item = self.manifest[idx]
         tokens_path = Path(str(item["tokens_path"]))
@@ -206,6 +209,18 @@ class PianoDataset(Dataset):
         if (idx - lower) <= (upper - idx):
             return lower
         return upper
+
+    def _sync_worker_rng(self) -> None:
+        """Keep dataset RNG aligned with DataLoader worker seed state."""
+
+        info = get_worker_info()
+        if info is None:
+            return
+
+        worker_seed = int(info.seed)
+        if self._rng_worker_seed != worker_seed:
+            self.rng.seed(worker_seed)
+            self._rng_worker_seed = worker_seed
 
     def _resolve_event_size(self) -> int:
         strategy = str(getattr(self.data_config, "tokenization_strategy", "")).lower()
