@@ -55,6 +55,7 @@ from training.ddp_common import (
     _save_checkpoint,
 )
 from training.scheduler import WarmupCosineScheduler
+from kaggle_sync import KaggleCheckpointMirror
 
 
 VARIANT_E_100M_PROFILE: Dict[str, float] = {
@@ -311,6 +312,35 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Approximate total size cap for epoch bundles in GB (<=0 disables size-based pruning).",
     )
     parser.add_argument("--epoch_upload_cmd_template", type=str, default="")
+    parser.add_argument(
+        "--kaggle_sync_dataset",
+        type=str,
+        default="",
+        help="Kaggle dataset owner/slug used for checkpoint mirrors (blank disables).",
+    )
+    parser.add_argument(
+        "--kaggle_sync_title",
+        type=str,
+        default="",
+        help="Optional Kaggle dataset title for checkpoint mirrors.",
+    )
+    parser.add_argument(
+        "--kaggle_sync_license",
+        type=str,
+        default="CC0-1.0",
+        help="License name written into dataset metadata for checkpoint mirrors.",
+    )
+    parser.add_argument(
+        "--kaggle_sync_public",
+        action="store_true",
+        help="Create the Kaggle checkpoint mirror dataset as public.",
+    )
+    parser.add_argument(
+        "--kaggle_sync_every_n_steps",
+        type=int,
+        default=0,
+        help="Mirror checkpoints every N optimizer steps (0 uses --save_every_n_steps).",
+    )
 
     parser.add_argument("--seed_midi", type=str, default="")
     parser.add_argument("--generation_max_new_tokens", type=int, default=8192)
@@ -408,6 +438,57 @@ def main() -> None:
             )
         if distributed:
             dist.barrier()
+
+        kaggle_sync_dataset = (
+            str(args.kaggle_sync_dataset).strip()
+            or str(os.environ.get("KAGGLE_SYNC_DATASET", "")).strip()
+        )
+        kaggle_sync_title = (
+            str(args.kaggle_sync_title).strip()
+            or str(os.environ.get("KAGGLE_SYNC_TITLE", "")).strip()
+        )
+        kaggle_sync_license = (
+            str(args.kaggle_sync_license).strip()
+            or str(os.environ.get("KAGGLE_SYNC_LICENSE", "CC0-1.0")).strip()
+        )
+        kaggle_sync_public_env = str(os.environ.get("KAGGLE_SYNC_PUBLIC", "")).strip().lower()
+        kaggle_sync_public = bool(args.kaggle_sync_public)
+        if kaggle_sync_public_env:
+            kaggle_sync_public = kaggle_sync_public_env in {"1", "true", "yes", "on"}
+        kaggle_sync_steps = int(args.kaggle_sync_every_n_steps)
+        if kaggle_sync_steps <= 0:
+            kaggle_sync_steps = int(max(0, args.save_every_n_steps))
+
+        kaggle_sync: KaggleCheckpointMirror | None = None
+        if _is_main_process(rank) and kaggle_sync_dataset:
+            try:
+                kaggle_sync = KaggleCheckpointMirror(
+                    dataset_id=kaggle_sync_dataset,
+                    checkpoint_dir=checkpoint_dir,
+                    title=kaggle_sync_title,
+                    license_name=kaggle_sync_license,
+                    public=bool(kaggle_sync_public),
+                    staging_root=output_dir / "kaggle_checkpoint_sync",
+                )
+                _log(
+                    rank,
+                    "Kaggle checkpoint mirror enabled: "
+                    f"dataset={kaggle_sync.dataset_id} "
+                    f"steps={int(kaggle_sync_steps) if int(kaggle_sync_steps) > 0 else 'disabled'}",
+                )
+            except Exception as exc:
+                kaggle_sync = None
+                _log(
+                    rank,
+                    "WARNING: Kaggle checkpoint mirror disabled: "
+                    f"{exc}",
+                )
+        elif _is_main_process(rank):
+            _log(
+                rank,
+                "Kaggle checkpoint mirror disabled. Set KAGGLE_SYNC_DATASET or "
+                "--kaggle_sync_dataset to enable real-time dataset uploads.",
+            )
 
         tokenizer = CustomDeltaTokenizer(include_special_tokens=False)
         configured_vocab_size = int(max(1, int(args.vocab_size)))
@@ -890,6 +971,15 @@ def main() -> None:
                             f"step={global_step:06d} batch={int(step_idx):05d}/{int(batches_per_epoch):05d} "
                             f"loss~{step_avg_loss:.4f}"
                         )
+                        if kaggle_sync is not None and int(kaggle_sync_steps) > 0 and int(global_step) % int(kaggle_sync_steps) == 0:
+                            kaggle_sync.schedule(
+                                epoch=int(epoch),
+                                global_step=int(global_step),
+                                val_loss=float(step_avg_loss),
+                                best_val_loss=float(best_val_loss),
+                                save_tag=f"step_{int(global_step):06d}",
+                                best=False,
+                            )
 
                     if _is_main_process(rank) and int(global_step) % int(max(1, args.log_every_n_steps)) == 0 and running_count > 0:
                         avg_running = float(running_loss / max(1, running_count))
@@ -1159,6 +1249,22 @@ def main() -> None:
             output_midi = str(out_path.resolve())
 
         if _is_main_process(rank):
+            if kaggle_sync is not None:
+                latest_val_loss = (
+                    float(history["val_loss"][-1])
+                    if history.get("val_loss")
+                    else float("inf")
+                )
+                kaggle_sync.schedule(
+                    epoch=int(final_epoch),
+                    global_step=int(global_step),
+                    val_loss=float(latest_val_loss),
+                    best_val_loss=float(best_val_loss),
+                    save_tag="final",
+                    best=False,
+                )
+                kaggle_sync.wait()
+
             result_payload = {
                 "profile": "variant_e_100m_ddp",
                 "target_params": int(VARIANT_E_100M_PROFILE["target_params"]),

@@ -10,6 +10,8 @@ This folder contains current training and generation notebooks.
   - Dedicated 40M Variant E Kaggle baseline run.
 - 03_colab_midi_generation.ipynb
   - Colab generation notebook for checkpoint inference workflows.
+- 06_colab_midi_generation_100m_variant_e.ipynb
+  - Colab generation notebook retargeted to Variant E 100M checkpoint defaults.
 - 05_kaggle_100m_variant_e_500k_barmeta.ipynb
   - Primary 100M Variant E notebook for 500k-piece training on dual T4.
   - Enforces strict dense backend checks and unified custom-delta tokenizer contract.

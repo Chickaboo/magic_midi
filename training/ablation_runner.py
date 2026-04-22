@@ -168,7 +168,8 @@ def _load_pretokenized_manifest(
     if not manifest_path.exists():
         raise FileNotFoundError(f"Pre-tokenized manifest not found: {manifest_path}")
 
-    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    # Accept UTF-8 BOM manifests produced by some Windows tooling.
+    raw = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
     if not isinstance(raw, list) or not raw:
         raise RuntimeError(f"Invalid or empty pre-tokenized manifest: {manifest_path}")
 
