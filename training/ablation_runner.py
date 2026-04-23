@@ -25,6 +25,7 @@ try:
     from model.variant_d import VariantDConfig, VariantDModel
     from model.variant_e import VariantEConfig, VariantEModel
     from model.variant_f import VariantFConfig, VariantFModel
+    from training.ddp_common import _resolve_loader_workers
     from training.trainer import Trainer
     from utils.logging_utils import get_project_logger
 except ModuleNotFoundError:
@@ -40,6 +41,7 @@ except ModuleNotFoundError:
     from model.variant_d import VariantDConfig, VariantDModel
     from model.variant_e import VariantEConfig, VariantEModel
     from model.variant_f import VariantFConfig, VariantFModel
+    from training.ddp_common import _resolve_loader_workers
     from training.trainer import Trainer
     from utils.logging_utils import get_project_logger
 
@@ -361,9 +363,10 @@ def _build_dataloaders(
     train_generator = torch.Generator()
     train_generator.manual_seed(int(seed))
 
-    num_workers = int(getattr(train_cfg, "_force_num_workers", 0))
-    if num_workers < 0:
-        num_workers = 0
+    num_workers = _resolve_loader_workers(
+        requested_workers=int(getattr(train_cfg, "_force_num_workers", -1)),
+        world_size=1,
+    )
     persistent_workers = num_workers > 0
 
     loader_kwargs = {
@@ -536,7 +539,7 @@ def _make_train_config(
         device="auto",
         val_generation_check=False,
     )
-    setattr(cfg, "_force_num_workers", 0)
+    setattr(cfg, "_force_num_workers", -1)
     setattr(cfg, "_enable_data_parallel", False)
     return cfg
 

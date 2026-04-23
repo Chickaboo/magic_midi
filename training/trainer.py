@@ -269,6 +269,8 @@ class Trainer:
 
         self.history: Dict[str, list] = {
             "train_loss": [],
+            "train_loss_total": [],
+            "train_tokens": [],
             "val_loss": [],
             "perplexity": [],
             "lr": [],
@@ -440,6 +442,13 @@ class Trainer:
         running_count = 0
         epoch_loss_sum = 0.0
         epoch_loss_count = 0
+        running_loss_total = 0.0
+        running_token_count = 0
+        running_slot_rescued = 0
+        running_slot_checked = 0
+        epoch_loss_total = 0.0
+        epoch_token_count = 0
+        warned_slot_mismatch = False
 
         for step_idx, batch in enumerate(self.train_loader, start=1):
             parsed = self._parse_batch(batch)
@@ -471,18 +480,26 @@ class Trainer:
                     durations=durations,
                     reset_memory=reset_memory,
                 )
-                loss = next_token_loss(
+                loss_result = next_token_loss(
                     logits,
                     targets,
                     label_smoothing=self.config.label_smoothing,
                     piece_boundary_mask=boundary_mask,
                     slot_aware=self.slot_aware_loss,
                     event_size=self.event_size,
+                    return_stats=True,
                 )
+                loss, valid_token_count, slot_rescued_count = loss_result
 
             loss_value = float(loss.item())
             epoch_loss_sum += loss_value
             epoch_loss_count += 1
+
+            valid_token_count = int(max(0, int(valid_token_count)))
+            slot_rescued_count = int(max(0, int(slot_rescued_count)))
+            batch_loss_total = float(loss_value) * float(valid_token_count)
+            epoch_loss_total += float(batch_loss_total)
+            epoch_token_count += int(valid_token_count)
 
             scaled_loss = loss / self.config.grad_accumulation_steps
             if self.use_amp:
@@ -534,6 +551,10 @@ class Trainer:
 
             running_loss += loss_value
             running_count += 1
+            running_loss_total += float(batch_loss_total)
+            running_token_count += int(valid_token_count)
+            running_slot_rescued += int(slot_rescued_count)
+            running_slot_checked += int(valid_token_count)
 
             if (
                 should_step
@@ -541,18 +562,39 @@ class Trainer:
                 and self.global_step % int(self.log_every_n_steps) == 0
                 and running_count > 0
             ):
-                avg = running_loss / running_count
+                avg = running_loss_total / max(1, running_token_count)
+                rescue_ratio = float(running_slot_rescued / max(1, running_slot_checked))
+                if bool(self.slot_aware_loss) and not bool(warned_slot_mismatch) and int(running_slot_rescued) > 0:
+                    LOGGER.warning(
+                        "slot-aware mask rescued %d/%d targets (%.2f%%). "
+                        "This indicates token-slot misalignment or non-quad/meta targets.",
+                        int(running_slot_rescued),
+                        int(running_slot_checked),
+                        float(rescue_ratio * 100.0),
+                    )
+                    warned_slot_mismatch = True
                 lr = self.optimizer.param_groups[0]["lr"]
                 LOGGER.info(
-                    "step=%06d train_loss=%.4f lr=%.6e",
+                    "step=%06d train_loss=%.4f train_loss_total=%.1f slot_rescue=%.4f lr=%.6e",
                     self.global_step,
                     avg,
+                    float(running_loss_total),
+                    float(rescue_ratio),
                     lr,
                 )
                 running_loss = 0.0
                 running_count = 0
+                running_loss_total = 0.0
+                running_token_count = 0
+                running_slot_rescued = 0
+                running_slot_checked = 0
 
-        train_loss = epoch_loss_sum / max(1, epoch_loss_count)
+        train_loss_total = float(epoch_loss_total)
+        train_token_count = int(max(0, epoch_token_count))
+        if int(train_token_count) <= 0:
+            train_loss = 0.0
+        else:
+            train_loss = float(train_loss_total / float(train_token_count))
         (
             val_loss,
             perplexity,
@@ -562,6 +604,8 @@ class Trainer:
         ) = self.validate(epoch=epoch)
 
         self.history["train_loss"].append(float(train_loss))
+        self.history["train_loss_total"].append(float(train_loss_total))
+        self.history["train_tokens"].append(float(train_token_count))
         self.history["val_loss"].append(float(val_loss))
         self.history["perplexity"].append(float(perplexity))
         self.history["val_raw_ce"].append(float(val_raw_ce))
@@ -585,19 +629,23 @@ class Trainer:
         elapsed = time.time() - epoch_start
         if max_epochs is None:
             LOGGER.info(
-                "Epoch %03d | train_loss=%.4f | val_loss=%.4f | ppl=%s | time=%.1fs",
+                "Epoch %03d | train_loss=%.4f | train_loss_total=%.1f | train_tokens=%d | val_loss=%.4f | ppl=%s | time=%.1fs",
                 epoch,
                 train_loss,
+                float(train_loss_total),
+                int(train_token_count),
                 val_loss,
                 self.format_perplexity(val_loss),
                 elapsed,
             )
         else:
             LOGGER.info(
-                "Epoch %03d/%03d | train_loss=%.4f | val_loss=%.4f | ppl=%s | time=%.1fs",
+                "Epoch %03d/%03d | train_loss=%.4f | train_loss_total=%.1f | train_tokens=%d | val_loss=%.4f | ppl=%s | time=%.1fs",
                 epoch,
                 int(max_epochs),
                 train_loss,
+                float(train_loss_total),
+                int(train_token_count),
                 val_loss,
                 self.format_perplexity(val_loss),
                 elapsed,
@@ -607,6 +655,8 @@ class Trainer:
             {
                 "epoch": epoch,
                 "train_loss": train_loss,
+                "train_loss_total": float(train_loss_total),
+                "train_tokens": int(train_token_count),
                 "val_loss": val_loss,
                 "val_raw_ce": val_raw_ce,
                 "val_token_acc": val_token_acc,
@@ -623,7 +673,11 @@ class Trainer:
 
         val_loss_sum = 0.0
         val_count = 0
+        val_loss_total = 0.0
+        val_token_count = 0
         val_raw_ce_sum = 0.0
+        val_raw_ce_total = 0.0
+        val_raw_token_count = 0
         val_token_acc_sum = 0.0
         val_slot_acc_sum: Dict[str, float] = {
             "delta": 0.0,
@@ -668,26 +722,36 @@ class Trainer:
                     durations=durations,
                     reset_memory=reset_memory,
                 )
-                loss = next_token_loss(
+                loss_result = next_token_loss(
                     logits,
                     targets,
                     label_smoothing=self.config.label_smoothing,
                     piece_boundary_mask=boundary_mask,
                     slot_aware=self.slot_aware_loss,
                     event_size=self.event_size,
+                    return_stats=True,
                 )
-                raw_ce = next_token_loss(
+                raw_result = next_token_loss(
                     logits,
                     targets,
                     label_smoothing=0.0,
                     piece_boundary_mask=boundary_mask,
                     slot_aware=self.slot_aware_loss,
                     event_size=self.event_size,
+                    return_stats=True,
                 )
+                loss, loss_tokens, _ = loss_result
+                raw_ce, raw_tokens, _ = raw_result
 
             val_loss_sum += float(loss.item())
             val_raw_ce_sum += float(raw_ce.item())
             val_count += 1
+            loss_tokens = int(max(0, int(loss_tokens)))
+            raw_tokens = int(max(0, int(raw_tokens)))
+            val_loss_total += float(float(loss.item()) * float(loss_tokens))
+            val_token_count += int(loss_tokens)
+            val_raw_ce_total += float(float(raw_ce.item()) * float(raw_tokens))
+            val_raw_token_count += int(raw_tokens)
 
             if self.report_token_accuracy:
                 token_acc = next_token_accuracy(
@@ -711,8 +775,15 @@ class Trainer:
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
 
-        val_loss = val_loss_sum / max(1, val_count)
-        val_raw_ce = val_raw_ce_sum / max(1, val_count)
+        if int(val_token_count) <= 0:
+            val_loss = 0.0
+        else:
+            val_loss = float(val_loss_total / float(val_token_count))
+
+        if int(val_raw_token_count) <= 0:
+            val_raw_ce = 0.0
+        else:
+            val_raw_ce = float(val_raw_ce_total / float(val_raw_token_count))
         val_token_acc = val_token_acc_sum / max(1, val_count)
         val_slot_acc = {
             key: float(total / max(1, val_count))

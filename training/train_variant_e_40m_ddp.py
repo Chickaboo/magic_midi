@@ -46,10 +46,12 @@ from training.losses import (
 )
 from training.ddp_common import (
     _average_from_sums,
+    _distributed_sum,
     _is_main_process,
     _load_checkpoint,
     _log,
     _rank_info,
+    _resolve_loader_workers,
     _resolve_divisible_heads,
     _resolve_resume_checkpoint,
     _save_checkpoint,
@@ -253,7 +255,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--label_smoothing", type=float, default=0.1)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=-1,
+        help="DataLoader workers per rank. Use -1 for auto tuning (default).",
+    )
     parser.add_argument("--log_every_n_steps", type=int, default=20)
     parser.add_argument(
         "--save_every_n_steps",
@@ -320,11 +327,19 @@ def main() -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("DDP requires CUDA, but CUDA is not available.")
         torch.cuda.set_device(int(local_rank))
-        dist.init_process_group(
-            backend="nccl",
-            timeout=timedelta(minutes=45),
-        )
-        device = torch.device(f"cuda:{int(local_rank)}")
+        ddp_device = torch.device(f"cuda:{int(local_rank)}")
+        try:
+            dist.init_process_group(
+                backend="nccl",
+                timeout=timedelta(minutes=45),
+                device_id=ddp_device,
+            )
+        except TypeError:
+            dist.init_process_group(
+                backend="nccl",
+                timeout=timedelta(minutes=45),
+            )
+        device = ddp_device
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -515,7 +530,15 @@ def main() -> None:
             else None
         )
 
-        num_workers = max(0, int(args.num_workers))
+        num_workers = _resolve_loader_workers(
+            requested_workers=int(args.num_workers),
+            world_size=int(world_size),
+        )
+        _log(
+            rank,
+            "DataLoader workers: "
+            f"requested={int(args.num_workers)} resolved={int(num_workers)}",
+        )
         loader_common = {
             "batch_size": int(max(1, args.batch_size)),
             "num_workers": int(num_workers),
@@ -602,6 +625,8 @@ def main() -> None:
 
         history: Dict[str, List[float]] = {
             "train_loss": [],
+            "train_loss_total": [],
+            "train_tokens": [],
             "val_loss": [],
             "val_raw_ce": [],
             "val_token_acc": [],
@@ -696,8 +721,15 @@ def main() -> None:
 
             epoch_loss_sum = 0.0
             epoch_loss_count = 0
+            epoch_loss_total = 0.0
+            epoch_token_count = 0
             running_loss = 0.0
             running_count = 0
+            running_loss_total = 0.0
+            running_token_count = 0
+            running_slot_rescued = 0
+            running_slot_checked = 0
+            warned_slot_mismatch = False
             skip_batches_this_epoch = (
                 int(first_epoch_skip_batches)
                 if int(epoch) == int(first_epoch) and int(first_epoch_skip_batches) > 0
@@ -739,20 +771,32 @@ def main() -> None:
                     if isinstance(logits, tuple):
                         logits = logits[0]
 
-                    loss = next_token_loss(
+                    loss_result = next_token_loss(
                         logits,
                         targets,
                         label_smoothing=float(train_cfg.label_smoothing),
                         piece_boundary_mask=boundary_mask,
                         slot_aware=bool(slot_aware_loss),
                         event_size=int(event_size),
+                        return_stats=True,
                     )
+                    loss, valid_token_count, slot_rescued_count = loss_result
 
                 loss_value = float(loss.item())
                 epoch_loss_sum += float(loss_value)
                 epoch_loss_count += 1
                 running_loss += float(loss_value)
                 running_count += 1
+
+                valid_token_count = int(max(0, int(valid_token_count)))
+                slot_rescued_count = int(max(0, int(slot_rescued_count)))
+                batch_loss_total = float(loss_value) * float(valid_token_count)
+                epoch_loss_total += float(batch_loss_total)
+                epoch_token_count += int(valid_token_count)
+                running_loss_total += float(batch_loss_total)
+                running_token_count += int(valid_token_count)
+                running_slot_rescued += int(slot_rescued_count)
+                running_slot_checked += int(valid_token_count)
 
                 scaled_loss = loss / float(max(1, train_cfg.grad_accumulation_steps))
                 if use_amp:
@@ -789,7 +833,7 @@ def main() -> None:
                         and int(max(0, train_cfg.save_every_n_steps)) > 0
                         and int(global_step) % int(max(1, train_cfg.save_every_n_steps)) == 0
                     ):
-                        step_avg_loss = float(running_loss / max(1, running_count))
+                        step_avg_loss = float(running_loss_total / max(1, running_token_count))
                         _save_checkpoint(
                             model=model,
                             optimizer=optimizer,
@@ -814,29 +858,47 @@ def main() -> None:
                         print(
                             f"Step checkpoint saved: epoch={epoch:03d} "
                             f"step={global_step:06d} batch={int(step_idx):05d}/{int(batches_per_epoch):05d} "
-                            f"loss~{step_avg_loss:.4f}"
+                            f"loss_avg~{step_avg_loss:.4f} loss_total~{float(running_loss_total):.1f}"
                         )
 
                     if _is_main_process(rank) and int(global_step) % int(max(1, args.log_every_n_steps)) == 0 and running_count > 0:
-                        avg_running = float(running_loss / max(1, running_count))
+                        avg_running = float(running_loss_total / max(1, running_token_count))
+                        rescue_ratio = float(running_slot_rescued / max(1, running_slot_checked))
+                        if bool(slot_aware_loss) and not bool(warned_slot_mismatch) and int(running_slot_rescued) > 0:
+                            _log(
+                                rank,
+                                "WARNING: slot-aware mask rescued "
+                                f"{running_slot_rescued}/{running_slot_checked} targets "
+                                f"({rescue_ratio * 100.0:.2f}%). This indicates token-slot misalignment "
+                                "or non-quad/meta tokens in training targets.",
+                            )
+                            warned_slot_mismatch = True
                         lr = float(optimizer.param_groups[0]["lr"])
                         print(
                             f"epoch={epoch:03d} step={global_step:06d} "
-                            f"train_loss={avg_running:.4f} lr={lr:.6e}"
+                            f"train_loss={avg_running:.4f} train_loss_total={float(running_loss_total):.1f} "
+                            f"slot_rescue={rescue_ratio:.4f} lr={lr:.6e}"
                         )
                         running_loss = 0.0
                         running_count = 0
+                        running_loss_total = 0.0
+                        running_token_count = 0
+                        running_slot_rescued = 0
+                        running_slot_checked = 0
 
-            train_loss = _average_from_sums(
-                total_sum=float(epoch_loss_sum),
-                total_count=float(epoch_loss_count),
-                device=device,
-            )
+            train_loss_total = _distributed_sum(float(epoch_loss_total), device=device)
+            train_token_count = _distributed_sum(float(epoch_token_count), device=device)
+            if float(train_token_count) <= 0.0:
+                train_loss = 0.0
+            else:
+                train_loss = float(train_loss_total / train_token_count)
 
             model.eval()
-            val_loss_sum = 0.0
+            val_loss_total = 0.0
+            val_token_count = 0
+            val_raw_ce_total = 0.0
+            val_raw_token_count = 0
             val_loss_count = 0
-            val_raw_ce_sum = 0.0
             val_token_acc_sum = 0.0
             val_slot_acc_sum: Dict[str, float] = {
                 "delta": 0.0,
@@ -871,25 +933,33 @@ def main() -> None:
                         )
                         if isinstance(logits, tuple):
                             logits = logits[0]
-                        loss = next_token_loss(
+                        loss_result = next_token_loss(
                             logits,
                             targets,
                             label_smoothing=float(train_cfg.label_smoothing),
                             piece_boundary_mask=boundary_mask,
                             slot_aware=bool(slot_aware_loss),
                             event_size=int(event_size),
+                            return_stats=True,
                         )
-                        raw_ce = next_token_loss(
+                        raw_result = next_token_loss(
                             logits,
                             targets,
                             label_smoothing=0.0,
                             piece_boundary_mask=boundary_mask,
                             slot_aware=bool(slot_aware_loss),
                             event_size=int(event_size),
+                            return_stats=True,
                         )
+                        loss, loss_tokens, _ = loss_result
+                        raw_ce, raw_tokens, _ = raw_result
 
-                    val_loss_sum += float(loss.item())
-                    val_raw_ce_sum += float(raw_ce.item())
+                    loss_tokens = int(max(0, int(loss_tokens)))
+                    raw_tokens = int(max(0, int(raw_tokens)))
+                    val_loss_total += float(loss.item()) * float(loss_tokens)
+                    val_token_count += int(loss_tokens)
+                    val_raw_ce_total += float(raw_ce.item()) * float(raw_tokens)
+                    val_raw_token_count += int(raw_tokens)
                     val_loss_count += 1
 
                     token_acc = next_token_accuracy(
@@ -911,13 +981,13 @@ def main() -> None:
                         val_slot_acc_sum[key] += float(slot_acc.get(key, 0.0))
 
             val_loss = _average_from_sums(
-                total_sum=float(val_loss_sum),
-                total_count=float(val_loss_count),
+                total_sum=float(val_loss_total),
+                total_count=float(val_token_count),
                 device=device,
             )
             val_raw_ce = _average_from_sums(
-                total_sum=float(val_raw_ce_sum),
-                total_count=float(val_loss_count),
+                total_sum=float(val_raw_ce_total),
+                total_count=float(val_raw_token_count),
                 device=device,
             )
             val_token_acc = _average_from_sums(
@@ -937,6 +1007,8 @@ def main() -> None:
 
             if _is_main_process(rank):
                 history["train_loss"].append(float(train_loss))
+                history["train_loss_total"].append(float(train_loss_total))
+                history["train_tokens"].append(float(train_token_count))
                 history["val_loss"].append(float(val_loss))
                 history["val_raw_ce"].append(float(val_raw_ce))
                 history["val_token_acc"].append(float(val_token_acc))
@@ -994,6 +1066,8 @@ def main() -> None:
 
                 print(
                     f"Epoch {epoch:03d} | train_loss={train_loss:.4f} "
+                    f"| train_loss_total={float(train_loss_total):.1f} "
+                    f"| train_tokens={int(train_token_count)} "
                     f"| val_loss={val_loss:.4f} | raw_ce={val_raw_ce:.4f} "
                     f"| acc={val_token_acc:.4f} | ppl={perplexity:.2f}"
                 )
@@ -1135,6 +1209,8 @@ def main() -> None:
                     "variant": "variant_e",
                     "params": int(params),
                     "train_loss": [float(v) for v in history.get("train_loss", [])],
+                    "train_loss_total": [float(v) for v in history.get("train_loss_total", [])],
+                    "train_tokens": [float(v) for v in history.get("train_tokens", [])],
                     "val_loss": [float(v) for v in history.get("val_loss", [])],
                     "val_raw_ce": [float(v) for v in history.get("val_raw_ce", [])],
                     "val_token_acc": [float(v) for v in history.get("val_token_acc", [])],

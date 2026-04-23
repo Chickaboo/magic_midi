@@ -83,6 +83,31 @@ def _average_from_sums(
     return float(reduced_sum / reduced_count)
 
 
+def _resolve_loader_workers(
+    *,
+    requested_workers: int,
+    world_size: int,
+    max_workers: int = 8,
+) -> int:
+    """Resolve DataLoader worker count with optional auto mode.
+
+    Pass requested_workers < 0 to enable auto tuning based on host CPU count
+    and number of distributed ranks.
+    """
+
+    requested = int(requested_workers)
+    if requested >= 0:
+        return int(max(0, requested))
+
+    cpu_total = int(os.cpu_count() or 2)
+    ranks = int(max(1, world_size))
+    per_rank_budget = int(max(1, cpu_total // ranks))
+
+    # Keep at least one core available for the training process/main thread.
+    auto_workers = int(max(1, per_rank_budget - 1))
+    return int(max(1, min(int(max_workers), auto_workers)))
+
+
 def _resolve_resume_checkpoint(
     *,
     checkpoint_dir: Path,

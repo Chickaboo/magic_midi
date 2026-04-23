@@ -46,16 +46,23 @@ from training.losses import (
 )
 from training.ddp_common import (
     _average_from_sums,
+    _distributed_sum,
     _is_main_process,
     _load_checkpoint,
     _log,
     _rank_info,
+    _resolve_loader_workers,
     _resolve_divisible_heads,
     _resolve_resume_checkpoint,
     _save_checkpoint,
 )
 from training.scheduler import WarmupCosineScheduler
-from kaggle_sync import KaggleCheckpointMirror
+from hf_sync import (
+    HuggingFaceCheckpointMirror,
+    normalize_hf_repo_id,
+    resolve_hf_token,
+    resolve_latest_hf_checkpoint,
+)
 
 
 VARIANT_E_100M_PROFILE: Dict[str, float] = {
@@ -284,7 +291,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--label_smoothing", type=float, default=0.05)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=-1,
+        help="DataLoader workers per rank. Use -1 for auto tuning (default).",
+    )
     parser.add_argument("--log_every_n_steps", type=int, default=20)
     parser.add_argument(
         "--save_every_n_steps",
@@ -313,33 +325,31 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--epoch_upload_cmd_template", type=str, default="")
     parser.add_argument(
-        "--kaggle_sync_dataset",
+        "--hf_sync_repo_id",
         type=str,
         default="",
-        help="Kaggle dataset owner/slug used for checkpoint mirrors (blank disables).",
+        help="Hugging Face model repo used for checkpoint mirrors (blank disables).",
     )
     parser.add_argument(
-        "--kaggle_sync_title",
-        type=str,
-        default="",
-        help="Optional Kaggle dataset title for checkpoint mirrors.",
-    )
-    parser.add_argument(
-        "--kaggle_sync_license",
-        type=str,
-        default="CC0-1.0",
-        help="License name written into dataset metadata for checkpoint mirrors.",
-    )
-    parser.add_argument(
-        "--kaggle_sync_public",
+        "--hf_sync_private",
         action="store_true",
-        help="Create the Kaggle checkpoint mirror dataset as public.",
+        help="Create the Hugging Face checkpoint mirror repo as private if it needs to be created.",
     )
+    parser.add_argument(
+        "--hf_sync_every_n_steps",
+        type=int,
+        default=0,
+        help="Mirror checkpoints every N optimizer steps (0 uses --save_every_n_steps).",
+    )
+    parser.add_argument("--kaggle_sync_dataset", type=str, default="", help=argparse.SUPPRESS)
+    parser.add_argument("--kaggle_sync_title", type=str, default="", help=argparse.SUPPRESS)
+    parser.add_argument("--kaggle_sync_license", type=str, default="CC0-1.0", help=argparse.SUPPRESS)
+    parser.add_argument("--kaggle_sync_public", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--kaggle_sync_every_n_steps",
         type=int,
         default=0,
-        help="Mirror checkpoints every N optimizer steps (0 uses --save_every_n_steps).",
+        help=argparse.SUPPRESS,
     )
 
     parser.add_argument("--seed_midi", type=str, default="")
@@ -380,11 +390,19 @@ def main() -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("DDP requires CUDA, but CUDA is not available.")
         torch.cuda.set_device(int(local_rank))
-        dist.init_process_group(
-            backend="nccl",
-            timeout=timedelta(minutes=45),
-        )
-        device = torch.device(f"cuda:{int(local_rank)}")
+        ddp_device = torch.device(f"cuda:{int(local_rank)}")
+        try:
+            dist.init_process_group(
+                backend="nccl",
+                timeout=timedelta(minutes=45),
+                device_id=ddp_device,
+            )
+        except TypeError:
+            dist.init_process_group(
+                backend="nccl",
+                timeout=timedelta(minutes=45),
+            )
+        device = ddp_device
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -439,56 +457,62 @@ def main() -> None:
         if distributed:
             dist.barrier()
 
-        kaggle_sync_dataset = (
-            str(args.kaggle_sync_dataset).strip()
+        legacy_sync_requested = bool(str(args.kaggle_sync_dataset).strip()) or bool(
+            str(os.environ.get("KAGGLE_SYNC_DATASET", "")).strip()
+        )
+        hf_sync_repo_id = normalize_hf_repo_id(
+            str(args.hf_sync_repo_id).strip()
+            or str(os.environ.get("HF_SYNC_REPO_ID", "")).strip()
+            or str(args.kaggle_sync_dataset).strip()
             or str(os.environ.get("KAGGLE_SYNC_DATASET", "")).strip()
         )
-        kaggle_sync_title = (
-            str(args.kaggle_sync_title).strip()
-            or str(os.environ.get("KAGGLE_SYNC_TITLE", "")).strip()
-        )
-        kaggle_sync_license = (
-            str(args.kaggle_sync_license).strip()
-            or str(os.environ.get("KAGGLE_SYNC_LICENSE", "CC0-1.0")).strip()
-        )
-        kaggle_sync_public_env = str(os.environ.get("KAGGLE_SYNC_PUBLIC", "")).strip().lower()
-        kaggle_sync_public = bool(args.kaggle_sync_public)
-        if kaggle_sync_public_env:
-            kaggle_sync_public = kaggle_sync_public_env in {"1", "true", "yes", "on"}
-        kaggle_sync_steps = int(args.kaggle_sync_every_n_steps)
-        if kaggle_sync_steps <= 0:
-            kaggle_sync_steps = int(max(0, args.save_every_n_steps))
+        if not hf_sync_repo_id and legacy_sync_requested:
+            hf_sync_repo_id = "Chickaboo/Pulse88-E-85M-Alpha"
+        hf_sync_private_env = str(os.environ.get("HF_SYNC_PRIVATE", "")).strip().lower()
+        hf_sync_private = bool(args.hf_sync_private)
+        if hf_sync_private_env:
+            hf_sync_private = hf_sync_private_env in {"1", "true", "yes", "on"}
+        elif legacy_sync_requested:
+            hf_sync_private = not bool(args.kaggle_sync_public)
+        hf_sync_steps = int(args.hf_sync_every_n_steps)
+        if hf_sync_steps <= 0:
+            hf_sync_steps = int(args.kaggle_sync_every_n_steps)
+        if hf_sync_steps <= 0:
+            hf_sync_steps = int(max(0, args.save_every_n_steps))
 
-        kaggle_sync: KaggleCheckpointMirror | None = None
-        if _is_main_process(rank) and kaggle_sync_dataset:
+        hf_sync: HuggingFaceCheckpointMirror | None = None
+        if _is_main_process(rank) and hf_sync_repo_id:
             try:
-                kaggle_sync = KaggleCheckpointMirror(
-                    dataset_id=kaggle_sync_dataset,
+                hf_token = resolve_hf_token()
+                hf_sync = HuggingFaceCheckpointMirror(
+                    repo_id=hf_sync_repo_id,
                     checkpoint_dir=checkpoint_dir,
-                    title=kaggle_sync_title,
-                    license_name=kaggle_sync_license,
-                    public=bool(kaggle_sync_public),
-                    staging_root=output_dir / "kaggle_checkpoint_sync",
+                    token=hf_token,
+                    private=bool(hf_sync_private),
+                    staging_root=output_dir / "hf_checkpoint_sync",
                 )
+                hf_sync.ensure_repo()
                 _log(
                     rank,
-                    "Kaggle checkpoint mirror enabled: "
-                    f"dataset={kaggle_sync.dataset_id} "
-                    f"steps={int(kaggle_sync_steps) if int(kaggle_sync_steps) > 0 else 'disabled'}",
+                    "Hugging Face checkpoint mirror enabled: "
+                    f"repo={hf_sync.repo_id} "
+                    f"steps={int(hf_sync_steps) if int(hf_sync_steps) > 0 else 'disabled'}",
                 )
             except Exception as exc:
-                kaggle_sync = None
+                hf_sync = None
                 _log(
                     rank,
-                    "WARNING: Kaggle checkpoint mirror disabled: "
+                    "WARNING: Hugging Face checkpoint mirror disabled: "
                     f"{exc}",
                 )
         elif _is_main_process(rank):
             _log(
                 rank,
-                "Kaggle checkpoint mirror disabled. Set KAGGLE_SYNC_DATASET or "
-                "--kaggle_sync_dataset to enable real-time dataset uploads.",
+                "Hugging Face checkpoint mirror disabled. Set HF_SYNC_REPO_ID or "
+                "--hf_sync_repo_id to enable real-time step uploads.",
             )
+
+        last_hf_sync_step = -1
 
         tokenizer = CustomDeltaTokenizer(include_special_tokens=False)
         configured_vocab_size = int(max(1, int(args.vocab_size)))
@@ -644,7 +668,15 @@ def main() -> None:
             else None
         )
 
-        num_workers = max(0, int(args.num_workers))
+        num_workers = _resolve_loader_workers(
+            requested_workers=int(args.num_workers),
+            world_size=int(world_size),
+        )
+        _log(
+            rank,
+            "DataLoader workers: "
+            f"requested={int(args.num_workers)} resolved={int(num_workers)}",
+        )
         loader_common = {
             "batch_size": int(max(1, args.batch_size)),
             "num_workers": int(num_workers),
@@ -758,6 +790,8 @@ def main() -> None:
 
         history: Dict[str, List[float]] = {
             "train_loss": [],
+            "train_loss_total": [],
+            "train_tokens": [],
             "val_loss": [],
             "val_raw_ce": [],
             "val_token_acc": [],
@@ -781,6 +815,16 @@ def main() -> None:
             auto_resume=bool(args.auto_resume),
             resume_from_checkpoint=str(args.resume_from_checkpoint),
         )
+        if resume_checkpoint is None and hf_sync_repo_id:
+            hf_resume_checkpoint = resolve_latest_hf_checkpoint(
+                repo_id=hf_sync_repo_id,
+                cache_root=output_dir,
+                token=resolve_hf_token(),
+                repo_type="model",
+            )
+            if hf_resume_checkpoint is not None:
+                resume_checkpoint = hf_resume_checkpoint
+                _log(rank, f"Resolved Hugging Face resume checkpoint: {resume_checkpoint}")
         epochs_to_run = int(train_cfg.max_epochs)
 
         if resume_checkpoint is not None:
@@ -851,8 +895,15 @@ def main() -> None:
 
             epoch_loss_sum = 0.0
             epoch_loss_count = 0
+            epoch_loss_total = 0.0
+            epoch_token_count = 0
             running_loss = 0.0
             running_count = 0
+            running_loss_total = 0.0
+            running_token_count = 0
+            running_slot_rescued = 0
+            running_slot_checked = 0
+            warned_slot_mismatch = False
             skip_batches_this_epoch = (
                 int(first_epoch_skip_batches)
                 if int(epoch) == int(first_epoch) and int(first_epoch_skip_batches) > 0
@@ -894,20 +945,32 @@ def main() -> None:
                     if isinstance(logits, tuple):
                         logits = logits[0]
 
-                    loss = next_token_loss(
+                    loss_result = next_token_loss(
                         logits,
                         targets,
                         label_smoothing=float(train_cfg.label_smoothing),
                         piece_boundary_mask=boundary_mask,
                         slot_aware=bool(slot_aware_loss),
                         event_size=int(event_size),
+                        return_stats=True,
                     )
+                    loss, valid_token_count, slot_rescued_count = loss_result
 
                 loss_value = float(loss.item())
                 epoch_loss_sum += float(loss_value)
                 epoch_loss_count += 1
                 running_loss += float(loss_value)
                 running_count += 1
+
+                valid_token_count = int(max(0, int(valid_token_count)))
+                slot_rescued_count = int(max(0, int(slot_rescued_count)))
+                batch_loss_total = float(loss_value) * float(valid_token_count)
+                epoch_loss_total += float(batch_loss_total)
+                epoch_token_count += int(valid_token_count)
+                running_loss_total += float(batch_loss_total)
+                running_token_count += int(valid_token_count)
+                running_slot_rescued += int(slot_rescued_count)
+                running_slot_checked += int(valid_token_count)
 
                 scaled_loss = loss / float(max(1, train_cfg.grad_accumulation_steps))
                 if use_amp:
@@ -944,7 +1007,7 @@ def main() -> None:
                         and int(max(0, train_cfg.save_every_n_steps)) > 0
                         and int(global_step) % int(max(1, train_cfg.save_every_n_steps)) == 0
                     ):
-                        step_avg_loss = float(running_loss / max(1, running_count))
+                        step_avg_loss = float(running_loss_total / max(1, running_token_count))
                         _save_checkpoint(
                             model=model,
                             optimizer=optimizer,
@@ -969,38 +1032,57 @@ def main() -> None:
                         print(
                             f"Step checkpoint saved: epoch={epoch:03d} "
                             f"step={global_step:06d} batch={int(step_idx):05d}/{int(batches_per_epoch):05d} "
-                            f"loss~{step_avg_loss:.4f}"
+                            f"loss_avg~{step_avg_loss:.4f} loss_total~{float(running_loss_total):.1f}"
                         )
-                        if kaggle_sync is not None and int(kaggle_sync_steps) > 0 and int(global_step) % int(kaggle_sync_steps) == 0:
-                            kaggle_sync.schedule(
+                        if hf_sync is not None and int(hf_sync_steps) > 0 and int(global_step) % int(hf_sync_steps) == 0:
+                            hf_sync.schedule(
                                 epoch=int(epoch),
                                 global_step=int(global_step),
                                 val_loss=float(step_avg_loss),
                                 best_val_loss=float(best_val_loss),
-                                save_tag=f"step_{int(global_step):06d}",
+                                save_tag=f"step-{int(global_step)}",
                                 best=False,
                             )
+                            last_hf_sync_step = int(global_step)
 
                     if _is_main_process(rank) and int(global_step) % int(max(1, args.log_every_n_steps)) == 0 and running_count > 0:
-                        avg_running = float(running_loss / max(1, running_count))
+                        avg_running = float(running_loss_total / max(1, running_token_count))
+                        rescue_ratio = float(running_slot_rescued / max(1, running_slot_checked))
+                        if bool(slot_aware_loss) and not bool(warned_slot_mismatch) and int(running_slot_rescued) > 0:
+                            _log(
+                                rank,
+                                "WARNING: slot-aware mask rescued "
+                                f"{running_slot_rescued}/{running_slot_checked} targets "
+                                f"({rescue_ratio * 100.0:.2f}%). This indicates token-slot misalignment "
+                                "or non-quad/meta tokens in training targets.",
+                            )
+                            warned_slot_mismatch = True
                         lr = float(optimizer.param_groups[0]["lr"])
                         print(
                             f"epoch={epoch:03d} step={global_step:06d} "
-                            f"train_loss={avg_running:.4f} lr={lr:.6e}"
+                            f"train_loss={avg_running:.4f} train_loss_total={float(running_loss_total):.1f} "
+                            f"slot_rescue={rescue_ratio:.4f} lr={lr:.6e}"
                         )
                         running_loss = 0.0
                         running_count = 0
+                        running_loss_total = 0.0
+                        running_token_count = 0
+                        running_slot_rescued = 0
+                        running_slot_checked = 0
 
-            train_loss = _average_from_sums(
-                total_sum=float(epoch_loss_sum),
-                total_count=float(epoch_loss_count),
-                device=device,
-            )
+            train_loss_total = _distributed_sum(float(epoch_loss_total), device=device)
+            train_token_count = _distributed_sum(float(epoch_token_count), device=device)
+            if float(train_token_count) <= 0.0:
+                train_loss = 0.0
+            else:
+                train_loss = float(train_loss_total / train_token_count)
 
             model.eval()
-            val_loss_sum = 0.0
+            val_loss_total = 0.0
+            val_token_count = 0
+            val_raw_ce_total = 0.0
+            val_raw_token_count = 0
             val_loss_count = 0
-            val_raw_ce_sum = 0.0
             val_token_acc_sum = 0.0
             val_slot_acc_sum: Dict[str, float] = {k: 0.0 for k in slot_metric_names}
             with torch.no_grad():
@@ -1030,25 +1112,33 @@ def main() -> None:
                         )
                         if isinstance(logits, tuple):
                             logits = logits[0]
-                        loss = next_token_loss(
+                        loss_result = next_token_loss(
                             logits,
                             targets,
                             label_smoothing=float(train_cfg.label_smoothing),
                             piece_boundary_mask=boundary_mask,
                             slot_aware=bool(slot_aware_loss),
                             event_size=int(event_size),
+                            return_stats=True,
                         )
-                        raw_ce = next_token_loss(
+                        raw_result = next_token_loss(
                             logits,
                             targets,
                             label_smoothing=0.0,
                             piece_boundary_mask=boundary_mask,
                             slot_aware=bool(slot_aware_loss),
                             event_size=int(event_size),
+                            return_stats=True,
                         )
+                        loss, loss_tokens, _ = loss_result
+                        raw_ce, raw_tokens, _ = raw_result
 
-                    val_loss_sum += float(loss.item())
-                    val_raw_ce_sum += float(raw_ce.item())
+                    loss_tokens = int(max(0, int(loss_tokens)))
+                    raw_tokens = int(max(0, int(raw_tokens)))
+                    val_loss_total += float(loss.item()) * float(loss_tokens)
+                    val_token_count += int(loss_tokens)
+                    val_raw_ce_total += float(raw_ce.item()) * float(raw_tokens)
+                    val_raw_token_count += int(raw_tokens)
                     val_loss_count += 1
 
                     token_acc = next_token_accuracy(
@@ -1070,13 +1160,13 @@ def main() -> None:
                         val_slot_acc_sum[key] += float(slot_acc.get(key, 0.0))
 
             val_loss = _average_from_sums(
-                total_sum=float(val_loss_sum),
-                total_count=float(val_loss_count),
+                total_sum=float(val_loss_total),
+                total_count=float(val_token_count),
                 device=device,
             )
             val_raw_ce = _average_from_sums(
-                total_sum=float(val_raw_ce_sum),
-                total_count=float(val_loss_count),
+                total_sum=float(val_raw_ce_total),
+                total_count=float(val_raw_token_count),
                 device=device,
             )
             val_token_acc = _average_from_sums(
@@ -1096,6 +1186,8 @@ def main() -> None:
 
             if _is_main_process(rank):
                 history["train_loss"].append(float(train_loss))
+                history["train_loss_total"].append(float(train_loss_total))
+                history["train_tokens"].append(float(train_token_count))
                 history["val_loss"].append(float(val_loss))
                 history["val_raw_ce"].append(float(val_raw_ce))
                 history["val_token_acc"].append(float(val_token_acc))
@@ -1153,6 +1245,8 @@ def main() -> None:
 
                 print(
                     f"Epoch {epoch:03d} | train_loss={train_loss:.4f} "
+                    f"| train_loss_total={float(train_loss_total):.1f} "
+                    f"| train_tokens={int(train_token_count)} "
                     f"| val_loss={val_loss:.4f} | raw_ce={val_raw_ce:.4f} "
                     f"| acc={val_token_acc:.4f} | ppl={perplexity:.2f}"
                 )
@@ -1249,21 +1343,22 @@ def main() -> None:
             output_midi = str(out_path.resolve())
 
         if _is_main_process(rank):
-            if kaggle_sync is not None:
-                latest_val_loss = (
-                    float(history["val_loss"][-1])
-                    if history.get("val_loss")
-                    else float("inf")
-                )
-                kaggle_sync.schedule(
-                    epoch=int(final_epoch),
-                    global_step=int(global_step),
-                    val_loss=float(latest_val_loss),
-                    best_val_loss=float(best_val_loss),
-                    save_tag="final",
-                    best=False,
-                )
-                kaggle_sync.wait()
+            if hf_sync is not None:
+                if int(global_step) != int(last_hf_sync_step):
+                    latest_val_loss = (
+                        float(history["val_loss"][-1])
+                        if history.get("val_loss")
+                        else float("inf")
+                    )
+                    hf_sync.schedule(
+                        epoch=int(final_epoch),
+                        global_step=int(global_step),
+                        val_loss=float(latest_val_loss),
+                        best_val_loss=float(best_val_loss),
+                        save_tag=f"step-{int(global_step)}",
+                        best=False,
+                    )
+                hf_sync.wait()
 
             result_payload = {
                 "profile": "variant_e_100m_ddp",
@@ -1319,6 +1414,8 @@ def main() -> None:
                     "variant": "variant_e",
                     "params": int(params),
                     "train_loss": [float(v) for v in history.get("train_loss", [])],
+                    "train_loss_total": [float(v) for v in history.get("train_loss_total", [])],
+                    "train_tokens": [float(v) for v in history.get("train_tokens", [])],
                     "val_loss": [float(v) for v in history.get("val_loss", [])],
                     "val_raw_ce": [float(v) for v in history.get("val_raw_ce", [])],
                     "val_token_acc": [float(v) for v in history.get("val_token_acc", [])],

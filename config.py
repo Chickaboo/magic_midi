@@ -7,7 +7,8 @@ class DataConfig:
     """Data pipeline configuration.
 
     Attributes:
-        maestro_path: Default MAESTRO root for single-dataset training.
+        maestro_path: Primary dataset root for the current Godzilla piano subset
+            training flow. The legacy field name is kept for compatibility.
         tokenizer_path: Path to tokenizer JSON file.
         processed_path: Directory where tokenized arrays and manifest are saved.
         vocab_size: Target tokenizer vocabulary size.
@@ -31,7 +32,7 @@ class DataConfig:
         time_feature_fallback_step_seconds: Fallback delta for missing time arrays.
     """
 
-    maestro_path: str = "maestro-v3.0.0"
+    maestro_path: str = "godzilla-piano"
     tokenizer_path: str = "tokenizer.json"
     processed_path: str = "processed/"
     vocab_size: int = 374
@@ -45,10 +46,7 @@ class DataConfig:
     dataset_paths: Dict[str, str] = field(default_factory=dict)
     dataset_weights: Dict[str, float] = field(
         default_factory=lambda: {
-            "maestro": 1.5,
-            "giant_midi": 1.2,
-            "aria_midi": 1.0,
-            "adl_piano": 1.3,
+            "godzilla_piano": 1.0,
         }
     )
     dataset_profiles: Dict[str, Dict[str, Any]] = field(default_factory=dict)

@@ -87,7 +87,7 @@ class UnifiedSub100mConfig:
     weight_decay: float = 0.01
     label_smoothing: float = 0.1
     max_grad_norm: float = 1.0
-    num_workers: int = 0
+    num_workers: int = -1
     log_every_n_steps: int = 20
     save_every_n_steps: int = 0
     save_every_n_epochs: int = 5
@@ -219,7 +219,7 @@ def _normalize_config(cfg: UnifiedSub100mConfig) -> UnifiedSub100mConfig:
     cfg.batch_size = max(1, int(cfg.batch_size))
     cfg.grad_accumulation_steps = max(1, int(cfg.grad_accumulation_steps))
     cfg.max_pieces = max(0, int(cfg.max_pieces))
-    cfg.num_workers = max(0, int(cfg.num_workers))
+    cfg.num_workers = int(cfg.num_workers)
     cfg.save_every_n_steps = max(0, int(cfg.save_every_n_steps))
     cfg.epochs = max(1, int(cfg.epochs))
 
@@ -439,7 +439,7 @@ def _build_train_cfg(cfg: UnifiedSub100mConfig, checkpoint_dir: Path, warmup_ste
         val_generation_check=False,
     )
 
-    setattr(train_cfg, "_force_num_workers", int(max(0, cfg.num_workers)))
+    setattr(train_cfg, "_force_num_workers", int(cfg.num_workers))
     setattr(train_cfg, "_log_every_n_steps", int(max(1, cfg.log_every_n_steps)))
     setattr(train_cfg, "_slot_aware_loss", bool(cfg.slot_aware_loss))
     setattr(train_cfg, "_report_token_accuracy", True)
@@ -551,7 +551,7 @@ def run_unified_sub100m(cfg: UnifiedSub100mConfig) -> Dict[str, Any]:
         device="auto",
         val_generation_check=False,
     )
-    setattr(probe_cfg, "_force_num_workers", int(max(0, cfg.num_workers)))
+    setattr(probe_cfg, "_force_num_workers", int(cfg.num_workers))
     setattr(probe_cfg, "_enable_data_parallel", False)
 
     probe_train_loader, _ = _build_dataloaders(
@@ -717,7 +717,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--label_smoothing", type=float, default=0.1)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=-1,
+        help="DataLoader workers per process. Use -1 for auto tuning (default).",
+    )
     parser.add_argument("--log_every_n_steps", type=int, default=20)
     parser.add_argument("--save_every_n_steps", type=int, default=0)
     parser.add_argument("--save_every_n_epochs", type=int, default=5)

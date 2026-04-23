@@ -44,14 +44,52 @@ def _build_slot_allowed_mask(
     return allowed
 
 
+def _valid_target_mask(
+    targets: torch.Tensor,
+    *,
+    ignore_index: int,
+    piece_boundary_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    valid = targets != int(ignore_index)
+    if piece_boundary_mask is not None:
+        if piece_boundary_mask.shape != targets.shape:
+            raise ValueError(
+                "piece_boundary_mask must match targets shape, "
+                f"got {tuple(piece_boundary_mask.shape)} vs {tuple(targets.shape)}"
+            )
+        valid = valid & (~piece_boundary_mask.to(dtype=torch.bool))
+    return valid
+
+
+def count_valid_targets(
+    targets: torch.Tensor,
+    ignore_index: int = -100,
+    piece_boundary_mask: torch.Tensor | None = None,
+) -> int:
+    """Return count of target positions included in loss/accuracy metrics."""
+
+    valid = _valid_target_mask(
+        targets,
+        ignore_index=ignore_index,
+        piece_boundary_mask=piece_boundary_mask,
+    )
+    return int(valid.sum().item())
+
+
 def _apply_slot_aware_logits(
     logits: torch.Tensor,
     *,
     event_size: int,
-) -> torch.Tensor:
+    targets: torch.Tensor | None = None,
+    ignore_index: int = -100,
+    piece_boundary_mask: torch.Tensor | None = None,
+    return_stats: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, int, int]:
     """Mask logits to valid classes per event slot for next-token training."""
 
     if logits.ndim != 3:
+        if bool(return_stats):
+            return logits, 0, 0
         return logits
 
     allowed = _build_slot_allowed_mask(
@@ -64,7 +102,43 @@ def _apply_slot_aware_logits(
         fill_value = torch.finfo(logits.dtype).min
     else:
         fill_value = -1e9
-    return logits.masked_fill(~allowed.unsqueeze(0), fill_value)
+
+    masked_logits = logits.masked_fill(~allowed.unsqueeze(0), fill_value)
+
+    rescued_targets = 0
+    valid_target_count = 0
+    if targets is not None:
+        if targets.ndim != 2 or targets.shape != logits.shape[:2]:
+            raise ValueError(
+                "targets must be (batch, seq) and match logits batch/seq dims, "
+                f"got {tuple(targets.shape)} vs {tuple(logits.shape[:2])}"
+            )
+
+        valid = _valid_target_mask(
+            targets,
+            ignore_index=ignore_index,
+            piece_boundary_mask=piece_boundary_mask,
+        )
+        valid = valid & (targets >= 0) & (targets < int(logits.shape[-1]))
+        valid_target_count = int(valid.sum().item())
+
+        if valid_target_count > 0:
+            batch_idx, time_idx = torch.nonzero(valid, as_tuple=True)
+            class_idx = targets[batch_idx, time_idx].to(dtype=torch.long)
+            allowed_for_target = allowed[time_idx, class_idx]
+            rescue_mask = ~allowed_for_target
+            rescued_targets = int(rescue_mask.sum().item())
+
+            # Keep target classes trainable even when slot assumptions are violated.
+            masked_logits[batch_idx, time_idx, class_idx] = logits[
+                batch_idx,
+                time_idx,
+                class_idx,
+            ]
+
+    if bool(return_stats):
+        return masked_logits, int(rescued_targets), int(valid_target_count)
+    return masked_logits
 
 
 def next_token_loss(
@@ -75,7 +149,8 @@ def next_token_loss(
     piece_boundary_mask: torch.Tensor | None = None,
     slot_aware: bool = False,
     event_size: int = 4,
-) -> torch.Tensor:
+    return_stats: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, int, int]:
     """Compute next-token cross-entropy loss with optional label smoothing."""
 
     if logits.ndim != 3:
@@ -89,25 +164,43 @@ def next_token_loss(
             f"Mismatch logits and targets shapes: {tuple(logits.shape[:2])} vs {tuple(targets.shape)}"
         )
 
-    masked_logits = (
-        _apply_slot_aware_logits(logits, event_size=int(max(1, event_size)))
-        if bool(slot_aware)
-        else logits
+    slot_rescued = 0
+    if bool(slot_aware):
+        masked_output = _apply_slot_aware_logits(
+            logits,
+            event_size=int(max(1, event_size)),
+            targets=targets,
+            ignore_index=ignore_index,
+            piece_boundary_mask=piece_boundary_mask,
+            return_stats=bool(return_stats),
+        )
+        if bool(return_stats):
+            masked_logits, slot_rescued, _ = masked_output
+        else:
+            masked_logits = masked_output
+    else:
+        masked_logits = logits
+
+    valid = _valid_target_mask(
+        targets,
+        ignore_index=ignore_index,
+        piece_boundary_mask=piece_boundary_mask,
     )
+    valid_count = int(valid.sum().item())
 
     if piece_boundary_mask is None:
-        return F.cross_entropy(
-            masked_logits.reshape(-1, masked_logits.shape[-1]),
-            targets.reshape(-1),
-            ignore_index=ignore_index,
-            label_smoothing=float(label_smoothing),
-        )
-
-    if piece_boundary_mask.shape != targets.shape:
-        raise ValueError(
-            "piece_boundary_mask must match targets shape, "
-            f"got {tuple(piece_boundary_mask.shape)} vs {tuple(targets.shape)}"
-        )
+        if valid_count <= 0:
+            loss = masked_logits.new_zeros(())
+        else:
+            loss = F.cross_entropy(
+                masked_logits.reshape(-1, masked_logits.shape[-1]),
+                targets.reshape(-1),
+                ignore_index=ignore_index,
+                label_smoothing=float(label_smoothing),
+            )
+        if bool(return_stats):
+            return loss, int(valid_count), int(slot_rescued)
+        return loss
 
     per_token = F.cross_entropy(
         masked_logits.reshape(-1, masked_logits.shape[-1]),
@@ -117,11 +210,14 @@ def next_token_loss(
         reduction="none",
     ).view_as(targets)
 
-    valid = (targets != int(ignore_index)) & (~piece_boundary_mask.to(dtype=torch.bool))
-    valid_count = int(valid.sum().item())
     if valid_count <= 0:
-        return per_token.new_zeros(())
-    return per_token[valid].mean()
+        loss = per_token.new_zeros(())
+    else:
+        loss = per_token[valid].mean()
+
+    if bool(return_stats):
+        return loss, int(valid_count), int(slot_rescued)
+    return loss
 
 
 def create_targets(
@@ -129,7 +225,7 @@ def create_targets(
     continuation: torch.Tensor,
     ignore_index: int = -100,
 ) -> torch.Tensor:
-    """Create autoregressive targets masking seed region with ignore index."""
+    """Create autoregressive targets and mask only the pure seed context."""
 
     if seed.ndim != 2 or continuation.ndim != 2:
         raise ValueError("seed and continuation must be rank-2 tensors")
@@ -143,7 +239,9 @@ def create_targets(
         shifted = full[:, 1:]
         targets[:, :-1] = shifted
 
-    targets[:, : seed.shape[1]] = ignore_index
+    context_len = max(0, int(seed.shape[1]) - 1)
+    if context_len > 0:
+        targets[:, :context_len] = ignore_index
     return targets
 
 
@@ -195,20 +293,23 @@ def next_token_accuracy(
         )
 
     eval_logits = (
-        _apply_slot_aware_logits(logits, event_size=int(max(1, event_size)))
+        _apply_slot_aware_logits(
+            logits,
+            event_size=int(max(1, event_size)),
+            targets=targets,
+            ignore_index=ignore_index,
+            piece_boundary_mask=piece_boundary_mask,
+        )
         if bool(slot_aware)
         else logits
     )
     pred = torch.argmax(eval_logits, dim=-1)
 
-    valid = targets != int(ignore_index)
-    if piece_boundary_mask is not None:
-        if piece_boundary_mask.shape != targets.shape:
-            raise ValueError(
-                "piece_boundary_mask must match targets shape, "
-                f"got {tuple(piece_boundary_mask.shape)} vs {tuple(targets.shape)}"
-            )
-        valid = valid & (~piece_boundary_mask.to(dtype=torch.bool))
+    valid = _valid_target_mask(
+        targets,
+        ignore_index=ignore_index,
+        piece_boundary_mask=piece_boundary_mask,
+    )
 
     valid_count = int(valid.sum().item())
     if valid_count <= 0:
@@ -231,20 +332,23 @@ def next_token_slot_accuracies(
         raise ValueError("logits and targets must be shaped (batch, seq, vocab)/(batch, seq)")
 
     eval_logits = (
-        _apply_slot_aware_logits(logits, event_size=int(max(1, event_size)))
+        _apply_slot_aware_logits(
+            logits,
+            event_size=int(max(1, event_size)),
+            targets=targets,
+            ignore_index=ignore_index,
+            piece_boundary_mask=piece_boundary_mask,
+        )
         if bool(slot_aware)
         else logits
     )
     pred = torch.argmax(eval_logits, dim=-1)
 
-    valid = targets != int(ignore_index)
-    if piece_boundary_mask is not None:
-        if piece_boundary_mask.shape != targets.shape:
-            raise ValueError(
-                "piece_boundary_mask must match targets shape, "
-                f"got {tuple(piece_boundary_mask.shape)} vs {tuple(targets.shape)}"
-            )
-        valid = valid & (~piece_boundary_mask.to(dtype=torch.bool))
+    valid = _valid_target_mask(
+        targets,
+        ignore_index=ignore_index,
+        piece_boundary_mask=piece_boundary_mask,
+    )
 
     e_size = int(max(1, event_size))
     slot_ids = (torch.arange(targets.shape[1], device=targets.device, dtype=torch.long) + 1) % e_size
