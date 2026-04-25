@@ -544,7 +544,8 @@ class Trainer:
                     )
                     self.save_checkpoint(epoch=epoch, val_loss=latest_val)
                     LOGGER.info(
-                        "Step checkpoint saved | epoch=%03d step=%06d",
+                        "ts=%s Step checkpoint saved | epoch=%03d step=%06d",
+                        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
                         int(epoch),
                         int(self.global_step),
                     )
@@ -575,7 +576,8 @@ class Trainer:
                     warned_slot_mismatch = True
                 lr = self.optimizer.param_groups[0]["lr"]
                 LOGGER.info(
-                    "step=%06d train_loss=%.4f train_loss_total=%.1f slot_rescue=%.4f lr=%.6e",
+                    "ts=%s step=%06d train_loss_avg=%.4f train_loss_sum=%.1f slot_rescue=%.4f lr=%.6e",
+                    time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
                     self.global_step,
                     avg,
                     float(running_loss_total),
@@ -629,7 +631,7 @@ class Trainer:
         elapsed = time.time() - epoch_start
         if max_epochs is None:
             LOGGER.info(
-                "Epoch %03d | train_loss=%.4f | train_loss_total=%.1f | train_tokens=%d | val_loss=%.4f | ppl=%s | time=%.1fs",
+                "Epoch %03d | train_loss_avg=%.4f | train_loss_sum=%.1f | train_tokens=%d | val_loss=%.4f | ppl=%s | time=%.1fs",
                 epoch,
                 train_loss,
                 float(train_loss_total),
@@ -640,7 +642,7 @@ class Trainer:
             )
         else:
             LOGGER.info(
-                "Epoch %03d/%03d | train_loss=%.4f | train_loss_total=%.1f | train_tokens=%d | val_loss=%.4f | ppl=%s | time=%.1fs",
+                "Epoch %03d/%03d | train_loss_avg=%.4f | train_loss_sum=%.1f | train_tokens=%d | val_loss=%.4f | ppl=%s | time=%.1fs",
                 epoch,
                 int(max_epochs),
                 train_loss,

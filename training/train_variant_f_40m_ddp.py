@@ -8,6 +8,7 @@ import random
 import shutil
 import subprocess
 import sys
+import time
 from contextlib import nullcontext
 from datetime import timedelta
 from pathlib import Path
@@ -734,7 +735,7 @@ def main() -> None:
                             best=False,
                         )
                         print(
-                            f"Step checkpoint saved: epoch={epoch:03d} "
+                            f"ts={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())} Step checkpoint saved: epoch={epoch:03d} "
                             f"step={global_step:06d} loss_avg~{step_avg_loss:.4f} "
                             f"loss_total~{float(running_loss_total):.1f}"
                         )
@@ -753,8 +754,9 @@ def main() -> None:
                             warned_slot_mismatch = True
                         lr = float(optimizer.param_groups[0]["lr"])
                         print(
+                            f"ts={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())} "
                             f"epoch={epoch:03d} step={global_step:06d} "
-                            f"train_loss={avg_running:.4f} train_loss_total={float(running_loss_total):.1f} "
+                            f"train_loss_avg={avg_running:.4f} train_loss_sum={float(running_loss_total):.1f} "
                             f"slot_rescue={rescue_ratio:.4f} lr={lr:.6e}"
                         )
                         running_loss = 0.0
@@ -931,8 +933,8 @@ def main() -> None:
                     )
 
                 print(
-                    f"Epoch {epoch:03d} | train_loss={train_loss:.4f} "
-                    f"| train_loss_total={float(train_loss_total):.1f} "
+                    f"Epoch {epoch:03d} | train_loss_avg={train_loss:.4f} "
+                    f"| train_loss_sum={float(train_loss_total):.1f} "
                     f"| train_tokens={int(train_token_count)} "
                     f"| val_loss={val_loss:.4f} | raw_ce={val_raw_ce:.4f} "
                     f"| acc={val_token_acc:.4f} | ppl={perplexity:.2f}"
