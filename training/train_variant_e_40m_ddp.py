@@ -212,6 +212,198 @@ def _maybe_run_epoch_upload_command(
     subprocess.run(command, shell=True, check=True)
 
 
+def _slot_id_for_token(token_id: int) -> int | None:
+    tok = int(token_id)
+    if 0 <= tok < 128:
+        return 0
+    if 128 <= tok < 216:
+        return 1
+    if 216 <= tok < 344:
+        return 2
+    if 344 <= tok < 360:
+        return 3
+    return None
+
+
+def _audit_pretokenized_manifest_tokens(
+    *,
+    manifest: List[Dict[str, object]],
+    sample_pieces: int,
+    vocab_size: int,
+    event_size: int,
+    rank: int,
+) -> None:
+    if not _is_main_process(rank):
+        return
+
+    sample_limit = int(max(1, sample_pieces))
+    checked = 0
+    token_count = 0
+    note_token_count = 0
+    meta_token_count = 0
+    out_of_vocab_count = 0
+    slot_mismatch_count = 0
+    observed_min: int | None = None
+    observed_max: int | None = None
+
+    for item in manifest:
+        if checked >= sample_limit:
+            break
+
+        npz_path = Path(str(item.get("tokens_path", "")).strip())
+        if not npz_path.exists() or not npz_path.is_file():
+            continue
+
+        try:
+            with np.load(npz_path, allow_pickle=False) as pack:
+                token_seq = np.asarray(pack["tokens"], dtype=np.int64)
+        except Exception as exc:
+            _log(rank, f"WARNING: token audit could not read {npz_path}: {exc}")
+            continue
+
+        if token_seq.ndim != 1 or token_seq.size <= 0:
+            continue
+
+        checked += 1
+        token_count += int(token_seq.shape[0])
+
+        seq_min = int(token_seq.min())
+        seq_max = int(token_seq.max())
+        observed_min = seq_min if observed_min is None else min(observed_min, seq_min)
+        observed_max = seq_max if observed_max is None else max(observed_max, seq_max)
+
+        out_of_vocab_count += int(((token_seq < 0) | (token_seq >= int(vocab_size))).sum())
+
+        for idx, token_id in enumerate(token_seq.tolist()):
+            tok = int(token_id)
+            if 360 <= tok <= 373:
+                meta_token_count += 1
+
+            slot = _slot_id_for_token(tok)
+            if slot is None:
+                continue
+
+            note_token_count += 1
+            expected = int(idx % max(1, int(event_size)))
+            if expected != int(slot):
+                slot_mismatch_count += 1
+
+    if checked <= 0:
+        _log(rank, "WARNING: token audit skipped (no readable sample pieces found).")
+        return
+
+    note_ratio = float(note_token_count / max(1, token_count))
+    meta_ratio = float(meta_token_count / max(1, token_count))
+    slot_mismatch_ratio = float(slot_mismatch_count / max(1, note_token_count))
+
+    _log(
+        rank,
+        "Token audit: "
+        f"pieces={checked} tokens={token_count} vocab=[{observed_min},{observed_max}] "
+        f"out_of_vocab={out_of_vocab_count} note_ratio={note_ratio:.4f} "
+        f"meta_ratio={meta_ratio:.4f} slot_mismatch={slot_mismatch_ratio:.4f}",
+    )
+
+    if int(out_of_vocab_count) > 0:
+        raise RuntimeError(
+            "Pre-tokenized data contains token IDs outside configured vocab_size. "
+            f"out_of_vocab={out_of_vocab_count} vocab_size={vocab_size}"
+        )
+
+    if float(slot_mismatch_ratio) > 0.02:
+        _log(
+            rank,
+            "WARNING: High slot mismatch ratio detected. This usually indicates token stream "
+            "format drift versus quad slot assumptions and can harm slot-aware training.",
+        )
+
+
+def _tokenizer_signature_from_json(path: Path) -> Dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    token_ids = payload.get("token_ids") if isinstance(payload, dict) else {}
+    token_ids = token_ids if isinstance(token_ids, dict) else {}
+
+    event_size = int(payload.get("event_size", 0) or 0)
+    vocab_size = int(payload.get("vocab_size", 0) or 0)
+    if vocab_size <= 0 and isinstance(token_ids.get("register"), list):
+        reg = token_ids.get("register")
+        if len(reg) == 2:
+            vocab_size = int(reg[1]) + 1
+
+    return {
+        "vocab_size": int(vocab_size),
+        "event_size": int(event_size),
+        "include_structural_meta_tokens": payload.get("include_structural_meta_tokens", None),
+        "prepend_start_token": payload.get("prepend_start_token", None),
+        "include_special_tokens": payload.get("include_special_tokens", None),
+    }
+
+
+def _resolve_tokenizer_json_for_checkpoint(checkpoint_path: Path) -> Path | None:
+    candidates = [
+        checkpoint_path.parent / "custom_tokenizer.json",
+        checkpoint_path.parent.parent / "custom_tokenizer.json",
+    ]
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def _assert_resume_tokenizer_compatible(
+    *,
+    checkpoint_path: Path,
+    current_signature: Dict[str, Any],
+    rank: int,
+) -> None:
+    tokenizer_path = _resolve_tokenizer_json_for_checkpoint(checkpoint_path)
+    if tokenizer_path is None:
+        _log(
+            rank,
+            "WARNING: resume checkpoint has no nearby custom_tokenizer.json; skipping tokenizer compatibility check.",
+        )
+        return
+
+    try:
+        resume_signature = _tokenizer_signature_from_json(tokenizer_path)
+    except Exception as exc:
+        _log(
+            rank,
+            f"WARNING: failed to parse resume tokenizer config at {tokenizer_path}: {exc}",
+        )
+        return
+
+    required_keys = ["vocab_size", "event_size"]
+    optional_bool_keys = [
+        "include_structural_meta_tokens",
+        "prepend_start_token",
+        "include_special_tokens",
+    ]
+
+    mismatches: List[str] = []
+    for key in required_keys:
+        cur = current_signature.get(key, None)
+        old = resume_signature.get(key, None)
+        if old is None or cur is None:
+            continue
+        if int(old) != int(cur):
+            mismatches.append(f"{key}: resume={old} current={cur}")
+
+    for key in optional_bool_keys:
+        cur = current_signature.get(key, None)
+        old = resume_signature.get(key, None)
+        if old is None or cur is None:
+            continue
+        if bool(old) != bool(cur):
+            mismatches.append(f"{key}: resume={old} current={cur}")
+
+    if mismatches:
+        raise RuntimeError(
+            "Resume tokenizer mismatch detected. Start from a compatible checkpoint or retokenize/retrain. "
+            f"checkpoint={checkpoint_path} tokenizer={tokenizer_path} mismatches={'; '.join(mismatches)}"
+        )
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Distributed DDP trainer for Variant E 40M profile on pretokenized NPZ data."
@@ -254,7 +446,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup_steps", type=int, default=0)
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--label_smoothing", type=float, default=0.1)
+    parser.add_argument("--label_smoothing", type=float, default=0.0)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument(
         "--num_workers",
@@ -308,6 +500,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--allow_fallback_gdn", action="store_true")
     parser.add_argument("--disable_slot_aware_loss", action="store_true")
+    parser.add_argument(
+        "--audit_manifest_pieces",
+        type=int,
+        default=256,
+        help="Number of manifest pieces to sample for token range/slot preflight audit (0 disables).",
+    )
     parser.add_argument(
         "--deterministic",
         action="store_true",
@@ -488,6 +686,14 @@ def main() -> None:
             max_pieces=int(max(0, args.max_pieces)),
             min_required_tokens=int(args.max_sequence_length),
         )
+        if int(args.audit_manifest_pieces) > 0:
+            _audit_pretokenized_manifest_tokens(
+                manifest=manifest,
+                sample_pieces=int(args.audit_manifest_pieces),
+                vocab_size=int(tokenizer.vocab_size),
+                event_size=int(event_size),
+                rank=rank,
+            )
         train_manifest, val_manifest = _train_val_split(
             manifest=manifest,
             seed=int(args.seed),
@@ -623,6 +829,11 @@ def main() -> None:
         use_amp = bool(train_cfg.use_amp) and device.type == "cuda"
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
         slot_aware_loss = not bool(args.disable_slot_aware_loss)
+        if bool(slot_aware_loss) and float(train_cfg.label_smoothing) > 0.0:
+            _log(
+                rank,
+                "Slot-aware label smoothing enabled with valid-class normalization.",
+            )
 
         history: Dict[str, List[float]] = {
             "train_loss": [],
@@ -655,6 +866,23 @@ def main() -> None:
         epochs_to_run = int(train_cfg.max_epochs)
 
         if resume_checkpoint is not None:
+            _assert_resume_tokenizer_compatible(
+                checkpoint_path=resume_checkpoint,
+                current_signature={
+                    "vocab_size": int(tokenizer.vocab_size),
+                    "event_size": int(event_size),
+                    "include_structural_meta_tokens": bool(
+                        getattr(tokenizer, "include_structural_meta_tokens", True)
+                    ),
+                    "prepend_start_token": bool(
+                        getattr(tokenizer, "prepend_start_token", True)
+                    ),
+                    "include_special_tokens": bool(
+                        getattr(tokenizer, "include_special_tokens", False)
+                    ),
+                },
+                rank=rank,
+            )
             resumed_state = _load_checkpoint(
                 model=model,
                 optimizer=optimizer,

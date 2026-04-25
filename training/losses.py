@@ -141,6 +141,66 @@ def _apply_slot_aware_logits(
     return masked_logits
 
 
+def _slot_aware_label_smoothed_loss(
+    *,
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    valid_mask: torch.Tensor,
+    event_size: int,
+    label_smoothing: float,
+) -> tuple[torch.Tensor, int, int]:
+    """Compute slot-aware CE with smoothing mass only over allowed classes."""
+
+    valid_mask = valid_mask & (targets >= 0) & (targets < int(logits.shape[-1]))
+    valid_count = int(valid_mask.sum().item())
+    if valid_count <= 0:
+        return logits.new_zeros(()), 0, 0
+
+    batch_idx, time_idx = torch.nonzero(valid_mask, as_tuple=True)
+    class_idx = targets[batch_idx, time_idx].to(dtype=torch.long)
+
+    selected_logits = logits[batch_idx, time_idx, :]
+    allowed = _build_slot_allowed_mask(
+        seq_len=int(logits.shape[1]),
+        vocab_size=int(logits.shape[2]),
+        event_size=int(max(1, event_size)),
+        device=logits.device,
+    )
+    allowed_rows = allowed[time_idx, :].clone()
+
+    allowed_for_target = allowed_rows[
+        torch.arange(valid_count, device=logits.device),
+        class_idx,
+    ]
+    rescued_targets = int((~allowed_for_target).sum().item())
+
+    # Always keep the gold target trainable even when slot assumptions are violated.
+    allowed_rows[
+        torch.arange(valid_count, device=logits.device),
+        class_idx,
+    ] = True
+
+    if selected_logits.dtype.is_floating_point:
+        fill_value = torch.finfo(selected_logits.dtype).min
+    else:
+        fill_value = -1e9
+
+    masked_selected_logits = selected_logits.masked_fill(~allowed_rows, fill_value)
+    log_probs = F.log_softmax(masked_selected_logits, dim=-1)
+
+    nll = -log_probs.gather(1, class_idx.unsqueeze(1)).squeeze(1)
+    eps = float(max(0.0, min(1.0, label_smoothing)))
+    if eps <= 0.0:
+        loss = nll.mean()
+        return loss, int(valid_count), int(rescued_targets)
+
+    allowed_f = allowed_rows.to(dtype=log_probs.dtype)
+    denom = allowed_f.sum(dim=1).clamp(min=1.0)
+    smooth = -(log_probs * allowed_f).sum(dim=1) / denom
+    loss = ((1.0 - eps) * nll + eps * smooth).mean()
+    return loss, int(valid_count), int(rescued_targets)
+
+
 def next_token_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
@@ -186,6 +246,19 @@ def next_token_loss(
         ignore_index=ignore_index,
         piece_boundary_mask=piece_boundary_mask,
     )
+
+    if bool(slot_aware) and float(label_smoothing) > 0.0:
+        loss, valid_count, slot_rescued = _slot_aware_label_smoothed_loss(
+            logits=logits,
+            targets=targets,
+            valid_mask=valid,
+            event_size=int(max(1, event_size)),
+            label_smoothing=float(label_smoothing),
+        )
+        if bool(return_stats):
+            return loss, int(valid_count), int(slot_rescued)
+        return loss
+
     valid_count = int(valid.sum().item())
 
     if piece_boundary_mask is None:
