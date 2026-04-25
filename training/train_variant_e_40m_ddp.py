@@ -404,6 +404,27 @@ def _assert_resume_tokenizer_compatible(
         )
 
 
+def _scheduled_label_smoothing(
+    *,
+    global_step: int,
+    start: float,
+    target: float,
+    warmup_steps: int,
+) -> float:
+    start_v = float(max(0.0, min(1.0, start)))
+    target_v = float(max(0.0, min(1.0, target)))
+    warm = int(max(0, warmup_steps))
+    step = int(max(0, global_step))
+
+    if warm <= 0:
+        return float(target_v)
+    if step >= warm:
+        return float(target_v)
+
+    t = float(step) / float(max(1, warm))
+    return float(start_v + (target_v - start_v) * t)
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Distributed DDP trainer for Variant E 40M profile on pretokenized NPZ data."
@@ -446,7 +467,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup_steps", type=int, default=0)
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--label_smoothing", type=float, default=0.0)
+    parser.add_argument("--label_smoothing", type=float, default=0.02)
+    parser.add_argument(
+        "--label_smoothing_start",
+        type=float,
+        default=0.0,
+        help="Starting label smoothing value for linear warmup schedule.",
+    )
+    parser.add_argument(
+        "--label_smoothing_warmup_steps",
+        type=int,
+        default=2000,
+        help="Linear warmup steps for label smoothing from start to target (<=0 disables schedule).",
+    )
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument(
         "--num_workers",
@@ -828,8 +861,26 @@ def main() -> None:
 
         use_amp = bool(train_cfg.use_amp) and device.type == "cuda"
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-        slot_aware_loss = not bool(args.disable_slot_aware_loss)
-        if bool(slot_aware_loss) and float(train_cfg.label_smoothing) > 0.0:
+        slot_aware_loss = bool(event_size == 4 and not bool(args.disable_slot_aware_loss))
+        label_smoothing_target = float(max(0.0, min(1.0, float(train_cfg.label_smoothing))))
+        label_smoothing_start = float(max(0.0, min(1.0, float(args.label_smoothing_start))))
+        label_smoothing_warmup_steps = int(max(0, int(args.label_smoothing_warmup_steps)))
+        if label_smoothing_warmup_steps <= 0:
+            label_smoothing_start = float(label_smoothing_target)
+
+        if int(event_size) != 4 and not bool(args.disable_slot_aware_loss):
+            _log(
+                rank,
+                f"Slot-aware loss disabled automatically for event_size={event_size}.",
+            )
+        _log(
+            rank,
+            "Label smoothing schedule: "
+            f"start={label_smoothing_start:.4f} "
+            f"target={label_smoothing_target:.4f} "
+            f"warmup_steps={label_smoothing_warmup_steps}",
+        )
+        if bool(slot_aware_loss) and float(label_smoothing_target) > 0.0:
             _log(
                 rank,
                 "Slot-aware label smoothing enabled with valid-class normalization.",
@@ -848,6 +899,7 @@ def main() -> None:
             "val_token_acc_velocity": [],
             "perplexity": [],
             "lr": [],
+            "label_smoothing": [],
         }
         global_step = 0
         best_val_loss = float("inf")
@@ -989,6 +1041,12 @@ def main() -> None:
 
                 autocast_ctx = torch.amp.autocast("cuda", enabled=use_amp) if device.type == "cuda" else nullcontext()
                 with autocast_ctx:
+                    current_label_smoothing = _scheduled_label_smoothing(
+                        global_step=int(global_step),
+                        start=float(label_smoothing_start),
+                        target=float(label_smoothing_target),
+                        warmup_steps=int(label_smoothing_warmup_steps),
+                    )
                     logits = model(
                         token_ids=input_ids,
                         onset_times=onset_times,
@@ -1003,7 +1061,7 @@ def main() -> None:
                     loss_result = next_token_loss(
                         logits,
                         targets,
-                        label_smoothing=float(train_cfg.label_smoothing),
+                        label_smoothing=float(current_label_smoothing),
                         piece_boundary_mask=boundary_mask,
                         slot_aware=bool(slot_aware_loss),
                         event_size=int(event_size),
@@ -1056,6 +1114,7 @@ def main() -> None:
                     scheduler.step()
                     global_step += 1
                     history["lr"].append(float(optimizer.param_groups[0]["lr"]))
+                    history["label_smoothing"].append(float(current_label_smoothing))
 
                     if (
                         _is_main_process(rank)
@@ -1107,7 +1166,8 @@ def main() -> None:
                             f"ts={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())} "
                             f"epoch={epoch:03d} step={global_step:06d} "
                             f"train_loss_avg={avg_running:.4f} train_loss_sum={float(running_loss_total):.1f} "
-                            f"slot_rescue={rescue_ratio:.4f} lr={lr:.6e}"
+                            f"slot_rescue={rescue_ratio:.4f} "
+                            f"ls={float(current_label_smoothing):.4f} lr={lr:.6e}"
                         )
                         running_loss = 0.0
                         running_count = 0

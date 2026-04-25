@@ -6,6 +6,17 @@ import torch
 import torch.nn.functional as F
 
 
+def _stable_mask_fill_value(logits: torch.Tensor) -> float:
+    """Return a finite mask value that is stable for fp16/fp32 softmax."""
+
+    if not logits.dtype.is_floating_point:
+        return -1e9
+
+    # Keep masked logits finite and far below normal score ranges without
+    # using dtype min values that can produce brittle numerics in fp16 paths.
+    return -1e4
+
+
 def _build_slot_allowed_mask(
     *,
     seq_len: int,
@@ -98,10 +109,7 @@ def _apply_slot_aware_logits(
         event_size=int(max(1, event_size)),
         device=logits.device,
     )
-    if logits.dtype.is_floating_point:
-        fill_value = torch.finfo(logits.dtype).min
-    else:
-        fill_value = -1e9
+    fill_value = _stable_mask_fill_value(logits)
 
     masked_logits = logits.masked_fill(~allowed.unsqueeze(0), fill_value)
 
@@ -180,10 +188,7 @@ def _slot_aware_label_smoothed_loss(
         class_idx,
     ] = True
 
-    if selected_logits.dtype.is_floating_point:
-        fill_value = torch.finfo(selected_logits.dtype).min
-    else:
-        fill_value = -1e9
+    fill_value = _stable_mask_fill_value(selected_logits)
 
     masked_selected_logits = selected_logits.masked_fill(~allowed_rows, fill_value)
     log_probs = F.log_softmax(masked_selected_logits, dim=-1)
