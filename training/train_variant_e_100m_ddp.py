@@ -1069,21 +1069,32 @@ def main() -> None:
         first_epoch_skip_batches = 0
         final_epoch = int(train_cfg.max_epochs)
 
-        resume_checkpoint = _resolve_resume_checkpoint(
-            checkpoint_dir=checkpoint_dir,
-            auto_resume=bool(args.auto_resume),
-            resume_from_checkpoint=str(args.resume_from_checkpoint),
-        )
-        if resume_checkpoint is None and hf_sync_repo_id:
-            hf_resume_checkpoint = resolve_latest_hf_checkpoint(
-                repo_id=hf_sync_repo_id,
-                cache_root=output_dir,
-                token=resolve_hf_token(),
-                repo_type="model",
+        resume_checkpoint = None
+        explicit_resume_from_checkpoint = str(args.resume_from_checkpoint).strip()
+        if explicit_resume_from_checkpoint:
+            resume_checkpoint = _resolve_resume_checkpoint(
+                checkpoint_dir=checkpoint_dir,
+                auto_resume=False,
+                resume_from_checkpoint=explicit_resume_from_checkpoint,
             )
-            if hf_resume_checkpoint is not None:
-                resume_checkpoint = hf_resume_checkpoint
-                _log(rank, f"Resolved Hugging Face resume checkpoint: {resume_checkpoint}")
+        else:
+            if bool(args.auto_resume) and hf_sync_repo_id:
+                hf_resume_checkpoint = resolve_latest_hf_checkpoint(
+                    repo_id=hf_sync_repo_id,
+                    cache_root=output_dir,
+                    token=resolve_hf_token(),
+                    repo_type="model",
+                )
+                if hf_resume_checkpoint is not None:
+                    resume_checkpoint = hf_resume_checkpoint
+                    _log(rank, f"Resolved Hugging Face resume checkpoint: {resume_checkpoint}")
+
+            if resume_checkpoint is None:
+                resume_checkpoint = _resolve_resume_checkpoint(
+                    checkpoint_dir=checkpoint_dir,
+                    auto_resume=bool(args.auto_resume),
+                    resume_from_checkpoint="",
+                )
         epochs_to_run = int(train_cfg.max_epochs)
 
         if resume_checkpoint is not None:

@@ -89,23 +89,34 @@ def resolve_latest_hf_checkpoint(
     api = api_factory(token=token or None)
 
     try:
-        tree = list(api.list_repo_tree(normalized_repo_id, repo_type=repo_type, recursive=False, token=token or None))
+        tree = list(api.list_repo_tree(normalized_repo_id, repo_type=repo_type, recursive=True, token=token or None))
     except Exception:
         return None
 
-    step_names: list[str] = []
+    step_paths: list[tuple[int, str]] = []
+    seen_paths: set[str] = set()
     for entry in tree:
-        entry_name = _entry_path_text(entry)
-        if not entry_name.startswith("step-"):
+        entry_path = _entry_path_text(entry)
+        if not entry_path:
             continue
-        step_suffix = entry_name.split("step-", 1)[1]
-        if step_suffix.isdigit():
-            step_names.append(entry_name)
 
-    if not step_names:
+        parts = [part for part in entry_path.split("/") if part]
+        for index, part in enumerate(parts):
+            if not part.startswith("step-"):
+                continue
+            step_suffix = part.split("step-", 1)[1]
+            if not step_suffix.isdigit():
+                continue
+            folder_path = "/".join(parts[: index + 1])
+            if not folder_path or folder_path in seen_paths:
+                continue
+            seen_paths.add(folder_path)
+            step_paths.append((int(step_suffix), folder_path))
+
+    if not step_paths:
         return None
 
-    latest_step = max(step_names, key=lambda item: int(item.split("step-", 1)[1]))
+    latest_step = max(step_paths, key=lambda item: item[0])[1]
     download_root = Path(cache_root).expanduser().resolve() / "hf_resume_cache"
     download_root.mkdir(parents=True, exist_ok=True)
 
