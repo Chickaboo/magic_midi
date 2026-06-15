@@ -27,6 +27,12 @@ if str(ROOT) not in sys.path:
 from config import DataConfig, TrainConfig
 from data.dataset import PianoDataset
 from data.tokenizer_remi_bpe import PianoREMIBPETokenizer
+from hf_sync import (
+    HuggingFaceCheckpointMirror,
+    normalize_hf_repo_id,
+    resolve_hf_token,
+    resolve_latest_hf_checkpoint,
+)
 from model.dense_piano_transformer import (
     DensePianoTransformer,
     DensePianoTransformerConfig,
@@ -128,6 +134,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save_every_n_steps", type=int, default=500)
     parser.add_argument("--save_every_n_epochs", type=int, default=5)
     parser.add_argument("--amp_dtype", type=str, default="bfloat16")
+    parser.add_argument(
+        "--hf_sync_repo_id",
+        type=str,
+        default="",
+        help="Hugging Face model repo used for checkpoint mirrors (blank disables).",
+    )
+    parser.add_argument(
+        "--hf_sync_private",
+        action="store_true",
+        help="Create the Hugging Face checkpoint mirror repo as private if it needs to be created.",
+    )
+    parser.add_argument(
+        "--hf_sync_every_n_steps",
+        type=int,
+        default=0,
+        help="Mirror checkpoints every N optimizer steps (0 uses --save_every_n_steps).",
+    )
 
     parser.add_argument("--resume_from_checkpoint", type=str, default="")
     parser.add_argument("--resume_mode", choices=["remaining", "additional"], default="remaining")
@@ -208,6 +231,46 @@ def main() -> None:
             processed_dir.mkdir(parents=True, exist_ok=True)
         if distributed:
             dist.barrier()
+
+        hf_sync_repo_id = normalize_hf_repo_id(
+            str(args.hf_sync_repo_id).strip()
+            or str(os.environ.get("HF_SYNC_REPO_ID", "")).strip()
+        )
+        hf_sync_private_env = str(os.environ.get("HF_SYNC_PRIVATE", "")).strip().lower()
+        hf_sync_private = bool(args.hf_sync_private)
+        if hf_sync_private_env:
+            hf_sync_private = hf_sync_private_env in {"1", "true", "yes", "on"}
+        hf_sync_steps = int(args.hf_sync_every_n_steps)
+        if hf_sync_steps <= 0:
+            hf_sync_steps = int(max(0, args.save_every_n_steps))
+
+        hf_sync: HuggingFaceCheckpointMirror | None = None
+        if _is_main_process(rank) and hf_sync_repo_id:
+            try:
+                hf_sync = HuggingFaceCheckpointMirror(
+                    repo_id=hf_sync_repo_id,
+                    checkpoint_dir=checkpoint_dir,
+                    token=resolve_hf_token(),
+                    private=bool(hf_sync_private),
+                    staging_root=output_dir / "hf_checkpoint_sync",
+                )
+                hf_sync.ensure_repo()
+                _log(
+                    rank,
+                    "Hugging Face checkpoint mirror enabled: "
+                    f"repo={hf_sync.repo_id} "
+                    f"steps={int(hf_sync_steps) if int(hf_sync_steps) > 0 else 'disabled'}",
+                )
+            except Exception as exc:
+                hf_sync = None
+                _log(rank, f"WARNING: Hugging Face checkpoint mirror disabled: {exc}")
+        elif _is_main_process(rank):
+            _log(
+                rank,
+                "Hugging Face checkpoint mirror disabled. Set HF_SYNC_REPO_ID or "
+                "--hf_sync_repo_id to enable real-time step uploads.",
+            )
+        last_hf_sync_step = -1
 
         manifest_path = Path(str(args.pretokenized_manifest)).expanduser()
         pretokenized_root = (
@@ -392,11 +455,6 @@ def main() -> None:
         scaler = torch.amp.GradScaler("cuda", enabled=bool(use_amp and amp_dtype == torch.float16))
         _log(rank, f"AMP dtype: {amp_label} (GradScaler enabled={scaler.is_enabled()})")
 
-        resume_checkpoint = _resolve_resume_checkpoint(
-            checkpoint_dir=checkpoint_dir,
-            auto_resume=bool(args.auto_resume),
-            resume_from_checkpoint=str(args.resume_from_checkpoint),
-        )
         history: Dict[str, List[float]] = {
             "train_loss": [],
             "train_loss_total": [],
@@ -409,6 +467,33 @@ def main() -> None:
         best_val_loss = float("inf")
         global_step = 0
         start_epoch = 0
+
+        resume_checkpoint = None
+        explicit_resume_from_checkpoint = str(args.resume_from_checkpoint).strip()
+        if explicit_resume_from_checkpoint:
+            resume_checkpoint = _resolve_resume_checkpoint(
+                checkpoint_dir=checkpoint_dir,
+                auto_resume=False,
+                resume_from_checkpoint=explicit_resume_from_checkpoint,
+            )
+        else:
+            if bool(args.auto_resume) and hf_sync_repo_id:
+                hf_resume_checkpoint = resolve_latest_hf_checkpoint(
+                    repo_id=hf_sync_repo_id,
+                    cache_root=output_dir,
+                    token=resolve_hf_token(),
+                    repo_type="model",
+                )
+                if hf_resume_checkpoint is not None:
+                    resume_checkpoint = hf_resume_checkpoint
+                    _log(rank, f"Resolved Hugging Face resume checkpoint: {resume_checkpoint}")
+
+            if resume_checkpoint is None:
+                resume_checkpoint = _resolve_resume_checkpoint(
+                    checkpoint_dir=checkpoint_dir,
+                    auto_resume=bool(args.auto_resume),
+                    resume_from_checkpoint="",
+                )
         if resume_checkpoint is not None:
             state = _load_checkpoint(
                 model=model,
@@ -555,6 +640,16 @@ def main() -> None:
                                 "is_epoch_complete": False,
                             },
                         )
+                        if hf_sync is not None and int(hf_sync_steps) > 0 and int(global_step) % int(hf_sync_steps) == 0:
+                            hf_sync.schedule(
+                                epoch=int(epoch),
+                                global_step=int(global_step),
+                                val_loss=float(approx_loss),
+                                best_val_loss=float(best_val_loss),
+                                save_tag=f"step-{int(global_step)}",
+                                best=False,
+                            )
+                            last_hf_sync_step = int(global_step)
 
             train_loss_total = _distributed_sum(float(epoch_loss_total), device=device)
             train_token_count = _distributed_sum(float(epoch_token_count), device=device)
@@ -706,6 +801,24 @@ def main() -> None:
                 dist.barrier()
 
         if _is_main_process(rank):
+            if hf_sync is not None:
+                if int(global_step) != int(last_hf_sync_step):
+                    latest_val_loss = (
+                        float(history["val_loss"][-1])
+                        if history.get("val_loss")
+                        else float("inf")
+                    )
+                    hf_sync.schedule(
+                        epoch=int(final_epoch),
+                        global_step=int(global_step),
+                        val_loss=float(latest_val_loss),
+                        best_val_loss=float(best_val_loss),
+                        save_tag=f"step-{int(global_step)}",
+                        best=False,
+                    )
+                    last_hf_sync_step = int(global_step)
+                hf_sync.wait()
+
             result_payload = {
                 "profile": "dense_piano_transformer_remi_bpe",
                 "target_params": int(DENSE_PIANO_PROFILE["target_params"]),
@@ -756,6 +869,13 @@ def main() -> None:
                     "params": int(params),
                     "history": history,
                     "checkpoint_dir": str(checkpoint_dir.resolve()),
+                },
+                "hf_sync": {
+                    "enabled": bool(hf_sync_repo_id),
+                    "repo_id": str(hf_sync_repo_id),
+                    "private": bool(hf_sync_private),
+                    "every_n_steps": int(hf_sync_steps),
+                    "last_synced_step": int(last_hf_sync_step),
                 },
             }
             result_path = output_dir / "dense_piano_transformer_ddp_result.json"
