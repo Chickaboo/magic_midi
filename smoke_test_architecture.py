@@ -20,8 +20,13 @@ from config import ModelConfig
 from data.dataset import create_dataloaders
 from data.preprocess import MultiDatasetPreprocessor
 from data.tokenizer import CustomDeltaTokenizer
+from data.tokenizer_remi_bpe import PianoREMIBPETokenizer
+from model.dense_piano_transformer import (
+    DensePianoTransformer,
+    DensePianoTransformerConfig,
+)
 from model.attention_block import ALiBiPositionBias, MusicAttentionBlock
-from model.factory import build_model
+from model.factory import build_model, build_named_model
 from model.hybrid import PianoHybridModel
 from model.hybrid_v2 import IttyBittyPianoV2
 from scale_config import SCALE_PRESETS, verify_preset_params
@@ -545,6 +550,95 @@ def test_model_factory_switch() -> None:
     _print_ok("Model factory", "v1->PianoHybridModel, v2->IttyBittyPianoV2")
 
 
+def test_dense_piano_transformer_forward() -> None:
+    """Validate DensePianoTransformer factory routing and forward shape."""
+
+    print("Testing DensePianoTransformer forward...")
+    cfg = DensePianoTransformerConfig(
+        vocab_size=512,
+        d_model=64,
+        n_layers=3,
+        max_sequence_length=32,
+        dropout=0.0,
+        attention_dropout=0.0,
+        num_attention_heads=4,
+        head_dim=16,
+        window_schedule=(4, 8, 8),
+        max_relative_distance=8,
+        global_anchor_count=4,
+        global_anchor_start_layer=3,
+        gradient_checkpointing=True,
+    )
+    model = build_named_model("dense_piano_transformer", cfg).eval()
+    assert isinstance(model, DensePianoTransformer)
+    token_ids = torch.randint(0, cfg.vocab_size, (2, 16))
+    with torch.no_grad():
+        logits, memory = model(token_ids, return_memory=True)
+    assert logits.shape == (2, 16, cfg.vocab_size)
+    assert memory is None
+    assert model.layers[0].window_size == 4
+    assert model.layers[-1].use_global_anchors
+    _print_ok(
+        "DensePianoTransformer",
+        f"logits={tuple(logits.shape)}, params={model.get_num_params():,}",
+    )
+
+
+def test_piano_remi_bpe_tokenizer() -> None:
+    """Validate PianoREMIBPE encode/decode, factory compatibility, and pedal tokens."""
+
+    print("Testing PianoREMIBPE tokenizer...")
+    import pretty_midi
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp = Path(tmp_dir)
+        midi_path = tmp / "remi_bpe.mid"
+        midi = pretty_midi.PrettyMIDI(initial_tempo=120.0)
+        piano = pretty_midi.Instrument(program=0)
+        piano.notes.append(
+            pretty_midi.Note(velocity=96, pitch=60, start=0.0, end=0.5)
+        )
+        piano.notes.append(
+            pretty_midi.Note(velocity=64, pitch=64, start=0.5, end=1.0)
+        )
+        piano.control_changes.append(
+            pretty_midi.ControlChange(number=64, value=127, time=0.25)
+        )
+        piano.control_changes.append(
+            pretty_midi.ControlChange(number=64, value=0, time=0.75)
+        )
+        midi.instruments.append(piano)
+        midi.write(str(midi_path))
+
+        tokenizer = PianoREMIBPETokenizer(vocab_size=374)
+        tokenizer.train([midi_path], vocab_size=tokenizer.vocab_size)
+        token_ids, onsets, durations = tokenizer.encode_with_time_features(midi_path)
+        assert tokenizer.event_size == 1
+        assert len(token_ids) == len(onsets) == len(durations)
+        assert len(token_ids) > 0
+
+        labels: list[str] = []
+        for token_id in token_ids:
+            labels.extend(tokenizer.decode_token_id_events(int(token_id)))
+        assert "PEDAL_ON" in labels
+        assert "PEDAL_OFF" in labels
+        note_idx = next(i for i, label in enumerate(labels) if label.startswith("NOTE_ON_"))
+        assert labels[note_idx + 1].startswith("VELOCITY_")
+        assert labels[note_idx + 2].startswith("DURATION_")
+
+        decoded = tokenizer.decode(token_ids)
+        assert decoded.instruments and len(decoded.instruments[0].notes) == 2
+
+        tokenizer_path = tmp / "piano_remi_bpe.json"
+        tokenizer.save(str(tokenizer_path))
+        loaded = PianoREMIBPETokenizer.load(tokenizer_path)
+        assert loaded.vocab_size == tokenizer.vocab_size
+        _print_ok(
+            "PianoREMIBPE",
+            f"tokens={len(token_ids)}, vocab={loaded.vocab_size}, event_size={loaded.event_size}",
+        )
+
+
 def test_time_features_and_weighted_sampling() -> None:
     """Smoke-test onset/duration extraction and dataset weight sampler wiring."""
 
@@ -885,6 +979,8 @@ if __name__ == "__main__":
     test_v2_model()
     test_memory_reset_determinism()
     test_model_factory_switch()
+    test_dense_piano_transformer_forward()
+    test_piano_remi_bpe_tokenizer()
     test_tokenizer_time_feature_invariants()
     test_time_features_and_weighted_sampling()
     test_dataset_weight_distribution_report()

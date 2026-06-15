@@ -1,6 +1,7 @@
 from .baseline import PianoBaselineModel
 from .hybrid import PianoHybridModel
 from .hybrid_v2 import IttyBittyPianoV2
+from .dense_piano_transformer import DensePianoTransformer, DensePianoTransformerConfig
 from .variant_f import VariantFConfig, VariantFModel
 from .factory import build_model, build_named_model
 from .mamba_block import MAMBA_AVAILABLE, MambaBlock
@@ -20,6 +21,8 @@ __all__ = [
     "PianoBaselineModel",
     "PianoHybridModel",
     "IttyBittyPianoV2",
+    "DensePianoTransformer",
+    "DensePianoTransformerConfig",
     "VariantFConfig",
     "VariantFModel",
     "build_model",

@@ -11,6 +11,10 @@ from model.variant_c import VariantCConfig, VariantCModel
 from model.variant_d import VariantDConfig, VariantDModel
 from model.variant_e import VariantEConfig, VariantEModel
 from model.variant_f import VariantFConfig, VariantFModel
+from model.dense_piano_transformer import (
+    DensePianoTransformer,
+    DensePianoTransformerConfig,
+)
 
 
 def build_model(config: ModelConfig):
@@ -41,6 +45,10 @@ def build_named_model(name: str, config: Any):
         "hybrid": "hybrid",
         "hybrid_v2": "hybrid_v2",
         "v2": "hybrid_v2",
+        "dense_piano_transformer": "dense_piano_transformer",
+        "densepianotransformer": "dense_piano_transformer",
+        "dense_piano": "dense_piano_transformer",
+        "dense": "dense_piano_transformer",
     }
     key = aliases.get(key, key)
 
@@ -69,5 +77,12 @@ def build_named_model(name: str, config: Any):
         elif key == "hybrid":
             cfg.use_v2_architecture = False
         return build_model(cfg)
+    if key == "dense_piano_transformer":
+        cfg = (
+            config
+            if isinstance(config, DensePianoTransformerConfig)
+            else DensePianoTransformerConfig(**dict(config))
+        )
+        return DensePianoTransformer(cfg)
 
     raise ValueError(f"Unsupported model family '{name}'.")

@@ -9,6 +9,7 @@ import numpy as np
 from miditok import Octuple, REMI, TokenizerConfig
 
 from data.tokenizer_custom import CustomDeltaTokenizer
+from data.tokenizer_remi_bpe import PianoREMIBPETokenizer
 
 
 TIME_EVENT_TYPES = {
@@ -701,10 +702,19 @@ def create_tokenizer(
     """Create tokenizer instance from the unified tokenizer selector."""
 
     normalized = str(strategy).strip().lower()
+    if normalized in {"piano_remi_bpe", "remi_bpe", "pianoremibpe"}:
+        return PianoREMIBPETokenizer(
+            vocab_size=int(kwargs.get("vocab_size", 30000)),
+            positions_per_bar=int(kwargs.get("positions_per_bar", 16)),
+            max_duration_bars=int(kwargs.get("max_duration_bars", 4)),
+            tempo_bins=int(kwargs.get("tempo_bins", 64)),
+            include_special_tokens=bool(kwargs.get("include_special_tokens", True)),
+        )
+
     if normalized not in {"custom_delta", "delta", "quad", "event_quad", "unified"}:
         raise ValueError(
             "Unsupported tokenizer strategy "
-            f"'{strategy}'. Only the unified CustomDeltaTokenizer is supported."
+            f"'{strategy}'. Use 'custom_delta' or 'piano_remi_bpe'."
         )
 
     return CustomDeltaTokenizer(
@@ -727,10 +737,12 @@ def load_tokenizer(path: str | Path, strategy: str | None = None) -> Any:
 
     forced = str(strategy).strip().lower() if strategy is not None else ""
     if forced:
+        if forced in {"piano_remi_bpe", "remi_bpe", "pianoremibpe"}:
+            return PianoREMIBPETokenizer.load(load_path)
         if forced not in {"custom_delta", "delta", "quad", "event_quad", "unified"}:
             raise ValueError(
                 "Unsupported tokenizer strategy "
-                f"'{strategy}'. Only the unified CustomDeltaTokenizer is supported."
+                f"'{strategy}'. Use 'custom_delta' or 'piano_remi_bpe'."
             )
         return CustomDeltaTokenizer.load(str(load_path))
 
@@ -740,18 +752,21 @@ def load_tokenizer(path: str | Path, strategy: str | None = None) -> Any:
         payload = json.loads(load_path.read_text(encoding="utf-8"))
         if str(payload.get("type", "")).strip() == "CustomDeltaTokenizer":
             return CustomDeltaTokenizer.load(str(load_path))
+        if str(payload.get("type", "")).strip() == "PianoREMIBPE":
+            return PianoREMIBPETokenizer.load(load_path)
     except Exception:
         raise ValueError(
             "Failed to parse tokenizer payload. Expected a CustomDeltaTokenizer JSON file."
         )
 
     raise ValueError(
-        "Unsupported tokenizer payload. Only CustomDeltaTokenizer is supported in this workspace."
+        "Unsupported tokenizer payload. Expected CustomDeltaTokenizer or PianoREMIBPE."
     )
 
 
 __all__ = [
     "CustomDeltaTokenizer",
+    "PianoREMIBPETokenizer",
     "create_tokenizer",
     "load_tokenizer",
 ]

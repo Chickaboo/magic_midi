@@ -329,6 +329,15 @@ def _build_kept_event_set(groups: Sequence[NoteGroup], kept_groups: int) -> set[
     return kept
 
 
+def _trim_time_stamped_events(events: Sequence[object], cutoff_time: float) -> list[object]:
+    trimmed: list[object] = []
+    for event in events:
+        event_time = float(getattr(event, "time", float("inf")))
+        if event_time <= float(cutoff_time):
+            trimmed.append(event)
+    return trimmed
+
+
 def _write_cut_midi(
     midi: pretty_midi.PrettyMIDI,
     groups: Sequence[NoteGroup],
@@ -337,24 +346,50 @@ def _write_cut_midi(
     onset_tolerance: float,
 ) -> Path:
     keep_set = _build_kept_event_set(groups, candidate.kept_groups)
+    cutoff_time = float(candidate.cut_time) + float(onset_tolerance)
     kept_instruments = []
 
     for instrument_index, instrument in enumerate(midi.instruments):
         kept_notes = []
         for note_index, note in enumerate(instrument.notes):
             if (int(instrument_index), int(note_index)) in keep_set:
+                note_end = min(float(note.end), cutoff_time)
+                if note_end <= float(note.start) + float(onset_tolerance):
+                    continue
+                if note_end < float(note.end):
+                    note.end = note_end
                 kept_notes.append(note)
 
         if kept_notes:
             instrument.notes = kept_notes
-            instrument.pitch_bends = [bend for bend in instrument.pitch_bends if float(bend.time) <= candidate.cut_time + onset_tolerance]
-            instrument.control_changes = [change for change in instrument.control_changes if float(change.time) <= candidate.cut_time + onset_tolerance]
+            instrument.pitch_bends = [bend for bend in instrument.pitch_bends if float(bend.time) <= cutoff_time]
+            instrument.control_changes = [change for change in instrument.control_changes if float(change.time) <= cutoff_time]
             kept_instruments.append(instrument)
 
     if not kept_instruments:
         raise RuntimeError("The selected cut removed every instrument.")
 
     midi.instruments = kept_instruments
+    if hasattr(midi, "time_signature_changes"):
+        midi.time_signature_changes = _trim_time_stamped_events(midi.time_signature_changes, cutoff_time)
+    if hasattr(midi, "key_signature_changes"):
+        midi.key_signature_changes = _trim_time_stamped_events(midi.key_signature_changes, cutoff_time)
+    if hasattr(midi, "lyrics"):
+        midi.lyrics = _trim_time_stamped_events(midi.lyrics, cutoff_time)
+    if hasattr(midi, "text_events"):
+        midi.text_events = _trim_time_stamped_events(midi.text_events, cutoff_time)
+
+    kept_note_starts = [
+        float(note.start)
+        for instrument in midi.instruments
+        for note in instrument.notes
+    ]
+    lead_offset = float(min(kept_note_starts)) if kept_note_starts else 0.0
+    midi.adjust_times(
+        [lead_offset, cutoff_time],
+        [0.0, float(cutoff_time - lead_offset)],
+    )
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     midi.write(str(output_path))
     return output_path
