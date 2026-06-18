@@ -269,6 +269,24 @@ class PianoREMIBPETokenizer:
         if not self._merges or len(seq) < 2:
             return seq, groups
 
+        if all(int(left) < self._base_vocab_size and int(right) < self._base_vocab_size for left, right in self._merges):
+            out_seq: List[int] = []
+            out_groups: List[List[int]] = []
+            i = 0
+            while i < len(seq):
+                if i + 1 < len(seq):
+                    pair = (int(seq[i]), int(seq[i + 1]))
+                    merged_id = self._merge_to_id.get(pair)
+                    if merged_id is not None:
+                        out_seq.append(int(merged_id))
+                        out_groups.append(groups[i] + groups[i + 1])
+                        i += 2
+                        continue
+                out_seq.append(int(seq[i]))
+                out_groups.append(groups[i])
+                i += 1
+            return out_seq, out_groups
+
         merge_rank = {pair: rank for rank, pair in enumerate(self._merges)}
         while len(seq) >= 2:
             best_idx = -1
@@ -298,6 +316,8 @@ class PianoREMIBPETokenizer:
         midi_paths: List[Path],
         vocab_size: int | None = None,
         sample_size: int | None = None,
+        mode: str = "iterative",
+        progress_every: int = 0,
     ) -> None:
         target = int(vocab_size or self.target_vocab_size)
         paths = [Path(p) for p in midi_paths]
@@ -314,11 +334,53 @@ class PianoREMIBPETokenizer:
                 continue
             if len(ids) >= 4:
                 sequences.append(ids)
+
+        self.train_from_base_sequences(
+            sequences,
+            vocab_size=target,
+            mode=mode,
+            progress_every=progress_every,
+        )
+
+    def train_from_base_sequences(
+        self,
+        sequences: Sequence[Sequence[int]],
+        vocab_size: int | None = None,
+        mode: str = "iterative",
+        progress_every: int = 0,
+    ) -> None:
+        target = int(vocab_size or self.target_vocab_size)
+        sequences = [[int(token) for token in seq] for seq in sequences if len(seq) >= 4]
         if not sequences:
             raise RuntimeError("No valid MIDI files were available for BPE training.")
-
         self._merges = []
         self._rebuild_bpe_maps()
+
+        train_mode = str(mode or "iterative").strip().lower()
+        if train_mode in {"fast", "pair_counts", "pair-counts"}:
+            counts: Counter[Tuple[int, int]] = Counter()
+            for index, seq in enumerate(sequences, start=1):
+                counts.update(zip(seq, seq[1:]))
+                if int(progress_every) > 0 and index % int(progress_every) == 0:
+                    print(
+                        f"PianoREMIBPE BPE counting: sequences={index:,}/{len(sequences):,} "
+                        f"unique_pairs={len(counts):,}",
+                        flush=True,
+                    )
+            max_merges = max(0, int(target) - int(self._base_vocab_size))
+            self._merges = [
+                (int(pair[0]), int(pair[1]))
+                for pair, freq in counts.most_common(max_merges)
+                if int(freq) >= 2
+            ]
+            self._rebuild_bpe_maps()
+            print(
+                f"PianoREMIBPE fast BPE complete: merges={len(self._merges):,} "
+                f"vocab={self.vocab_size:,}",
+                flush=True,
+            )
+            return
+
         while self.vocab_size < target:
             counts: Counter[Tuple[int, int]] = Counter()
             for seq in sequences:
@@ -345,6 +407,12 @@ class PianoREMIBPETokenizer:
                         i += 1
                 new_sequences.append(out)
             sequences = new_sequences
+            if int(progress_every) > 0 and len(self._merges) % int(progress_every) == 0:
+                print(
+                    f"PianoREMIBPE iterative BPE: merges={len(self._merges):,} "
+                    f"vocab={self.vocab_size:,}/{target:,}",
+                    flush=True,
+                )
 
     def encode(self, midi_path: Path) -> List[int]:
         base_ids, _onsets, _durations = self._base_sequence_with_features(Path(midi_path))

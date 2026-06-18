@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 import hashlib
 import json
 import os
@@ -133,6 +133,31 @@ def scan_midi_files(input_dir: Path) -> List[Path]:
     )
 
 
+def load_midi_files_from_jsonl(
+    input_dir: Path,
+    file_list_jsonl: Path,
+    *,
+    trust_file_list: bool,
+) -> List[Path]:
+    midi_files: List[Path] = []
+    with file_list_jsonl.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            row = line.strip()
+            if not row:
+                continue
+            try:
+                parsed = json.loads(row)
+            except Exception:
+                continue
+            rel_path = str(parsed.get("path", "")).strip()
+            if not rel_path or not is_midi_name(rel_path):
+                continue
+            candidate = input_dir / rel_path
+            if bool(trust_file_list) or (candidate.exists() and candidate.is_file()):
+                midi_files.append(candidate)
+    return midi_files
+
+
 def save_npz_with_retries(
     *,
     out_npz_path: Path,
@@ -182,11 +207,36 @@ def build_npz_relative_path(idx: int, source_path: str, shard_size: int = 50000)
 
 
 _WORKER_TOKENIZER: Optional[PianoREMIBPETokenizer] = None
+_BPE_WORKER_TOKENIZER: Optional[PianoREMIBPETokenizer] = None
 
 
 def _init_worker(tokenizer_path: str) -> None:
     global _WORKER_TOKENIZER
     _WORKER_TOKENIZER = PianoREMIBPETokenizer.load(tokenizer_path)
+
+
+def _init_bpe_worker(config: Dict[str, Any]) -> None:
+    global _BPE_WORKER_TOKENIZER
+    _BPE_WORKER_TOKENIZER = PianoREMIBPETokenizer(
+        vocab_size=int(config["vocab_size"]),
+        positions_per_bar=int(config["positions_per_bar"]),
+        max_duration_bars=int(config["max_duration_bars"]),
+        tempo_bins=int(config["tempo_bins"]),
+        include_special_tokens=True,
+    )
+
+
+def _worker_base_sequence(midi_path: str) -> Optional[List[int]]:
+    tokenizer = _BPE_WORKER_TOKENIZER
+    if tokenizer is None:
+        return None
+    try:
+        ids, _onsets, _durations = tokenizer._base_sequence_with_features(Path(str(midi_path)))
+    except Exception:
+        return None
+    if len(ids) < 4:
+        return None
+    return [int(token) for token in ids]
 
 
 def _worker_tokenize(payload: Tuple[Any, ...]) -> Dict[str, Any]:
@@ -263,9 +313,32 @@ def parse_args() -> argparse.Namespace:
         description="Tokenize solo piano MIDI files with PianoREMIBPE into sharded NPZ packs."
     )
     parser.add_argument("--input-dir", type=str, required=True, help="Input directory of .mid/.midi files.")
+    parser.add_argument(
+        "--file-list-jsonl",
+        type=str,
+        default="",
+        help="Optional Godzilla-style JSONL file with relative MIDI paths under --input-dir.",
+    )
+    parser.add_argument(
+        "--trust-file-list",
+        action="store_true",
+        help="Trust --file-list-jsonl paths without probing every file during startup.",
+    )
     parser.add_argument("--output-dir", "--output-root", dest="output_dir", type=str, default="processed/piano_remi_bpe")
     parser.add_argument("--vocab-size", type=int, default=30000)
     parser.add_argument("--bpe-sample-size", type=int, default=20000)
+    parser.add_argument(
+        "--bpe-training-mode",
+        choices=["fast", "iterative"],
+        default="fast",
+        help="fast counts high-frequency adjacent integer pairs once; iterative keeps the slower classic BPE loop.",
+    )
+    parser.add_argument(
+        "--bpe-workers",
+        type=int,
+        default=0,
+        help="Worker count for BPE sample parsing. 0 reuses --workers or os.cpu_count().",
+    )
     parser.add_argument("--workers", type=int, default=0, help="Worker count. 0 uses os.cpu_count().")
     parser.add_argument("--min-token-length", type=int, default=192)
     parser.add_argument("--positions-per-bar", type=int, default=16)
@@ -311,6 +384,23 @@ def _iter_payloads(
         )
 
 
+def _delete_result_npz(output_root: Path, result: Dict[str, Any]) -> None:
+    npz_path = str(result.get("npz_path", "")).strip()
+    if not npz_path:
+        return
+    candidate = (output_root / npz_path).resolve()
+    root = output_root.resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return
+    try:
+        if candidate.exists() and candidate.is_file():
+            candidate.unlink()
+    except Exception:
+        pass
+
+
 def main() -> None:
     args = parse_args()
     input_dir = Path(str(args.input_dir)).expanduser()
@@ -329,9 +419,30 @@ def main() -> None:
     summary_path = metadata_dir / "summary.json"
     tokenizer_path = metadata_dir / "piano_remi_bpe_tokenizer.json"
 
-    midi_files = scan_midi_files(input_dir)
+    file_list_jsonl = (
+        Path(str(args.file_list_jsonl)).expanduser()
+        if str(args.file_list_jsonl).strip()
+        else None
+    )
+    if file_list_jsonl is not None:
+        if not file_list_jsonl.exists() or not file_list_jsonl.is_file():
+            raise FileNotFoundError(f"file list JSONL not found: {file_list_jsonl}")
+        print(
+            f"Loading file list: {file_list_jsonl.resolve()} "
+            f"(trust_file_list={bool(args.trust_file_list)})",
+            flush=True,
+        )
+        midi_files = load_midi_files_from_jsonl(
+            input_dir,
+            file_list_jsonl,
+            trust_file_list=bool(args.trust_file_list),
+        )
+    else:
+        print(f"Scanning MIDI files recursively under {input_dir.resolve()}", flush=True)
+        midi_files = scan_midi_files(input_dir)
     if not midi_files:
         raise RuntimeError(f"No MIDI files found under {input_dir.resolve()}")
+    print(f"Loaded MIDI file list: {len(midi_files):,} files", flush=True)
 
     if bool(args.retrain_tokenizer) or not tokenizer_path.exists():
         sample_n = int(max(0, args.bpe_sample_size))
@@ -345,18 +456,57 @@ def main() -> None:
         )
         print(
             f"Training PianoREMIBPE vocab_size={int(args.vocab_size):,} "
-            f"on sample_files={len(sample_paths):,}"
+            f"on sample_files={len(sample_paths):,} mode={str(args.bpe_training_mode)}",
+            flush=True,
         )
-        tokenizer.train(
-            midi_paths=[Path(p) for p in sample_paths],
+        bpe_cpu_count = max(1, int(os.cpu_count() or 1))
+        bpe_workers = int(args.bpe_workers) if int(args.bpe_workers) > 0 else int(args.workers)
+        if bpe_workers <= 0:
+            bpe_workers = bpe_cpu_count
+        bpe_workers = max(1, int(bpe_workers))
+        bpe_config = {
+            "vocab_size": int(args.vocab_size),
+            "positions_per_bar": int(args.positions_per_bar),
+            "max_duration_bars": int(args.max_duration_bars),
+            "tempo_bins": int(args.tempo_bins),
+        }
+        sequences: List[List[int]] = []
+        bpe_start = time.time()
+        print(f"Parsing BPE sample with workers={bpe_workers}", flush=True)
+        with ProcessPoolExecutor(
+            max_workers=bpe_workers,
+            initializer=_init_bpe_worker,
+            initargs=(bpe_config,),
+        ) as pool:
+            chunk_size = max(1, min(128, bpe_workers * 4))
+            for index, ids in enumerate(
+                pool.map(_worker_base_sequence, [str(p) for p in sample_paths], chunksize=chunk_size),
+                start=1,
+            ):
+                if ids is not None:
+                    sequences.append(ids)
+                if index % int(max(1, args.progress_every)) == 0:
+                    elapsed = max(1e-6, time.time() - bpe_start)
+                    print(
+                        f"BPE sample parsed: files={index:,}/{len(sample_paths):,} "
+                        f"valid={len(sequences):,} rate={index / elapsed:.2f}/s",
+                        flush=True,
+                    )
+        print(
+            f"BPE sample parsing complete: valid={len(sequences):,}/{len(sample_paths):,}",
+            flush=True,
+        )
+        tokenizer.train_from_base_sequences(
+            sequences,
             vocab_size=int(args.vocab_size),
-            sample_size=None,
+            mode=str(args.bpe_training_mode),
+            progress_every=int(max(1, args.progress_every)),
         )
         tokenizer.save(str(tokenizer_path))
-        print(f"Tokenizer saved: {tokenizer_path.resolve()} (vocab={tokenizer.vocab_size:,})")
+        print(f"Tokenizer saved: {tokenizer_path.resolve()} (vocab={tokenizer.vocab_size:,})", flush=True)
     else:
         tokenizer = PianoREMIBPETokenizer.load(tokenizer_path)
-        print(f"Loaded tokenizer: {tokenizer_path.resolve()} (vocab={tokenizer.vocab_size:,})")
+        print(f"Loaded tokenizer: {tokenizer_path.resolve()} (vocab={tokenizer.vocab_size:,})", flush=True)
 
     checkpoint_payload = safe_json_read(checkpoint_path, default={})
     manifest_count, done_indices = load_manifest_state(manifest_jsonl_path)
@@ -383,6 +533,7 @@ def main() -> None:
 
     print("PianoREMIBPE tokenization session")
     print(f"  input_dir: {input_dir.resolve()}")
+    print(f"  file_list_jsonl: {file_list_jsonl.resolve() if file_list_jsonl is not None else 'recursive scan'}")
     print(f"  output_dir: {output_root.resolve()}")
     print(f"  total_files: {len(midi_files):,}")
     print(f"  start_index: {start_index:,}")
@@ -432,6 +583,10 @@ def main() -> None:
 
         status = str(result.get("status", "skip"))
         if status == "accepted":
+            if max_files > 0 and accepted >= max_files:
+                _delete_result_npz(output_root, result)
+                skipped += 1
+                return
             row = {
                 "index": int(idx),
                 "md5": str(result.get("md5", "")),
@@ -490,17 +645,49 @@ def main() -> None:
         initializer=_init_worker,
         initargs=(str(tokenizer_path),),
     ) as pool:
-        for result in pool.map(_worker_tokenize, payload_iter, chunksize=max(1, min(128, workers * 4))):
-            _handle_result(result)
-            if max_files > 0 and accepted >= max_files:
-                print(f"MAX_FILES reached ({max_files}). Stopping after current mapped batch.")
-                break
+        if max_files > 0:
+            payload_source = iter(payload_iter)
+            max_pending = max(1, min(128, workers * 4))
+            pending: Set[Future[Dict[str, Any]]] = set()
+            exhausted = False
+
+            def _fill_pending() -> None:
+                nonlocal exhausted
+                while not exhausted and accepted < max_files and len(pending) < max_pending:
+                    try:
+                        payload = next(payload_source)
+                    except StopIteration:
+                        exhausted = True
+                        break
+                    pending.add(pool.submit(_worker_tokenize, payload))
+
+            _fill_pending()
+            while pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    _handle_result(future.result())
+                if accepted >= max_files:
+                    print(f"MAX_FILES reached ({max_files}). Stopping.")
+                    for future in pending:
+                        future.cancel()
+                    while pending:
+                        done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                        for future in done:
+                            if not future.cancelled():
+                                _handle_result(future.result())
+                    break
+                _fill_pending()
+        else:
+            chunk_size = max(1, min(128, workers * 4))
+            for result in pool.map(_worker_tokenize, payload_iter, chunksize=chunk_size):
+                _handle_result(result)
 
     _save_checkpoint(rebuild_manifest=False)
     manifest_len = rebuild_manifest_json(manifest_jsonl_path, manifest_json_path)
     elapsed = max(1e-6, time.time() - session_start)
     summary = {
         "input_dir": str(input_dir.resolve()),
+        "file_list_jsonl": str(file_list_jsonl.resolve()) if file_list_jsonl is not None else "",
         "output_dir": str(output_root.resolve()),
         "total_files": int(len(midi_files)),
         "start_index": int(start_index),

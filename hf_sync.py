@@ -18,6 +18,7 @@ class _MirrorRequest:
     best_val_loss: float
     save_tag: str
     best: bool
+    metrics: dict[str, Any]
 
 
 def _utc_now_iso() -> str:
@@ -305,6 +306,7 @@ class HuggingFaceCheckpointMirror:
             "best_val_loss": float(request.best_val_loss),
             "save_tag": str(request.save_tag),
             "best": bool(request.best),
+            "metrics": request.metrics,
             "copied_files": copied_files,
             "source_checkpoint_dir": str(self.checkpoint_dir),
         }
@@ -340,6 +342,7 @@ class HuggingFaceCheckpointMirror:
         best_val_loss: float,
         save_tag: str,
         best: bool,
+        metrics: Optional[dict[str, Any]] = None,
     ) -> None:
         request = _MirrorRequest(
             epoch=int(epoch),
@@ -348,6 +351,7 @@ class HuggingFaceCheckpointMirror:
             best_val_loss=float(best_val_loss),
             save_tag=str(save_tag),
             best=bool(best),
+            metrics=dict(metrics or {}),
         )
 
         with self._lock:

@@ -455,7 +455,7 @@ def main() -> None:
         scaler = torch.amp.GradScaler("cuda", enabled=bool(use_amp and amp_dtype == torch.float16))
         _log(rank, f"AMP dtype: {amp_label} (GradScaler enabled={scaler.is_enabled()})")
 
-        history: Dict[str, List[float]] = {
+        history: Dict[str, List[Any]] = {
             "train_loss": [],
             "train_loss_total": [],
             "train_tokens": [],
@@ -463,6 +463,7 @@ def main() -> None:
             "val_raw_ce": [],
             "val_token_acc": [],
             "perplexity": [],
+            "step_checkpoints": [],
         }
         best_val_loss = float("inf")
         global_step = 0
@@ -516,6 +517,7 @@ def main() -> None:
         if resume_checkpoint is not None and str(args.resume_mode) == "remaining":
             epochs_to_run = max(0, int(args.epochs) - int(start_epoch))
         final_epoch = int(first_epoch + epochs_to_run - 1)
+        train_start_time = time.time()
 
         for epoch in range(first_epoch, final_epoch + 1):
             if train_sampler is not None:
@@ -603,11 +605,14 @@ def main() -> None:
                         and running_count > 0
                     ):
                         avg = float(running_loss_total / max(1, running_token_count))
+                        avg_ppl = float(math.exp(min(20.0, float(avg))))
                         lr = float(optimizer.param_groups[0]["lr"])
                         print(
                             f"ts={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())} "
                             f"epoch={epoch:03d} step={global_step:06d} "
-                            f"train_loss_avg={avg:.4f} train_loss_sum={running_loss_total:.1f} lr={lr:.6e}"
+                            f"train_loss_avg={avg:.4f} train_ppl~{avg_ppl:.2f} "
+                            f"train_loss_sum={running_loss_total:.1f} "
+                            f"tokens={int(running_token_count):,} lr={lr:.6e}"
                         )
                         running_loss_total = 0.0
                         running_token_count = 0
@@ -619,6 +624,35 @@ def main() -> None:
                         and int(global_step) % int(train_cfg.save_every_n_steps) == 0
                     ):
                         approx_loss = float(epoch_loss_total / max(1, epoch_token_count))
+                        approx_ppl = float(math.exp(min(20.0, float(approx_loss))))
+                        lr = float(optimizer.param_groups[0]["lr"])
+                        epoch_progress = float(step_idx) / float(max(1, len(train_loader)))
+                        elapsed_hours = float(time.time() - train_start_time) / 3600.0
+                        best_val_for_log = (
+                            float(best_val_loss)
+                            if math.isfinite(float(best_val_loss))
+                            else float("nan")
+                        )
+                        hf_sync_due = bool(
+                            hf_sync is not None
+                            and int(hf_sync_steps) > 0
+                            and int(global_step) % int(hf_sync_steps) == 0
+                        )
+                        step_metrics = {
+                            "epoch": int(epoch),
+                            "global_step": int(global_step),
+                            "batch_step_in_epoch": int(step_idx),
+                            "batches_per_epoch": int(len(train_loader)),
+                            "epoch_progress": float(epoch_progress),
+                            "train_loss": float(approx_loss),
+                            "train_perplexity": float(approx_ppl),
+                            "train_tokens": int(epoch_token_count),
+                            "learning_rate": float(lr),
+                            "elapsed_hours": float(elapsed_hours),
+                            "best_val_loss": float(best_val_for_log),
+                            "hf_sync_scheduled": bool(hf_sync_due),
+                        }
+                        history.setdefault("step_checkpoints", []).append(step_metrics)
                         _save_checkpoint(
                             model=model,
                             optimizer=optimizer,
@@ -640,7 +674,7 @@ def main() -> None:
                                 "is_epoch_complete": False,
                             },
                         )
-                        if hf_sync is not None and int(hf_sync_steps) > 0 and int(global_step) % int(hf_sync_steps) == 0:
+                        if hf_sync_due:
                             hf_sync.schedule(
                                 epoch=int(epoch),
                                 global_step=int(global_step),
@@ -648,8 +682,21 @@ def main() -> None:
                                 best_val_loss=float(best_val_loss),
                                 save_tag=f"step-{int(global_step)}",
                                 best=False,
+                                metrics=step_metrics,
                             )
                             last_hf_sync_step = int(global_step)
+                        print(
+                            f"ts={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())} "
+                            f"checkpoint step={global_step:06d} epoch={epoch:03d} "
+                            f"batch={int(step_idx):05d}/{int(len(train_loader)):05d} "
+                            f"epoch_progress={epoch_progress * 100.0:.2f}% "
+                            f"train_loss={approx_loss:.4f} train_ppl={approx_ppl:.2f} "
+                            f"train_tokens={int(epoch_token_count):,} lr={lr:.6e} "
+                            f"best_val_loss={best_val_for_log:.4f} "
+                            f"hf_sync={'scheduled' if bool(step_metrics['hf_sync_scheduled']) else 'not-scheduled'} "
+                            f"elapsed_hours={elapsed_hours:.2f}",
+                            flush=True,
+                        )
 
             train_loss_total = _distributed_sum(float(epoch_loss_total), device=device)
             train_token_count = _distributed_sum(float(epoch_token_count), device=device)
@@ -815,6 +862,26 @@ def main() -> None:
                         best_val_loss=float(best_val_loss),
                         save_tag=f"step-{int(global_step)}",
                         best=False,
+                        metrics={
+                            "epoch": int(final_epoch),
+                            "global_step": int(global_step),
+                            "latest_val_loss": float(latest_val_loss),
+                            "latest_val_perplexity": float(math.exp(min(20.0, float(latest_val_loss))))
+                            if math.isfinite(float(latest_val_loss))
+                            else float("nan"),
+                            "best_val_loss": float(best_val_loss),
+                            "best_val_perplexity": float(math.exp(min(20.0, float(best_val_loss))))
+                            if math.isfinite(float(best_val_loss))
+                            else float("nan"),
+                            "train_loss": float(history["train_loss"][-1])
+                            if history.get("train_loss")
+                            else float("nan"),
+                            "train_tokens": int(history["train_tokens"][-1])
+                            if history.get("train_tokens")
+                            else 0,
+                            "elapsed_hours": float(time.time() - train_start_time) / 3600.0,
+                            "final_upload": True,
+                        },
                     )
                     last_hf_sync_step = int(global_step)
                 hf_sync.wait()
